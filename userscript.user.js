@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WTR-LAB Pronouns Fix
+// @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.6.5
-// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Mixed-gender sentence fix. Uses GM_xmlhttpRequest + cache fallback for reliable glossary loading.
+// @version      4.7.0
+// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a JSON glossary. Adds mixed-sentence resolver, carry context, movable UI, minimise pill, ON/OFF auto-refresh, and stable Changed counter.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -15,22 +15,43 @@
 (() => {
   "use strict";
 
-  // Safety guard
   if (!location.hostname.endsWith("wtr-lab.com")) return;
 
   // ==========================================================
   // USER SETTINGS
   // ==========================================================
-  const GLOSSARY_URL = "https://raw.githubusercontent.com/youaremyhero/wtr-lab-pronouns-fix/main/glossary.template.json";
+  // Your new template path:
+  const GLOSSARY_URL = "https://raw.githubusercontent.com/youaremyhero/WTR-LAB-Pronouns-Fix/main/glossary.template.json";
+
   const DEFAULT_CARRY_PARAGRAPHS = 2;
   const EARLY_PRONOUN_WINDOW = 160;
 
-  // Mixed-gender resolver tuning
-  const NEAR_NAME_WINDOW = 80;          // characters: if pronoun is within this many chars after a name, assume it refers to that name
-  const OBJECT_FALLBACK_WINDOW = 220;   // characters: for him/her fallback logic when no nearby name
-
   // UI character list settings
   const MAX_NAMES_SHOWN = 3;
+
+  // Mixed-sentence resolver tuning
+  const NEAR_NAME_WINDOW = 90;      // how close a pronoun must be to a name/alias to inherit that gender
+  const OPPONENT_OBJECT_BIAS = true; // in mixed sentences, object pronouns often refer to "the other person"
+
+  // Gendered-term fallback (weak signal, used only when no character match)
+  const GENDERED_TERMS = {
+    male: [
+      String.raw`\bbig brother\b`, String.raw`\belder brother\b`, String.raw`\byounger brother\b`,
+      String.raw`\bbrother\b`, String.raw`\bgroom\b`, String.raw`\bhusband\b`,
+      String.raw`\bfather\b`, String.raw`\bdad\b`, String.raw`\buncle\b`,
+      String.raw`\bking\b`, String.raw`\bprince\b`, String.raw`\bsir\b`,
+      String.raw`\bmister\b`, String.raw`\bmr\.?(?!s)\b`,
+      String.raw`\bson\b`, String.raw`\bboy\b`, String.raw`\bman\b`, String.raw`\bmen\b`
+    ],
+    female: [
+      String.raw`\bbig sister\b`, String.raw`\belder sister\b`, String.raw`\byounger sister\b`,
+      String.raw`\bsister\b`, String.raw`\bbride\b`, String.raw`\bwife\b`,
+      String.raw`\bmother\b`, String.raw`\bmom\b`, String.raw`\baunt\b`,
+      String.raw`\bqueen\b`, String.raw`\bprincess\b`, String.raw`\blady\b`,
+      String.raw`\bmadam\b`, String.raw`\bmiss\b`,
+      String.raw`\bdaughter\b`, String.raw`\bgirl\b`, String.raw`\bwoman\b`, String.raw`\bwomen\b`
+    ]
+  };
 
   // Glossary cache
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
@@ -56,7 +77,7 @@
   }
 
   function normalizeWeirdSpaces(s) {
-    return s.replace(/\u00A0|\u2009|\u202F/g, " ");
+    return String(s).replace(/\u00A0|\u2009|\u202F/g, " ");
   }
 
   function isSceneBreak(t) {
@@ -78,8 +99,26 @@
     return /\b(she|he|her|him|his|hers|herself|himself)\b/i.test(head);
   }
 
+  function countRegexMatches(text, pattern) {
+    const m = text.match(new RegExp(pattern, "giu"));
+    return m ? m.length : 0;
+  }
+
+  function detectGenderFromTerms(text) {
+    const src = (text || "").toLowerCase();
+    let maleScore = 0, femaleScore = 0;
+    for (const p of GENDERED_TERMS.male) maleScore += countRegexMatches(src, p);
+    for (const p of GENDERED_TERMS.female) femaleScore += countRegexMatches(src, p);
+
+    if (maleScore && !femaleScore) return "male";
+    if (femaleScore && !maleScore) return "female";
+    if (maleScore >= femaleScore + 2) return "male";
+    if (femaleScore >= maleScore + 2) return "female";
+    return null;
+  }
+
   // ==========================================================
-  // Pronoun replacement (your existing robust rules)
+  // Smart pronoun replacement (token-level safe)
   // ==========================================================
   function replacePronounsSmart(text, direction /* "toMale" | "toFemale" */) {
     text = normalizeWeirdSpaces(text);
@@ -136,6 +175,10 @@
     return text;
   }
 
+  function directionFromGender(g) {
+    return g === "female" ? "toFemale" : "toMale";
+  }
+
   // ==========================================================
   // Content targeting (avoid nav/footer/toolbars)
   // ==========================================================
@@ -178,13 +221,6 @@
   // ==========================================================
   // Glossary helpers + scoring
   // ==========================================================
-  function pickKey(glossary) {
-    const url = location.href;
-    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
-    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
-    return matches[0] || "default";
-  }
-
   function countOccurrences(haystack, needle) {
     if (!needle) return 0;
     let idx = 0, count = 0;
@@ -213,16 +249,19 @@
     return (best && best.score >= 300) ? best : null;
   }
 
-  function directionFromGender(g) {
-    return g === "female" ? "toFemale" : "toMale";
+  function pickKey(glossary) {
+    const url = location.href;
+    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
+    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
+    return matches[0] || "default";
   }
 
   // ==========================================================
-  // NEW: Mixed-gender sentence resolver
+  // Mixed-sentence resolver
   // ==========================================================
-  function buildMentionIndex(sentence, entries) {
-    const mentions = [];
+  function buildMentions(sentence, entries) {
     const lower = sentence.toLowerCase();
+    const mentions = [];
 
     for (const [name, info] of entries) {
       const g = String(info.gender || "").toLowerCase();
@@ -238,12 +277,14 @@
         while (true) {
           idx = lower.indexOf(needle, idx);
           if (idx === -1) break;
-          // crude word-boundary-ish check to reduce false matches
+
+          // simple boundary checks
           const before = lower[idx - 1];
           const after = lower[idx + needle.length];
           const okBefore = !before || !/[a-z0-9]/i.test(before);
           const okAfter = !after || !/[a-z0-9]/i.test(after);
-          if (okBefore && okAfter) mentions.push({ pos: idx, len: needle.length, gender: g });
+
+          if (okBefore && okAfter) mentions.push({ pos: idx, gender: g });
           idx += needle.length;
         }
       }
@@ -253,136 +294,85 @@
     return mentions;
   }
 
-  function nextNonSpaceChar(text, startIdx) {
-    const m = text.slice(startIdx).match(/^\s*([\s\S])/u);
-    return m ? m[1] : "";
-  }
-
-  function normalizePronounToken(raw, targetGender, nextChar) {
-    const w = raw;
-    const lw = raw.toLowerCase();
-
-    const nextIsLetter = !!(nextChar && /\p{L}/u.test(nextChar));
-
-    // Decide replacement base (lowercase), then caseLike() to match original
-    let repl = null;
-
-    if (targetGender === "female") {
-      if (lw === "he") repl = "she";
-      else if (lw === "him") repl = "her";
-      else if (lw === "his") repl = nextIsLetter ? "her" : "hers";
-      else if (lw === "hers") repl = "hers";
-      else if (lw === "himself") repl = "herself";
-      else if (lw === "herself") repl = "herself";
-      else if (lw === "her") {
-        // if 'her' followed by a noun and target is female, keep 'her'
-        repl = "her";
+  function mixedSentenceFix(sentence, entries, defaultGender) {
+    const mentions = buildMentions(sentence, entries);
+    const genders = new Set(mentions.map(m => m.gender));
+    if (genders.size < 2) {
+      // Not mixed -> default fallback if given, otherwise return as-is
+      if (defaultGender === "female" || defaultGender === "male") {
+        return replacePronounsSmart(sentence, directionFromGender(defaultGender));
       }
-    } else if (targetGender === "male") {
-      if (lw === "she") repl = "he";
-      else if (lw === "her") repl = nextIsLetter ? "his" : "him";
-      else if (lw === "hers") repl = "his";
-      else if (lw === "his") repl = "his";
-      else if (lw === "herself") repl = "himself";
-      else if (lw === "himself") repl = "himself";
-      else if (lw === "him") repl = "him";
-      else if (lw === "he") repl = "he";
+      return sentence;
     }
 
-    if (!repl) return w;
-    return caseLike(w, repl);
-  }
+    const pronRe = /\b(he|she|him|her|his|hers|himself|herself)\b/giu;
 
-  function fixMixedGenderSentence(sentence, entries) {
-    // Find mentioned genders
-    const mentions = buildMentionIndex(sentence, entries);
-    const genders = new Set(mentions.map(m => m.gender));
-    if (genders.size < 2) return sentence; // not mixed
-
-    // Track "last mentioned gender" while scanning pronouns
-    const pronounRe = /\b(he|she|him|her|his|hers|himself|herself)\b/giu;
-
-    let lastMentionIdx = 0;
+    let mi = 0;
     let lastMentionGender = null;
-    let lastTargetGender = null;
 
-    const out = sentence.replace(pronounRe, (m, _p, offset) => {
-      // advance lastGender to last mention before this pronoun
-      while (lastMentionIdx < mentions.length && mentions[lastMentionIdx].pos < offset) {
-        lastMentionGender = mentions[lastMentionIdx].gender;
-        lastMentionIdx++;
+    return sentence.replace(pronRe, (m, _p, offset) => {
+      // Advance mentions up to this pronoun position
+      while (mi < mentions.length && mentions[mi].pos < offset) {
+        lastMentionGender = mentions[mi].gender;
+        mi++;
       }
 
-      // nearest mention distance (previous mention only)
-      const prevMention = (lastMentionIdx > 0) ? mentions[lastMentionIdx - 1] : null;
-      const dist = prevMention ? (offset - prevMention.pos) : Infinity;
+      const prev = (mi > 0) ? mentions[mi - 1] : null;
+      const dist = prev ? (offset - prev.pos) : Infinity;
 
-      const priorContext = lastTargetGender || lastMentionGender;
-
-      // Determine target gender for this pronoun
       let target = null;
 
-      if (prevMention && dist <= NEAR_NAME_WINDOW) {
-        // Close to a name => assume refers to that name
-        target = prevMention.gender;
-      } else {
+      // If close to a name/alias, inherit that gender
+      if (prev && dist <= NEAR_NAME_WINDOW) {
+        target = prev.gender;
+      } else if (lastMentionGender) {
+        // Heuristic: in mixed sentences, object pronouns often refer to opponent ("the other one")
         const lw = m.toLowerCase();
-        const isObjectLike = (lw === "him" || lw === "her" || lw === "himself" || lw === "herself");
-
-        if (isObjectLike && priorContext && genders.size === 2) {
-          // For mixed sentences, object pronouns often refer to "the other" participant (opponent/victim)
-          target = (priorContext === "female") ? "male" : "female";
-        } else if (priorContext) {
-          // Otherwise follow the last mentioned character/pronoun
-          target = priorContext;
+        const isObject = (lw === "him" || lw === "her" || lw === "himself" || lw === "herself");
+        if (OPPONENT_OBJECT_BIAS && isObject) {
+          target = (lastMentionGender === "female") ? "male" : "female";
         } else {
-          // No mentions at all (shouldn't happen if mixed), leave unchanged
-          target = null;
+          target = lastMentionGender;
         }
+      } else if (defaultGender === "female" || defaultGender === "male") {
+        target = defaultGender;
+      } else {
+        return m;
       }
 
-      if (!target) return m;
-
-      lastTargetGender = target;
-
-      // Peek next character to handle her/his possession decision
-      const nextChar = nextNonSpaceChar(sentence, offset + m.length) || "";
-      return normalizePronounToken(m, target, nextChar);
+      const dir = directionFromGender(target);
+      return replacePronounsSmart(m, dir);
     });
-
-    return out;
   }
 
-  function fixTextWithSentenceLogic(text, entries, primaryCharacter) {
-    let s = normalizeWeirdSpaces(text);
+  function fixTextSentenceLevel(text, entries, primaryCharacter, defaultGender) {
+    // Sentence splitting: keep it simple but effective
+    const parts = String(text).split(/(?<=[.!?…])\s+/u);
 
-    // Split sentences but keep punctuation with the sentence
-    // (This is intentionally simple/fast; web novel text is messy.)
-    const parts = s.split(/(?<=[.!?…])\s+/u);
-
-    const fixed = parts.map(sent => {
+    return parts.map(sent => {
+      // If sentence has a strong single-character match, prefer that
       const match = bestCharacterForText(sent, entries, primaryCharacter);
-
-      // If sentence clearly belongs to one character gender, use your strong replacer
       if (match) {
         const g = String(match.info.gender || "").toLowerCase();
         if (g === "female" || g === "male") {
-          const dir = directionFromGender(g);
-          return replacePronounsSmart(sent, dir);
+          return replacePronounsSmart(sent, directionFromGender(g));
         }
       }
 
-      // Otherwise, only do mixed-gender resolution if it appears mixed
-      return fixMixedGenderSentence(sent, entries);
-    });
+      // Try mixed resolver (will fall back to defaultGender if not mixed)
+      const mixedFixed = mixedSentenceFix(sent, entries, defaultGender);
+      if (mixedFixed !== sent) return mixedFixed;
 
-    return fixed.join(" ");
+      // If still unchanged, try gendered terms fallback (weak)
+      const termGender = detectGenderFromTerms(sent);
+      if (termGender) return replacePronounsSmart(sent, directionFromGender(termGender));
+
+      // Else return as-is
+      return sent;
+    }).join(" ");
   }
 
-  // ==========================================================
-  // Text node walker (UPDATED to use sentence-level logic)
-  // ==========================================================
-  function replaceInTextNodes(blockEl, entries, primaryCharacter) {
+  function replaceInTextNodes(blockEl, entries, primaryCharacter, defaultGender) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent = node.parentNode;
@@ -400,14 +390,14 @@
     while (walker.nextNode()) {
       const node = walker.currentNode;
       const before = node.nodeValue;
-      const after = fixTextWithSentenceLogic(before, entries, primaryCharacter);
+      const after = fixTextSentenceLevel(before, entries, primaryCharacter, defaultGender);
       if (after !== before) { node.nodeValue = after; changed++; }
     }
     return changed;
   }
 
   // ==========================================================
-  // UI (unchanged from your current version, kept minimal here)
+  // UI
   // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
@@ -423,8 +413,13 @@
     let glossaryOk = true;
 
     function applyPos(el) {
-      if (savedPos.left != null) { el.style.left = savedPos.left + "px"; el.style.right = "auto"; }
-      else { el.style.right = "12px"; el.style.left = "auto"; }
+      if (savedPos.left != null) {
+        el.style.left = savedPos.left + "px";
+        el.style.right = "auto";
+      } else {
+        el.style.right = "12px";
+        el.style.left = "auto";
+      }
       el.style.top = (savedPos.top ?? 12) + "px";
     }
 
@@ -463,11 +458,17 @@
         el.style.right = "auto";
       });
 
-      const end = () => { if (!dragging) return; dragging = false; clampToViewport(el); };
+      const end = () => {
+        if (!dragging) return;
+        dragging = false;
+        clampToViewport(el);
+      };
+
       el.addEventListener("pointerup", end);
       el.addEventListener("pointercancel", end);
     }
 
+    // Expanded panel
     const box = document.createElement("div");
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
@@ -499,20 +500,10 @@
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     `;
 
-    const minBtn = document.createElement("button");
-    minBtn.type = "button";
-    minBtn.textContent = "—";
-    minBtn.title = "Minimise";
-    minBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:26px; height:26px; border-radius:9px;
-      background:rgba(255,255,255,0.12); color:#fff;
-      font-size:16px; line-height:26px; padding:0;
-    `;
-
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
     resetBtn.textContent = "↺";
+    resetBtn.setAttribute("aria-label", "Reset Changed");
     resetBtn.title = "Reset Changed";
     resetBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
@@ -521,9 +512,22 @@
       font-size:14px; line-height:26px; padding:0;
     `;
 
+    const minBtn = document.createElement("button");
+    minBtn.type = "button";
+    minBtn.textContent = "—";
+    minBtn.setAttribute("aria-label", "Minimise");
+    minBtn.title = "Minimise";
+    minBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      width:26px; height:26px; border-radius:9px;
+      background:rgba(255,255,255,0.12); color:#fff;
+      font-size:16px; line-height:26px; padding:0;
+    `;
+
     const bullets = document.createElement("div");
     bullets.style.cssText = `white-space: pre-line; opacity: .95;`;
 
+    // Minimised pill: PF (ON/OFF) + expand button
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
@@ -541,11 +545,12 @@
     pillRow.style.cssText = `display:flex; align-items:center; gap:8px;`;
 
     const pillText = document.createElement("div");
-    pillText.style.cssText = `padding: 2px 6px; white-space: nowrap;`;
+    pillText.style.cssText = `padding: 2px 6px; white-space: nowrap; cursor:pointer;`;
 
     const pillExpandBtn = document.createElement("button");
     pillExpandBtn.type = "button";
     pillExpandBtn.textContent = "+";
+    pillExpandBtn.setAttribute("aria-label", "Expand");
     pillExpandBtn.title = "Expand";
     pillExpandBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
@@ -562,14 +567,25 @@
     }
 
     function refreshPanelBullets() {
-      if (!glossaryOk) { bullets.textContent = "Glossary error"; return; }
+      if (!glossaryOk) {
+        bullets.textContent = "Glossary error";
+        return;
+      }
       const line1 = `• Characters: ${charactersCount}` + (charactersList3 ? ` • ${charactersList3}` : "");
       const line2 = `• Changed: ${changedTotal}`;
       bullets.textContent = `${line1}\n${line2}`;
     }
 
-    toggleBtn.onclick = () => { setEnabled(!enabled()); refreshToggleUI(); setTimeout(() => location.reload(), 150); };
-    resetBtn.onclick = () => { changedTotal = 0; refreshPanelBullets(); };
+    toggleBtn.onclick = () => {
+      setEnabled(!enabled());
+      refreshToggleUI();
+      setTimeout(() => location.reload(), 150);
+    };
+
+    resetBtn.onclick = () => {
+      changedTotal = 0;
+      refreshPanelBullets();
+    };
 
     function syncPos(fromEl, toEl) {
       const r = fromEl.getBoundingClientRect();
@@ -599,6 +615,7 @@
     controls.appendChild(toggleBtn);
     controls.appendChild(resetBtn);
     controls.appendChild(minBtn);
+
     topRow.appendChild(title);
     topRow.appendChild(controls);
 
@@ -616,23 +633,34 @@
     refreshPanelBullets();
 
     if (localStorage.getItem(UI_KEY_MIN) === "1") setMin(true);
-    window.addEventListener("resize", () => clampToViewport(localStorage.getItem(UI_KEY_MIN) === "1" ? pill : box));
+
+    window.addEventListener("resize", () => {
+      clampToViewport(localStorage.getItem(UI_KEY_MIN) === "1" ? pill : box);
+    });
 
     return {
       isEnabled: () => enabled(),
       setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshPanelBullets(); },
       setCharacters: (entries) => {
         charactersCount = entries.length;
+
         const names = entries.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
           const g = String(info.gender || "").toLowerCase();
           const label = (g === "female" || g === "male") ? g : "unknown";
           return `${name} (${label})`;
         });
+
         charactersList3 = names.join(", ") + (entries.length > MAX_NAMES_SHOWN ? " …" : "");
         refreshPanelBullets();
       },
-      addChanged: (delta) => { if (Number.isFinite(delta) && delta > 0) changedTotal += delta; refreshPanelBullets(); },
-      setChanged: (n) => { changedTotal = Number.isFinite(n) ? Math.max(0, n) : 0; refreshPanelBullets(); },
+      addChanged: (delta) => {
+        if (Number.isFinite(delta) && delta > 0) changedTotal += delta;
+        refreshPanelBullets();
+      },
+      setChanged: (n) => {
+        changedTotal = Number.isFinite(n) ? Math.max(0, n) : 0;
+        refreshPanelBullets();
+      },
       refreshUI: refreshToggleUI
     };
   }
@@ -713,22 +741,36 @@
     }
 
     let glossary;
-    try { glossary = await loadGlossaryJSON(GLOSSARY_URL); }
-    catch { ui.setGlossaryOk(false); ui.setChanged(0); return; }
+    try {
+      glossary = await loadGlossaryJSON(GLOSSARY_URL);
+    } catch {
+      ui.setGlossaryOk(false);
+      ui.setChanged(0);
+      return;
+    }
 
     const key = pickKey(glossary);
     const cfg = glossary[key] || {};
-    const characters = { ...(glossary.default?.characters || {}), ...(cfg.characters || {}) };
+
+    const characters = {
+      ...(glossary.default?.characters || {}),
+      ...(cfg.characters || {})
+    };
     const entries = Object.entries(characters);
 
-    if (!entries.length) { ui.setGlossaryOk(false); ui.setChanged(0); return; }
+    if (!entries.length) {
+      ui.setGlossaryOk(false);
+      ui.setChanged(0);
+      return;
+    }
 
     ui.setGlossaryOk(true);
     ui.setCharacters(entries);
 
-    const mode = String(cfg.mode || "paragraph").toLowerCase(); // kept for compatibility
+    const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
     const forceGender = String(cfg.forceGender || "").toLowerCase();
+
     const carryParagraphs = Number.isFinite(+cfg.carryParagraphs)
       ? Math.max(0, Math.min(5, +cfg.carryParagraphs))
       : DEFAULT_CARRY_PARAGRAPHS;
@@ -743,10 +785,14 @@
 
     function computeGenderForText(text) {
       if (forceGender === "male" || forceGender === "female") return forceGender;
+
       const match = bestCharacterForText(text, entries, primaryCharacter);
-      if (!match) return null;
-      const g = String(match.info.gender || "").toLowerCase();
-      return (g === "female" || g === "male") ? g : null;
+      if (match) {
+        const g = String(match.info.gender || "").toLowerCase();
+        if (g === "female" || g === "male") return g;
+      }
+
+      return detectGenderFromTerms(text);
     }
 
     function run() {
@@ -759,9 +805,22 @@
 
       const blocks = getTextBlocks(root);
 
+      // Chapter mode fallback: uses a single gender unless mixed resolver overrides within sentences
+      let usedMode = mode;
+      let chapterGender = null;
+
+      if (mode === "chapter") {
+        if (forceGender === "male" || forceGender === "female") {
+          chapterGender = forceGender;
+        } else if (primaryCharacter && characters[primaryCharacter]) {
+          const g = String(characters[primaryCharacter].gender || "").toLowerCase();
+          if (g === "female" || g === "male") chapterGender = g;
+        }
+        if (!chapterGender) usedMode = "paragraph";
+      }
+
       let lastGender = null;
       let carryLeft = 0;
-
       let changedThisRun = 0;
 
       for (const b of blocks) {
@@ -774,21 +833,32 @@
           continue;
         }
 
-        // Determine base gender for carry logic (paragraph-level)
-        let g = computeGenderForText(bt);
-        let hadDirectMatch = !!g;
+        let defaultGender = null;
+        let hadDirectMatch = false;
 
-        if (!g && lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
-          g = lastGender;
-          carryLeft--;
+        if (usedMode === "chapter") {
+          defaultGender = chapterGender;
+          hadDirectMatch = true;
+        } else {
+          const computed = computeGenderForText(bt);
+          if (computed) {
+            defaultGender = computed;
+            hadDirectMatch = true;
+          } else if (
+            lastGender &&
+            carryLeft > 0 &&
+            (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))
+          ) {
+            defaultGender = lastGender;
+            carryLeft--;
+          }
         }
 
-        // Apply sentence-level logic regardless of paragraph gender (this is the key change)
-        // (If we have a single gender sentence, it will still route through replacePronounsSmart internally.)
-        changedThisRun += replaceInTextNodes(b, entries, primaryCharacter);
+        // Apply sentence-level fixes (handles mixed-gender sentences)
+        changedThisRun += replaceInTextNodes(b, entries, primaryCharacter, defaultGender);
 
-        if (hadDirectMatch) {
-          lastGender = g;
+        if (usedMode !== "chapter" && hadDirectMatch && (defaultGender === "male" || defaultGender === "female")) {
+          lastGender = defaultGender;
           carryLeft = carryParagraphs;
         }
       }
