@@ -21,7 +21,7 @@
   // ==========================================================
   // USER SETTINGS
   // ==========================================================
-  const GLOSSARY_URL = "https://raw.githubusercontent.com/youaremyhero/wtr-lab-pronouns-fix/main/glossary.templates.json";
+  const GLOSSARY_URL = "https://raw.githubusercontent.com/youaremyhero/wtr-lab-pronouns-fix/main/glossary.template.json";
   const DEFAULT_CARRY_PARAGRAPHS = 2;
   const EARLY_PRONOUN_WINDOW = 160;
 
