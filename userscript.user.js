@@ -253,6 +253,11 @@
     return mentions;
   }
 
+  function nextNonSpaceChar(text, startIdx) {
+    const m = text.slice(startIdx).match(/^\s*([\s\S])/u);
+    return m ? m[1] : "";
+  }
+
   function normalizePronounToken(raw, targetGender, nextChar) {
     const w = raw;
     const lw = raw.toLowerCase();
@@ -298,18 +303,21 @@
     const pronounRe = /\b(he|she|him|her|his|hers|himself|herself)\b/giu;
 
     let lastMentionIdx = 0;
-    let lastGender = null;
+    let lastMentionGender = null;
+    let lastTargetGender = null;
 
     const out = sentence.replace(pronounRe, (m, _p, offset) => {
       // advance lastGender to last mention before this pronoun
       while (lastMentionIdx < mentions.length && mentions[lastMentionIdx].pos < offset) {
-        lastGender = mentions[lastMentionIdx].gender;
+        lastMentionGender = mentions[lastMentionIdx].gender;
         lastMentionIdx++;
       }
 
       // nearest mention distance (previous mention only)
       const prevMention = (lastMentionIdx > 0) ? mentions[lastMentionIdx - 1] : null;
       const dist = prevMention ? (offset - prevMention.pos) : Infinity;
+
+      const priorContext = lastTargetGender || lastMentionGender;
 
       // Determine target gender for this pronoun
       let target = null;
@@ -321,12 +329,12 @@
         const lw = m.toLowerCase();
         const isObjectLike = (lw === "him" || lw === "her" || lw === "himself" || lw === "herself");
 
-        if (isObjectLike && lastGender && genders.size === 2) {
+        if (isObjectLike && priorContext && genders.size === 2) {
           // For mixed sentences, object pronouns often refer to "the other" participant (opponent/victim)
-          target = (lastGender === "female") ? "male" : "female";
-        } else if (lastGender) {
-          // Otherwise follow the last mentioned character
-          target = lastGender;
+          target = (priorContext === "female") ? "male" : "female";
+        } else if (priorContext) {
+          // Otherwise follow the last mentioned character/pronoun
+          target = priorContext;
         } else {
           // No mentions at all (shouldn't happen if mixed), leave unchanged
           target = null;
@@ -335,8 +343,10 @@
 
       if (!target) return m;
 
+      lastTargetGender = target;
+
       // Peek next character to handle her/his possession decision
-      const nextChar = sentence[offset + m.length] || "";
+      const nextChar = nextNonSpaceChar(sentence, offset + m.length) || "";
       return normalizePronounToken(m, target, nextChar);
     });
 
