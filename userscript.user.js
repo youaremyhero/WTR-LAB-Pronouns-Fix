@@ -25,6 +25,49 @@
   const DEFAULT_CARRY_PARAGRAPHS = 2;
   const EARLY_PRONOUN_WINDOW = 160;
 
+  const GENDERED_TERMS = {
+    male: [
+      String.raw`\bbrother\b`,
+      String.raw`\bbig brother\b`,
+      String.raw`\belder brother\b`,
+      String.raw`\byounger brother\b`,
+      String.raw`\bgroom\b`,
+      String.raw`\bhusband\b`,
+      String.raw`\bfather\b`,
+      String.raw`\bdad\b`,
+      String.raw`\buncle\b`,
+      String.raw`\bking\b`,
+      String.raw`\bprince\b`,
+      String.raw`\bsir\b`,
+      String.raw`\bmister\b`,
+      String.raw`\bmr\.?(?!s)\b`,
+      String.raw`\bson\b`,
+      String.raw`\bboy\b`,
+      String.raw`\bman\b`,
+      String.raw`\bmen\b`
+    ],
+    female: [
+      String.raw`\bsister\b`,
+      String.raw`\bbig sister\b`,
+      String.raw`\belder sister\b`,
+      String.raw`\byounger sister\b`,
+      String.raw`\bbride\b`,
+      String.raw`\bwife\b`,
+      String.raw`\bmother\b`,
+      String.raw`\bmom\b`,
+      String.raw`\baunt\b`,
+      String.raw`\bqueen\b`,
+      String.raw`\bprincess\b`,
+      String.raw`\blady\b`,
+      String.raw`\bmadam\b`,
+      String.raw`\bmiss\b`,
+      String.raw`\bdaughter\b`,
+      String.raw`\bgirl\b`,
+      String.raw`\bwoman\b`,
+      String.raw`\bwomen\b`
+    ]
+  };
+
   // UI character list settings
   const MAX_NAMES_SHOWN = 3;
 
@@ -53,6 +96,25 @@
 
   function normalizeWeirdSpaces(s) {
     return s.replace(/\u00A0|\u2009|\u202F/g, " ");
+  }
+
+  function countRegexMatches(text, pattern) {
+    const matches = text.match(new RegExp(pattern, "gi"));
+    return matches ? matches.length : 0;
+  }
+
+  function detectGenderFromTerms(text) {
+    const src = (text || "").toLowerCase();
+    let maleScore = 0, femaleScore = 0;
+
+    for (const p of GENDERED_TERMS.male) maleScore += countRegexMatches(src, p);
+    for (const p of GENDERED_TERMS.female) femaleScore += countRegexMatches(src, p);
+
+    if (maleScore && !femaleScore) return "male";
+    if (femaleScore && !maleScore) return "female";
+    if (maleScore >= femaleScore + 2) return "male";
+    if (femaleScore >= maleScore + 2) return "female";
+    return null;
   }
 
   function isSceneBreak(t) {
@@ -208,7 +270,7 @@
     const box = document.createElement("div");
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
-      background: rgba(0,0,0,0.72); color: #fff;
+      background: rgba(0,0,0,0.62); color: #fff;
       border-radius: 12px; padding: 10px 12px;
       font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
@@ -269,7 +331,7 @@
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
-      background: rgba(0,0,0,0.72); color:#fff;
+      background: rgba(0,0,0,0.62); color:#fff;
       border-radius: 999px;
       padding: 6px 8px;
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
@@ -636,9 +698,11 @@
     function computeGenderForText(text) {
       if (forceGender === "male" || forceGender === "female") return forceGender;
       const match = bestCharacterForText(text, entries, primaryCharacter);
-      if (!match) return null;
-      const g = String(match.info.gender || "").toLowerCase();
-      return (g === "female" || g === "male") ? g : null;
+      if (match) {
+        const g = String(match.info.gender || "").toLowerCase();
+        if (g === "female" || g === "male") return g;
+      }
+      return detectGenderFromTerms(text);
     }
 
     function run() {

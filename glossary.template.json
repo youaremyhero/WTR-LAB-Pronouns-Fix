@@ -7,7 +7,9 @@
     "carryParagraphs": 3,
     "characters": {
       "Qi Xu": { "gender": "female", "aliases": ["Asuna"] },
-      "Magic Boy": { "gender": "male", "aliases": ["Retired Magical Boy", "Magical Boy"] }
+      "Magic Boy": { "gender": "male", "aliases": ["Retired Magical Boy", "Magical Boy"] },
+      "Awesome Plus": { "gender": "male" },
+      "Li Zhi": { "gender": "male" }
     }
   }
 }
