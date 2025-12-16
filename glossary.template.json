@@ -9,7 +9,8 @@
       "Qi Xu": { "gender": "female", "aliases": ["Asuna"] },
       "Magic Boy": { "gender": "male", "aliases": ["Retired Magical Boy", "Magical Boy"] },
       "Awesome Plus": { "gender": "male" },
-      "Li Zhi": { "gender": "male" }
+      "Li Zhi": { "gender": "male" },
+      "Chinese Cooking Master": { "gender": "male", "aliases": ["Chinese Master Chef", "Chinese Cooking Boy"] }
     }
   }
 }
