@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.0
-// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives). NEW: TermMemory Assist (Add Character/Add Term from WTR terms or highlighted selection, pin preferred terms across chapters, copy-ready JSON lines, persists until Copy/Clear).
+// @version      4.9.1
+// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Draft Add Character/Term + persistent TermMemory + Term patches (hash-based). Faster + per-chapter detected characters. Optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives, mixed pronoun normalization).
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
 // @connect      raw.githubusercontent.com
 // @connect      gist.githubusercontent.com
 // @connect      githubusercontent.com
@@ -32,23 +35,18 @@
   const MAX_NAMES_SHOWN = 3;
 
   // Cache
-  const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
-  const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v1";
+  const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v2";
+  const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v2";
   const GLOSSARY_CACHE_TTL_MS = 10 * 60 * 1000;
 
   // Persistent UI state
-  const UI_KEY_MIN = "wtrpf_ui_min_v1";
-  const UI_KEY_POS = "wtrpf_ui_pos_v1";
-  const UI_KEY_ON  = "wtrpf_enabled_v1";
+  const UI_KEY_MIN = "wtrpf_ui_min_v2";
+  const UI_KEY_POS = "wtrpf_ui_pos_v2";
+  const UI_KEY_ON  = "wtrpf_enabled_v2";
 
-  // ==========================================================
-  // TermMemory (NEW)
-  // ==========================================================
-  const TERM_MEM_KEY = "wtrpf_term_memory_v1";
-  const TERM_MEM_META_KEY = "wtrpf_term_memory_meta_v1"; // small meta; safe to delete
-
-  // NOTE: If user clears browser data / site data (incl. Local Storage), TermMemory is lost.
-  // Clearing “cache” alone sometimes doesn’t remove Local Storage, but “Clear site data” usually does.
+  // Draft + term memory (Tampermonkey persistent storage)
+  const DRAFT_KEY = "wtrpf_draft_v1";
+  const TERM_MEM_KEY = "wtrpf_term_memory_v1"; // persists across chapters; NOT cleared by Copy/Clear Draft
 
   // ==========================================================
   // Utilities
@@ -58,6 +56,7 @@
 
   const RX_PRONOUN_MALE = /\b(he|him|his|himself)\b/gi;
   const RX_PRONOUN_FEMALE = /\b(she|her|hers|herself)\b/gi;
+  const RX_ANY_PRONOUN = /\b(he|him|his|himself|she|her|hers|herself)\b/i;
 
   const RX_ATTACK_CUES = /\b(knife|blade|sword|dagger|stab|stabs|stabbed|slash|slashed|strike|struck|hit|hits|punched|kicked|cut|pierce|pierced|neck|chest)\b/i;
 
@@ -97,40 +96,8 @@
     return m ? m.length : 0;
   }
 
-  function nowISO() {
-    try { return new Date().toISOString(); } catch { return String(Date.now()); }
-  }
-
-  function safeJSONParse(s, fallback) {
-    try { return JSON.parse(s); } catch { return fallback; }
-  }
-
   // ==========================================================
-  // TermMemory store
-  // ==========================================================
-  function loadTermMemory() {
-    const raw = localStorage.getItem(TERM_MEM_KEY);
-    const data = safeJSONParse(raw, null);
-    if (!data || typeof data !== "object") {
-      return { items: {} };
-    }
-    if (!data.items || typeof data.items !== "object") data.items = {};
-    return data;
-  }
-
-  function saveTermMemory(mem) {
-    localStorage.setItem(TERM_MEM_KEY, JSON.stringify(mem));
-    localStorage.setItem(TERM_MEM_META_KEY, JSON.stringify({ updatedAt: nowISO() }));
-  }
-
-  function termKeyFrom(hash, text) {
-    if (hash) return `hash:${hash}`;
-    const t = String(text || "").trim();
-    return `text:${t.toLowerCase()}`;
-  }
-
-  // ==========================================================
-  // Smart pronoun replacement (existing engine)
+  // Smart pronoun replacement
   // ==========================================================
   function replacePronounsSmart(text, direction /* "toMale" | "toFemale" */) {
     text = normalizeWeirdSpaces(text);
@@ -204,6 +171,15 @@
     return maleCount > femCount;
   }
 
+  // Less strict than conservativeShouldApply():
+  // If paragraph contains ANY "wrong" pronoun for that gender, we allow a full pass.
+  function hasAnyWrongPronoun(region, gender) {
+    const maleCount = countMatches(RX_PRONOUN_MALE, region);
+    const femCount  = countMatches(RX_PRONOUN_FEMALE, region);
+    if (gender === "male") return femCount > 0;
+    return maleCount > 0;
+  }
+
   function detectDialogueSpeakerGender(text, entries) {
     const s = text;
     const found = [];
@@ -211,10 +187,8 @@
       const g = String(info.gender || "").toLowerCase();
       if (g !== "male" && g !== "female") continue;
       const nEsc = escapeRegExp(name);
-
       const rx1 = new RegExp(String.raw`["“][^"”]{3,}["”]\s*(?:,?\s*)?(?:said|asked|shouted|whispered|replied|muttered|yelled)\s+${nEsc}\b`, "i");
       const rx2 = new RegExp(String.raw`\b${nEsc}\b\s*(?:said|asked|shouted|whispered|replied|muttered|yelled)\s*(?:,?\s*)?["“]`, "i");
-
       if (rx1.test(s) || rx2.test(s)) found.push(g);
     }
     if (!found.length) return null;
@@ -234,7 +208,11 @@
     return null;
   }
 
-  function applyAnchoredFixes(text, entries, opts) {
+  // ==========================================================
+  // Upgrade: Anchored local fixes
+  // (Optimized: apply only to "active" entries present in the paragraph)
+  // ==========================================================
+  function applyAnchoredFixes(text, activeEntries, opts) {
     let changed = 0;
     let s = normalizeWeirdSpaces(text);
 
@@ -244,7 +222,7 @@
       onlyChangeIfWrong = false
     } = opts;
 
-    for (const [name, info] of entries) {
+    for (const [name, info] of activeEntries) {
       const gender = String(info.gender || "").toLowerCase();
       if (gender !== "male" && gender !== "female") continue;
 
@@ -278,7 +256,7 @@
           let after = replacePronounsSmart(region, dir);
 
           if (passiveVoice) {
-            const gAgent = detectPassiveAgentGender(region, entries);
+            const gAgent = detectPassiveAgentGender(region, activeEntries);
             if (gAgent) {
               const d2 = (gAgent === "female") ? "toFemale" : "toMale";
               after = replacePronounsSmart(after, d2);
@@ -298,267 +276,65 @@
   }
 
   // ==========================================================
-  // Content targeting
+  // Term patches (hash-based)
+  // - Uses WTR term spans: <span class="text-patch system" data-hash="...">Displayed</span>
+  // - We store preferred text by hash in TERM_MEM.
+  // - Optional glossary can ship defaults (cfg.termPatches).
   // ==========================================================
-  function findContentRoot() {
-    const candidates = Array.from(document.querySelectorAll(
-      "article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section, .chapter-body"
-    ));
-    let best = null, bestScore = 0;
-    for (const el of candidates) {
-      const pCount = el.querySelectorAll("p").length;
-      const textLen = (el.innerText || "").trim().length;
-      const score = (pCount * 1200) + textLen;
-      if (score > bestScore && textLen > 800) { bestScore = score; best = el; }
-    }
-    return best || document.body;
+  function loadTermMemory() {
+    try { return GM_getValue(TERM_MEM_KEY, {}) || {}; } catch { return {}; }
+  }
+  function saveTermMemory(mem) {
+    try { GM_setValue(TERM_MEM_KEY, mem || {}); } catch {}
   }
 
-  const SKIP_CLOSEST = [
-    "header","nav","footer","aside","form",
-    "button","input","textarea","select",
-    "[role='navigation']",
-    ".breadcrumbs",".breadcrumb",".toolbar",".tools",".tool",
-    ".pagination",".pager",".share",".social",
-    ".menu",".navbar",".nav",".btn",".button",
-    ".mini-term-editor" // avoid interacting with WTR editor directly
-  ].join(",");
-
-  function isSkippable(el) {
-    return !!(el && el.closest && el.closest(SKIP_CLOSEST));
-  }
-
-  function getTextBlocks(root) {
-    const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
-    return blocks.filter(b => {
-      if (isSkippable(b)) return false;
-      const t = (b.innerText || "").trim();
-      return t.length >= 20;
-    });
-  }
-
-  // ==========================================================
-  // TreeWalker text node replacer
-  // ==========================================================
-  function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} */) {
-    const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const parent = node.parentNode;
-        if (!parent) return NodeFilter.FILTER_REJECT;
-        const tag = parent.nodeName;
-        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return NodeFilter.FILTER_REJECT;
-        const el = parent.nodeType === 1 ? parent : parent.parentElement;
-        if (el && el.closest && el.closest("a, button, input, textarea, select")) return NodeFilter.FILTER_REJECT;
-        if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
+  function applyTermPatches(root, cfg, termMem) {
+    // cfg.termPatches: { "<hash>": "Preferred Text" }
+    const defaults = (cfg && cfg.termPatches && typeof cfg.termPatches === "object") ? cfg.termPatches : {};
+    const spans = root.querySelectorAll("span.text-patch.system[data-hash]");
     let changed = 0;
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const before = node.nodeValue;
-      const out = fnReplace(before);
-      const after = (out && typeof out === "object") ? out.text : before;
-      const delta = (out && typeof out === "object") ? (out.changed || 0) : 0;
 
-      if (after !== before) {
-        node.nodeValue = after;
-        changed += Math.max(1, delta || 1);
-      } else if (delta) {
-        changed += delta;
+    spans.forEach(sp => {
+      const hash = sp.getAttribute("data-hash") || "";
+      if (!hash) return;
+
+      const preferred = (termMem[hash] && termMem[hash].preferred) || defaults[hash];
+      if (!preferred) return;
+
+      const before = sp.textContent || "";
+      if (before !== preferred) {
+        sp.textContent = preferred;
+        changed++;
       }
-    }
+    });
+
     return changed;
   }
 
   // ==========================================================
-  // Character detection on current chapter/page (existing)
+  // UI: Drafts + Add Character/Term popover
   // ==========================================================
-  function detectCharactersOnPage(root, entries) {
-    const hay = (root?.innerText || "").toLowerCase();
-    const detected = [];
-
-    for (const [name, info] of entries) {
-      const nameLower = String(name || "").toLowerCase();
-      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
-
-      let hit = false;
-      if (nameLower && hay.includes(nameLower)) hit = true;
-
-      if (!hit) {
-        for (const a of aliases) {
-          const aLower = String(a || "").toLowerCase();
-          if (aLower && hay.includes(aLower)) { hit = true; break; }
-        }
-      }
-
-      if (hit) detected.push([name, info]);
-    }
-
-    return detected;
+  function loadDraft() {
+    try { return GM_getValue(DRAFT_KEY, {}) || {}; } catch { return {}; }
+  }
+  function saveDraft(d) {
+    try { GM_setValue(DRAFT_KEY, d || {}); } catch {}
   }
 
-  // ==========================================================
-  // Term detection: WTR terms (NEW)
-  // ==========================================================
-  function collectWtrTerms(root) {
-    // Returns Map hash -> text (preferred as currently displayed)
-    const map = new Map();
-    if (!root) return map;
-    const nodes = root.querySelectorAll(".text-patch.system[data-hash]");
-    nodes.forEach(el => {
-      const h = el.getAttribute("data-hash") || "";
-      const t = (el.textContent || "").trim();
-      if (h && t) map.set(h, t);
-    });
-    return map;
+  function formatDraftForCopy(draftObj) {
+    // Output: one-liners, easy paste into glossary "characters" block
+    // "Name": { "gender": "male", "aliases": [] },
+    const keys = Object.keys(draftObj || {}).sort((a, b) => a.localeCompare(b));
+    return keys.map(k => {
+      const v = draftObj[k] || {};
+      const gender = v.gender || "unknown";
+      const aliases = Array.isArray(v.aliases) ? v.aliases : [];
+      // Keep one line if possible
+      const aliasPart = aliases.length ? `, "aliases": ${JSON.stringify(aliases)}` : `, "aliases": []`;
+      return `"${k}": { "gender": "${gender}"${aliasPart} },`;
+    }).join("\n");
   }
 
-  // ==========================================================
-  // Consistency enforcement: pinned terms (NEW)
-  // ==========================================================
-  function enforcePinnedTerms(root, mem, stats) {
-    if (!root || !mem || !mem.items) return;
-
-    // 1) Hash-based: update .text-patch by hash (most reliable)
-    const wtrMap = collectWtrTerms(root);
-    for (const [k, item] of Object.entries(mem.items)) {
-      if (!item || !item.pinned) continue;
-      if (!k.startsWith("hash:")) continue;
-
-      const hash = k.slice("hash:".length);
-      const preferred = String(item.preferred || "").trim();
-      if (!hash || !preferred) continue;
-
-      // If WTR term exists in this chapter, force its display text
-      // (also collects variants passively)
-      const current = wtrMap.get(hash);
-      if (current && current !== preferred) {
-        const els = root.querySelectorAll(`.text-patch.system[data-hash="${CSS.escape(hash)}"]`);
-        els.forEach(el => {
-          if ((el.textContent || "").trim() !== preferred) {
-            el.textContent = preferred;
-            stats.termEdits++;
-          }
-        });
-      }
-    }
-
-    // 2) Plain-text fallback: replace known variants -> preferred for pinned entries
-    // Conservative: only for pinned; uses variants list.
-    const pinned = Object.values(mem.items).filter(it => it && it.pinned && it.preferred);
-    if (!pinned.length) return;
-
-    const blocks = getTextBlocks(root);
-    for (const b of blocks) {
-      replaceInTextNodes(b, (txt) => {
-        let s = txt;
-        for (const it of pinned) {
-          const preferred = String(it.preferred || "").trim();
-          if (!preferred) continue;
-
-          const variants = Array.isArray(it.variants) ? it.variants : [];
-          for (const v of variants) {
-            const vv = String(v || "").trim();
-            if (!vv || vv === preferred) continue;
-
-            // Very short variants are risky; skip unless explicitly long or multi-word
-            const riskyShort = vv.length <= 3 && !/\s/.test(vv);
-            if (riskyShort) continue;
-
-            // Word-boundary if "wordy", else simple replace
-            if (/^[\p{L}\p{N}_'-]+$/u.test(vv)) {
-              const re = new RegExp(String.raw`\b${escapeRegExp(vv)}\b`, "g");
-              s = s.replace(re, preferred);
-            } else {
-              // phrase variant
-              s = s.split(vv).join(preferred);
-            }
-          }
-        }
-        return { text: s, changed: 0 };
-      });
-    }
-  }
-
-  // ==========================================================
-  // Glossary helpers
-  // ==========================================================
-  function pickKey(glossary) {
-    const url = location.href;
-    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
-    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
-    return matches[0] || "default";
-  }
-
-  function directionFromGender(g) {
-    return g === "female" ? "toFemale" : "toMale";
-  }
-
-  // ==========================================================
-  // Reliable glossary loader (+ cache)
-  // ==========================================================
-  function loadGlossaryJSON(url) {
-    return new Promise((resolve, reject) => {
-      const cached = localStorage.getItem(GLOSSARY_CACHE_KEY);
-      const cachedTs = Number(localStorage.getItem(GLOSSARY_CACHE_TS) || "0");
-      const cacheFresh = cached && cachedTs && (Date.now() - cachedTs) <= GLOSSARY_CACHE_TTL_MS;
-
-      const useCache = () => {
-        if (!cached) return reject(new Error("Glossary error"));
-        try { resolve(JSON.parse(cached)); }
-        catch { reject(new Error("Glossary error")); }
-      };
-
-      if (cacheFresh) return useCache();
-
-      if (typeof GM_xmlhttpRequest === "function") {
-        GM_xmlhttpRequest({
-          method: "GET",
-          url,
-          headers: { "Cache-Control": "no-cache" },
-          onload: (r) => {
-            try {
-              if (r.status < 200 || r.status >= 300) {
-                if (cached) return useCache();
-                return reject(new Error("Glossary error"));
-              }
-              localStorage.setItem(GLOSSARY_CACHE_KEY, r.responseText);
-              localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
-              resolve(JSON.parse(r.responseText));
-            } catch {
-              if (cached) return useCache();
-              reject(new Error("Glossary error"));
-            }
-          },
-          onerror: () => {
-            if (cached) return useCache();
-            reject(new Error("Glossary error"));
-          }
-        });
-        return;
-      }
-
-      fetch(url, { cache: "no-store" })
-        .then(async (res) => {
-          const txt = await res.text();
-          if (!res.ok) throw new Error("Glossary error");
-          localStorage.setItem(GLOSSARY_CACHE_KEY, txt);
-          localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
-          return JSON.parse(txt);
-        })
-        .then(resolve)
-        .catch(() => {
-          if (cached) return useCache();
-          reject(new Error("Glossary error"));
-        });
-    });
-  }
-
-  // ==========================================================
-  // UI + TermMemory Assist (NEW)
-  // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
     const enabledInit = localStorage.getItem(UI_KEY_ON);
@@ -567,15 +343,13 @@
     function enabled() { return localStorage.getItem(UI_KEY_ON) !== "0"; }
     function setEnabled(v) { localStorage.setItem(UI_KEY_ON, v ? "1" : "0"); }
 
-    let charactersCount = 0;
-    let charactersList3 = "";
+    let detectedCount = 0;
+    let detectedList3 = "";
     let changedTotal = 0;
     let glossaryOk = true;
 
-    // TermMemory UI state
-    let draftCount = 0;
-    let draftLines = "";
-    const sessionHighlights = new Set(); // keys added during this chapter session (for visual emphasis)
+    let draft = loadDraft();
+    let termMem = loadTermMemory();
 
     function applyPos(el) {
       if (savedPos.left != null) {
@@ -640,7 +414,6 @@
 
       /* ============================
          EDIT HERE: Expanded opacity
-         - Reduced opacity by ~20%
          ============================ */
       background: rgba(0,0,0,0.50);
 
@@ -652,8 +425,7 @@
 
       /* ============================
          EDIT HERE: Expanded width cap
-         - Slightly narrower than before
-         - Height auto (grows with content)
+         - width slightly reduced; height auto
          ============================ */
       max-width: min(460px, 86vw);
       height: auto;
@@ -661,36 +433,6 @@
       backdrop-filter: blur(6px);
       user-select: none;
       touch-action: none;
-    `;
-
-    // Minimised pill container
-    const pill = document.createElement("div");
-    pill.style.cssText = `
-      display:none; position: fixed; z-index: 2147483647;
-
-      /* ============================
-         EDIT HERE: Minimised opacity
-         - Reduced opacity by ~40%
-         ============================ */
-      background: rgba(0,0,0,0.37);
-
-      color:#fff;
-      border-radius: 999px;
-
-      /* ============================
-         EDIT HERE: Minimised size
-         - Smaller padding + font
-         ============================ */
-      padding: 4px 6px;
-      font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-
-      box-shadow: 0 10px 28px rgba(0,0,0,.25);
-      backdrop-filter: blur(6px);
-      user-select: none;
-      touch-action: none;
-
-      /* Slightly narrower cap */
-      max-width: min(380px, 84vw);
     `;
 
     const topRow = document.createElement("div");
@@ -726,7 +468,7 @@
     const resetBtn = document.createElement("button");
     resetBtn.type = "button";
     resetBtn.textContent = "↺";
-    resetBtn.title = "Reset Changed";
+    resetBtn.title = "Reset Changed (session)";
     resetBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
       width:26px; height:26px; border-radius:9px;
@@ -734,64 +476,82 @@
       font-size:14px; line-height:26px; padding:0;
     `;
 
-    // --- Layout requested: info row -> divider -> copy/clear -> draft count
-    const info = document.createElement("div");
-    info.style.cssText = `white-space: pre-line; opacity: .95; margin-bottom: 8px;`;
+    // Info row (top)
+    const infoTop = document.createElement("div");
+    infoTop.style.cssText = `white-space: pre-line; opacity: .95;`;
 
     const divider = document.createElement("div");
-    divider.style.cssText = `height:1px; background: rgba(255,255,255,0.14); margin: 8px 0;`;
+    divider.style.cssText = `height:1px; background:rgba(255,255,255,0.16); margin:8px 0;`;
 
-    const draftLabel = document.createElement("div");
-    draftLabel.textContent = "Draft (copy to update glossary.json later):";
-    draftLabel.style.cssText = `font-weight:600; font-size:12px; margin: 4px 0 6px;`;
+    // Draft area (only shown if draft exists)
+    const draftWrap = document.createElement("div");
+    draftWrap.style.cssText = `display:none;`;
+
+    const draftButtons = document.createElement("div");
+    draftButtons.style.cssText = `display:flex; gap:8px; align-items:center; margin-bottom:8px;`;
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.textContent = "Copy JSON";
+    copyBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding:6px 10px; border-radius:10px;
+      background:rgba(255,255,255,0.14); color:#fff;
+      font:12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const clearDraftBtn = document.createElement("button");
+    clearDraftBtn.type = "button";
+    clearDraftBtn.textContent = "Clear Draft";
+    clearDraftBtn.style.cssText = copyBtn.style.cssText;
 
     const draftBox = document.createElement("textarea");
     draftBox.readOnly = true;
     draftBox.spellcheck = false;
     draftBox.style.cssText = `
-      width: 100%;
-      min-height: 78px;
-      max-height: 200px;
+      width:100%;
+      min-height: 86px;
+      max-height: 220px;
       resize: vertical;
       border: 1px solid rgba(255,255,255,0.14);
       border-radius: 10px;
       padding: 8px 10px;
       background: rgba(255,255,255,0.06);
       color: #fff;
-      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      outline: none;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      outline:none;
     `;
 
-    const btnRow = document.createElement("div");
-    btnRow.style.cssText = `display:flex; gap:8px; align-items:center; margin-top: 8px;`;
+    const draftCount = document.createElement("div");
+    draftCount.style.cssText = `opacity:.8; margin-top:6px; font-size:11px;`;
 
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.textContent = "Copy JSON";
-    copyBtn.title = "Copy draft lines and clear (per your preference)";
-    copyBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 7px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.14); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    // Minimised pill
+    const pill = document.createElement("div");
+    pill.style.cssText = `
+      display:none; position: fixed; z-index: 2147483647;
+
+      /* ============================
+         EDIT HERE: Minimised opacity
+         ============================ */
+      background: rgba(0,0,0,0.37);
+
+      color:#fff;
+      border-radius: 999px;
+
+      /* ============================
+         EDIT HERE: Minimised size
+         ============================ */
+      padding: 4px 6px;
+      font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+
+      box-shadow: 0 10px 28px rgba(0,0,0,.25);
+      backdrop-filter: blur(6px);
+      user-select: none;
+      touch-action: none;
+
+      max-width: min(420px, 84vw);
     `;
 
-    const clearBtn = document.createElement("button");
-    clearBtn.type = "button";
-    clearBtn.textContent = "Clear";
-    clearBtn.title = "Clear draft (TermMemory)";
-    clearBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 7px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.10); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const draftCountEl = document.createElement("div");
-    draftCountEl.style.cssText = `opacity:.85; margin-top: 8px;`;
-    draftCountEl.textContent = "Drafted: 0";
-
-    // Min pill row
     const pillRow = document.createElement("div");
     pillRow.style.cssText = `display:flex; align-items:center; gap:8px;`;
 
@@ -809,189 +569,6 @@
       font-size:14px; line-height:22px; padding:0;
     `;
 
-    // Modal (Add Character / Add Term)
-    const modal = document.createElement("div");
-    modal.style.cssText = `
-      display:none; position: fixed; z-index: 2147483647;
-      right: 12px; top: 64px;
-      max-width: min(420px, 90vw);
-      background: rgba(0,0,0,0.72);
-      color: #fff;
-      border: 1px solid rgba(255,255,255,0.16);
-      border-radius: 14px;
-      box-shadow: 0 18px 40px rgba(0,0,0,.35);
-      padding: 10px 12px;
-      backdrop-filter: blur(8px);
-      user-select: none;
-      touch-action: none;
-    `;
-
-    const modalTitle = document.createElement("div");
-    modalTitle.style.cssText = `font-weight:700; margin-bottom:6px;`;
-    modalTitle.textContent = "Add to PronounsFix";
-
-    const modalSub = document.createElement("div");
-    modalSub.style.cssText = `opacity:.9; margin-bottom:10px; word-break: break-word;`;
-
-    const modalStep = document.createElement("div");
-    modalStep.style.cssText = `display:flex; flex-direction:column; gap:10px;`;
-
-    // Step 1 buttons
-    const step1 = document.createElement("div");
-    step1.style.cssText = `display:flex; gap:8px; flex-wrap:wrap;`;
-
-    const addCharBtn = document.createElement("button");
-    addCharBtn.type = "button";
-    addCharBtn.textContent = "Add Character";
-    addCharBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 8px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.16); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const addTermBtn = document.createElement("button");
-    addTermBtn.type = "button";
-    addTermBtn.textContent = "Add Term";
-    addTermBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 8px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.10); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    // Step 2 (dynamic)
-    const step2 = document.createElement("div");
-    step2.style.cssText = `display:none; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 10px;`;
-
-    const nameRow = document.createElement("div");
-    nameRow.style.cssText = `display:flex; flex-direction:column; gap:6px;`;
-
-    const nameLabel = document.createElement("div");
-    nameLabel.style.cssText = `font-weight:600;`;
-    nameLabel.textContent = "Preferred name / term";
-
-    const nameInput = document.createElement("input");
-    nameInput.type = "text";
-    nameInput.autocomplete = "off";
-    nameInput.spellcheck = false;
-    nameInput.style.cssText = `
-      width:100%;
-      padding: 8px 10px;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.16);
-      background: rgba(255,255,255,0.06);
-      color: #fff;
-      outline: none;
-      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const toggleRow = document.createElement("div");
-    toggleRow.style.cssText = `display:flex; align-items:center; gap:10px; flex-wrap:wrap;`;
-
-    const pinWrap = document.createElement("label");
-    pinWrap.style.cssText = `display:flex; align-items:center; gap:8px; cursor:pointer; opacity:.95;`;
-
-    const pinCb = document.createElement("input");
-    pinCb.type = "checkbox";
-    pinCb.checked = true;
-
-    const pinText = document.createElement("span");
-    pinText.textContent = "Pin term (enforce across chapters)";
-
-    pinWrap.appendChild(pinCb);
-    pinWrap.appendChild(pinText);
-
-    const genderRow = document.createElement("div");
-    genderRow.style.cssText = `display:none; align-items:center; gap:8px; flex-wrap:wrap;`;
-
-    const genderLabel = document.createElement("div");
-    genderLabel.style.cssText = `font-weight:600; margin-right:4px;`;
-    genderLabel.textContent = "Select gender:";
-
-    const gMale = document.createElement("button");
-    gMale.type = "button";
-    gMale.textContent = "Male";
-    gMale.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 7px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.14); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const gFemale = document.createElement("button");
-    gFemale.type = "button";
-    gFemale.textContent = "Female";
-    gFemale.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 7px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.14); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const gUnknown = document.createElement("button");
-    gUnknown.type = "button";
-    gUnknown.textContent = "Unknown";
-    gUnknown.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 7px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.08); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const actionRow = document.createElement("div");
-    actionRow.style.cssText = `display:flex; gap:8px; margin-top: 10px;`;
-
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.textContent = "Save";
-    saveBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 8px 10px; border-radius: 10px;
-      background: rgba(76,175,80,0.18); color:#fff;
-      border: 1px solid rgba(76,175,80,0.28);
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const cancelBtn = document.createElement("button");
-    cancelBtn.type = "button";
-    cancelBtn.textContent = "Cancel";
-    cancelBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 8px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.10); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    // Modal assembly
-    step1.appendChild(addCharBtn);
-    step1.appendChild(addTermBtn);
-
-    nameRow.appendChild(nameLabel);
-    nameRow.appendChild(nameInput);
-
-    genderRow.appendChild(genderLabel);
-    genderRow.appendChild(gMale);
-    genderRow.appendChild(gFemale);
-    genderRow.appendChild(gUnknown);
-
-    toggleRow.appendChild(pinWrap);
-
-    actionRow.appendChild(saveBtn);
-    actionRow.appendChild(cancelBtn);
-
-    step2.appendChild(nameRow);
-    step2.appendChild(genderRow);
-    step2.appendChild(toggleRow);
-    step2.appendChild(actionRow);
-
-    modalStep.appendChild(step1);
-    modalStep.appendChild(step2);
-
-    modal.appendChild(modalTitle);
-    modal.appendChild(modalSub);
-    modal.appendChild(modalStep);
-
     function refreshToggleUI() {
       const on = enabled();
       toggleBtn.textContent = on ? "ON" : "OFF";
@@ -999,87 +576,59 @@
       pillText.textContent = `PF (${on ? "ON" : "OFF"})`;
     }
 
-    function refreshInfo() {
+    function refreshDraftUI() {
+      const keys = Object.keys(draft || {});
+      const hasDraft = keys.length > 0;
+
+      draftWrap.style.display = hasDraft ? "block" : "none";
+      if (hasDraft) {
+        draftBox.value = formatDraftForCopy(draft);
+        draftCount.textContent = `Draft count: ${keys.length}`;
+      }
+    }
+
+    function refreshInfoTop() {
       if (!glossaryOk) {
-        info.textContent = "Glossary error";
+        infoTop.textContent = "Glossary error";
         return;
       }
-      const line1 = `• Characters: ${charactersCount}` + (charactersList3 ? ` • ${charactersList3}` : "");
+      const line1 = `• Characters (this chapter): ${detectedCount}` + (detectedList3 ? ` • ${detectedList3}` : "");
       const line2 = `• Changed: ${changedTotal}`;
-      info.textContent = `${line1}\n${line2}`;
-    }
-
-    function renderDraftFromMemory() {
-      const mem = loadTermMemory();
-      const items = mem.items || {};
-
-      // Copy output format (your requested “easy paste” lines):
-      // "Li Zhi": { "gender": "male" },
-      // Keep characters-only here, since glossary characters live under "characters".
-      const charLines = [];
-      let count = 0;
-
-      for (const it of Object.values(items)) {
-        if (!it || it.type !== "character") continue;
-        const name = String(it.preferred || "").trim();
-        if (!name) continue;
-
-        const g = String(it.gender || "unknown").toLowerCase();
-        if (g === "male" || g === "female") {
-          charLines.push(`"${name}": { "gender": "${g}" },`);
-        } else {
-          // If unknown, still output (optional). You can delete later.
-          charLines.push(`"${name}": { "gender": "unknown" },`);
-        }
-        count++;
-      }
-
-      draftCount = count;
-      draftLines = charLines.join("\n");
-      draftBox.value = draftLines;
-      draftCountEl.textContent = `Drafted: ${draftCount}`;
-    }
-
-    async function copyDraftAndClear() {
-      const text = (draftBox.value || "").trim();
-      if (!text) return;
-
-      try {
-        await navigator.clipboard.writeText(text);
-      } catch {
-        // Fallback for stricter pages
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.style.position = "fixed";
-        ta.style.left = "-9999px";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        ta.remove();
-      }
-
-      // Per your preference: keep until Copy or Clear -> Copy clears as well
-      clearTermMemory();
-    }
-
-    function clearTermMemory() {
-      saveTermMemory({ items: {} });
-      renderDraftFromMemory();
+      infoTop.textContent = `${line1}\n${line2}`;
     }
 
     toggleBtn.onclick = () => {
       setEnabled(!enabled());
       refreshToggleUI();
-      setTimeout(() => location.reload(), 150);
+      setTimeout(() => location.reload(), 120);
     };
 
     resetBtn.onclick = () => {
       changedTotal = 0;
-      refreshInfo();
+      refreshInfoTop();
     };
 
-    copyBtn.onclick = () => { copyDraftAndClear(); };
-    clearBtn.onclick = () => { clearTermMemory(); };
+    copyBtn.onclick = async () => {
+      const txt = draftBox.value || "";
+      try {
+        await navigator.clipboard.writeText(txt);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => (copyBtn.textContent = "Copy JSON"), 900);
+      } catch {
+        // fallback select
+        draftBox.focus();
+        draftBox.select();
+        document.execCommand("copy");
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => (copyBtn.textContent = "Copy JSON"), 900);
+      }
+    };
+
+    clearDraftBtn.onclick = () => {
+      draft = {};
+      saveDraft(draft);
+      refreshDraftUI();
+    };
 
     function syncPos(fromEl, toEl) {
       const r = fromEl.getBoundingClientRect();
@@ -1093,7 +642,6 @@
       localStorage.setItem(UI_KEY_MIN, min ? "1" : "0");
       box.style.display = min ? "none" : "block";
       pill.style.display = min ? "block" : "none";
-      modal.style.display = "none";
       if (min) syncPos(box, pill);
       else syncPos(pill, box);
     }
@@ -1114,30 +662,28 @@
     topRow.appendChild(title);
     topRow.appendChild(controls);
 
-    // Expanded layout
+    draftButtons.appendChild(copyBtn);
+    draftButtons.appendChild(clearDraftBtn);
+
+    draftWrap.appendChild(draftButtons);
+    draftWrap.appendChild(draftBox);
+    draftWrap.appendChild(draftCount);
+
     box.appendChild(topRow);
-    box.appendChild(info);
+    box.appendChild(infoTop);
     box.appendChild(divider);
-    box.appendChild(draftLabel);
-    box.appendChild(draftBox);
-    box.appendChild(btnRow);
-    box.appendChild(draftCountEl);
+    box.appendChild(draftWrap);
 
-    btnRow.appendChild(copyBtn);
-    btnRow.appendChild(clearBtn);
-
-    // Min pill
     pillRow.appendChild(pillText);
     pillRow.appendChild(pillExpandBtn);
     pill.appendChild(pillRow);
 
     document.documentElement.appendChild(box);
     document.documentElement.appendChild(pill);
-    document.documentElement.appendChild(modal);
 
     refreshToggleUI();
-    refreshInfo();
-    renderDraftFromMemory();
+    refreshInfoTop();
+    refreshDraftUI();
 
     if (localStorage.getItem(UI_KEY_MIN) === "1") setMin(true);
 
@@ -1146,194 +692,462 @@
     });
 
     // ------------------------------
-    // TermMemory Assist: modal logic
+    // Add Character / Add Term popover
+    // Trigger rules:
+    // - click WTR term span (.text-patch.system), OR
+    // - user has a selection (highlight)
     // ------------------------------
-    const modalState = {
-      source: null,   // { hash, rawText, kind: "wtrTerm"|"selection" }
-      mode: null,     // "character"|"term"
-      gender: "unknown"
+    const pop = document.createElement("div");
+    pop.style.cssText = `
+      position: fixed;
+      z-index: 2147483647;
+      display: none;
+      min-width: 220px;
+      max-width: min(360px, 88vw);
+      padding: 10px 10px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.78);
+      color: #fff;
+      box-shadow: 0 10px 28px rgba(0,0,0,.35);
+      backdrop-filter: blur(8px);
+      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const popTitle = document.createElement("div");
+    popTitle.style.cssText = `font-weight:600; margin-bottom:6px;`;
+
+    const popSub = document.createElement("div");
+    popSub.style.cssText = `opacity:.85; margin-bottom:10px; word-break: break-word;`;
+
+    const popRow = document.createElement("div");
+    popRow.style.cssText = `display:flex; gap:8px; flex-wrap: wrap;`;
+
+    const btnAddChar = document.createElement("button");
+    btnAddChar.textContent = "Add Character";
+    const btnAddTerm = document.createElement("button");
+    btnAddTerm.textContent = "Add Term";
+    const btnClose = document.createElement("button");
+    btnClose.textContent = "Close";
+
+    const btnStyle = `
+      appearance:none; border:0; cursor:pointer;
+      padding:6px 10px; border-radius:10px;
+      background:rgba(255,255,255,0.14); color:#fff;
+      font:12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+    [btnAddChar, btnAddTerm, btnClose].forEach(b => b.style.cssText = btnStyle);
+
+    // Step 2: gender choice for character
+    const rowGender = document.createElement("div");
+    rowGender.style.cssText = `display:none; margin-top:10px; gap:8px;`;
+    const btnMale = document.createElement("button");
+    btnMale.textContent = "Male";
+    const btnFemale = document.createElement("button");
+    btnFemale.textContent = "Female";
+    [btnMale, btnFemale].forEach(b => b.style.cssText = btnStyle);
+
+    // Step 2: pin term (store preferred text for hash)
+    const rowPin = document.createElement("div");
+    rowPin.style.cssText = `display:none; margin-top:10px;`;
+    const pinLabel = document.createElement("div");
+    pinLabel.style.cssText = `opacity:.9; margin-bottom:6px;`;
+    pinLabel.textContent = "Pinned display text:";
+    const pinInput = document.createElement("input");
+    pinInput.type = "text";
+    pinInput.style.cssText = `
+      width:100%;
+      padding:8px 10px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.06);
+      color:#fff;
+      outline:none;
+      font:12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+    const pinSave = document.createElement("button");
+    pinSave.textContent = "Save Pin";
+    pinSave.style.cssText = btnStyle;
+    pinSave.style.marginTop = "8px";
+
+    popRow.appendChild(btnAddChar);
+    popRow.appendChild(btnAddTerm);
+    popRow.appendChild(btnClose);
+
+    rowGender.appendChild(btnMale);
+    rowGender.appendChild(btnFemale);
+
+    rowPin.appendChild(pinLabel);
+    rowPin.appendChild(pinInput);
+    rowPin.appendChild(pinSave);
+
+    pop.appendChild(popTitle);
+    pop.appendChild(popSub);
+    pop.appendChild(popRow);
+    pop.appendChild(rowGender);
+    pop.appendChild(rowPin);
+
+    document.documentElement.appendChild(pop);
+
+    let pending = { type: null, text: "", hash: "", fromSpan: false };
+
+    function hidePop() {
+      pop.style.display = "none";
+      rowGender.style.display = "none";
+      rowPin.style.display = "none";
+      pending = { type: null, text: "", hash: "", fromSpan: false };
+    }
+
+    function showPop(x, y, header, text, hash, fromSpan) {
+      pending = { type: null, text: text || "", hash: hash || "", fromSpan: !!fromSpan };
+      popTitle.textContent = header || "Add";
+      popSub.textContent = text || "";
+      rowGender.style.display = "none";
+      rowPin.style.display = "none";
+
+      pop.style.left = Math.min(x, window.innerWidth - 12) + "px";
+      pop.style.top  = Math.min(y, window.innerHeight - 12) + "px";
+      pop.style.display = "block";
+
+      // clamp
+      const r = pop.getBoundingClientRect();
+      const left = Math.min(r.left, window.innerWidth - r.width - 8);
+      const top  = Math.min(r.top, window.innerHeight - r.height - 8);
+      pop.style.left = Math.max(8, left) + "px";
+      pop.style.top  = Math.max(8, top) + "px";
+    }
+
+    btnClose.onclick = hidePop;
+
+    btnAddChar.onclick = () => {
+      pending.type = "character";
+      rowPin.style.display = "none";
+      rowGender.style.display = "flex";
+      popTitle.textContent = "Add Character → Select Gender";
     };
 
-    function openModal(source) {
-      // Only open when expanded (keeps UX cleaner)
-      if (localStorage.getItem(UI_KEY_MIN) === "1") setMin(false);
+    btnAddTerm.onclick = () => {
+      pending.type = "term";
+      rowGender.style.display = "none";
+      rowPin.style.display = "block";
+      popTitle.textContent = "Add Term → Pin display text";
+      pinInput.value = pending.text || "";
+    };
 
-      modalState.source = source;
-      modalState.mode = null;
-      modalState.gender = "unknown";
+    function addDraftCharacter(name, gender) {
+      if (!name) return;
+      if (!draft[name]) draft[name] = { gender, aliases: [] };
+      else draft[name].gender = gender; // overwrite if user changes their mind
+      saveDraft(draft);
+      refreshDraftUI();
 
-      // Step 1 visible, step 2 hidden
-      step2.style.display = "none";
-      addCharBtn.disabled = false;
-      addTermBtn.disabled = false;
+      // chapter-only highlight effect (only for WTR term spans that exactly match)
+      highlightAddedInChapter(name);
+    }
 
-      // Default input is the selected/term text, but user can expand it (e.g. Energetic -> full name)
-      const raw = String(source?.rawText || "").trim();
-      nameInput.value = raw;
+    btnMale.onclick = () => addDraftCharacter(pending.text, "male");
+    btnFemale.onclick = () => addDraftCharacter(pending.text, "female");
 
-      // Position modal near main box
+    pinSave.onclick = () => {
+      // Only meaningful when we have a stable hash (from WTR span)
+      const hash = pending.hash;
+      const preferred = (pinInput.value || "").trim();
+      if (!hash || !preferred) return;
+
+      termMem = loadTermMemory(); // latest
+      termMem[hash] = termMem[hash] || {};
+      termMem[hash].preferred = preferred;
+      termMem[hash].updatedAt = Date.now();
+      saveTermMemory(termMem);
+
+      // Apply immediately on current page
       try {
-        const r = box.getBoundingClientRect();
-        modal.style.left = (r.left) + "px";
-        modal.style.top = (r.bottom + 8) + "px";
-        modal.style.right = "auto";
+        const root = findContentRoot();
+        applyTermPatches(root, currentCfgRef || {}, termMem);
       } catch {}
 
-      modalSub.textContent = raw ? `Selected: ${raw}` : "Selected: (empty)";
-      modal.style.display = "block";
-      clampToViewport(modal);
-    }
-
-    function closeModal() {
-      modal.style.display = "none";
-      modalState.source = null;
-      modalState.mode = null;
-      modalState.gender = "unknown";
-    }
-
-    function setMode(mode) {
-      modalState.mode = mode;
-      step2.style.display = "block";
-
-      // Character mode shows gender, Term mode hides it
-      if (mode === "character") {
-        genderRow.style.display = "flex";
-        pinCb.checked = true; // recommended default ON for character names consistency
-      } else {
-        genderRow.style.display = "none";
-        pinCb.checked = true; // still useful for equipment/skills
-      }
-    }
-
-    addCharBtn.onclick = () => setMode("character");
-    addTermBtn.onclick = () => setMode("term");
-
-    function pickGender(g) {
-      modalState.gender = g;
-      // Small visual feedback
-      const on = "rgba(255,255,255,0.22)";
-      const off = "rgba(255,255,255,0.14)";
-      gMale.style.background = (g === "male") ? on : off;
-      gFemale.style.background = (g === "female") ? on : off;
-      gUnknown.style.background = (g === "unknown") ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.08)";
-    }
-
-    gMale.onclick = () => pickGender("male");
-    gFemale.onclick = () => pickGender("female");
-    gUnknown.onclick = () => pickGender("unknown");
-
-    cancelBtn.onclick = () => closeModal();
-
-    function highlightCurrentChapterKey(key) {
-      sessionHighlights.add(key);
-
-      const root = findContentRoot();
-      if (!root) return;
-
-      if (key.startsWith("hash:")) {
-        const hash = key.slice("hash:".length);
-        const els = root.querySelectorAll(`.text-patch.system[data-hash="${CSS.escape(hash)}"]`);
-        els.forEach(el => {
-          el.style.textShadow = "0 0 10px rgba(76,175,80,0.55)";
-          el.style.outline = "1px solid rgba(76,175,80,0.40)";
-          el.style.borderRadius = "6px";
-          el.style.padding = "0 2px";
-        });
-      }
-      // Note: for plain-text selections (no hash), we keep it conservative and do not wrap text nodes.
-      // It avoids breaking WTR DOM / line structures.
-    }
-
-    function addToTermMemory({ type, hash, rawText, preferred, gender, pinned }) {
-      const mem = loadTermMemory();
-      const items = mem.items || {};
-      mem.items = items;
-
-      const key = termKeyFrom(hash, rawText);
-      const pref = String(preferred || rawText || "").trim();
-      if (!pref) return null;
-
-      const existing = items[key] || null;
-
-      // Build/merge
-      const out = {
-        type: type,
-        gender: type === "character" ? String(gender || "unknown").toLowerCase() : undefined,
-        preferred: pref,
-        pinned: !!pinned,
-        variants: [],
-        createdAt: existing?.createdAt || nowISO(),
-        updatedAt: nowISO(),
-        hash: hash || existing?.hash || undefined
-      };
-
-      // Variants: always include the raw text if different
-      const vset = new Set(Array.isArray(existing?.variants) ? existing.variants : []);
-      const raw = String(rawText || "").trim();
-      if (raw && raw !== pref) vset.add(raw);
-
-      // If existing preferred differs, keep old preferred as variant
-      if (existing?.preferred && existing.preferred !== pref) vset.add(existing.preferred);
-
-      out.variants = Array.from(vset).filter(Boolean).slice(0, 60);
-
-      items[key] = out;
-      saveTermMemory(mem);
-
-      highlightCurrentChapterKey(key);
-      renderDraftFromMemory();
-      return out;
-    }
-
-    saveBtn.onclick = () => {
-      if (!modalState.source) return;
-
-      const preferred = String(nameInput.value || "").trim();
-      if (!preferred) return;
-
-      const type = modalState.mode;
-      if (type !== "character" && type !== "term") return;
-
-      const src = modalState.source;
-      addToTermMemory({
-        type,
-        hash: src.hash || null,
-        rawText: src.rawText || "",
-        preferred,
-        gender: modalState.gender || "unknown",
-        pinned: !!pinCb.checked
-      });
-
-      closeModal();
+      hidePop();
     };
 
-    // Public hooks for main loop
+    // Click handler: only show popover for WTR term spans OR selection
+    document.addEventListener("click", (ev) => {
+      // don’t interfere with PF UI itself
+      if (ev.target && (box.contains(ev.target) || pill.contains(ev.target) || pop.contains(ev.target))) return;
+
+      const sel = window.getSelection();
+      const selectedText = (sel && String(sel.toString() || "").trim()) || "";
+
+      const span = ev.target && ev.target.closest ? ev.target.closest("span.text-patch.system[data-hash]") : null;
+
+      // Rule: show popover only if (span) OR (selection exists)
+      if (!span && !selectedText) return;
+
+      if (span) {
+        const text = (span.textContent || "").trim();
+        const hash = span.getAttribute("data-hash") || "";
+        if (!text) return;
+        showPop(ev.clientX + 10, ev.clientY + 10, "Add (WTR term)", text, hash, true);
+        return;
+      }
+
+      // selection path (no hash)
+      // Keep full selection (user controls it); we do not auto-expand short → full to avoid surprises.
+      showPop(ev.clientX + 10, ev.clientY + 10, "Add (selection)", selectedText, "", false);
+    }, true);
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") hidePop();
+    });
+
+    // highlight CSS
+    GM_addStyle(`
+      .wtrpf-added-term-highlight {
+        text-shadow: 0 0 8px rgba(255,255,255,0.28);
+        text-decoration: underline;
+        text-decoration-color: rgba(255,255,255,0.35);
+        text-underline-offset: 2px;
+      }
+    `);
+
+    // chapter-only highlight using current DOM
+    function highlightAddedInChapter(name) {
+      try {
+        const root = findContentRoot();
+        const spans = root.querySelectorAll("span.text-patch.system");
+        spans.forEach(sp => {
+          const t = (sp.textContent || "").trim();
+          if (t === name) sp.classList.add("wtrpf-added-term-highlight");
+        });
+      } catch {}
+    }
+
+    // expose for main loop
     return {
-      // existing hooks
       isEnabled: () => enabled(),
-      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshInfo(); },
-      setCharacters: (entries) => {
-        charactersCount = entries.length;
+      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshInfoTop(); },
+      setDetectedCharacters: (entries) => {
+        detectedCount = entries.length;
         const names = entries.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
           const g = String(info.gender || "").toLowerCase();
           const label = (g === "female" || g === "male") ? g : "unknown";
           return `${name} (${label})`;
         });
-        charactersList3 = names.join(", ") + (entries.length > MAX_NAMES_SHOWN ? " …" : "");
-        refreshInfo();
+        detectedList3 = names.join(", ") + (entries.length > MAX_NAMES_SHOWN ? " …" : "");
+        refreshInfoTop();
       },
       addChanged: (delta) => {
         if (Number.isFinite(delta) && delta > 0) changedTotal += delta;
-        refreshInfo();
+        refreshInfoTop();
       },
       refreshUI: refreshToggleUI,
-
-      // NEW hooks
-      openTermModal: openModal,
-      closeTermModal: closeModal,
-      renderDraft: renderDraftFromMemory
+      getDraft: () => (draft = loadDraft(), draft),
+      getTermMem: () => (termMem = loadTermMemory(), termMem),
+      setTermMem: (m) => { termMem = m || {}; saveTermMemory(termMem); },
     };
   }
+
+  // ==========================================================
+  // Content targeting
+  // ==========================================================
+  function findContentRoot() {
+    const candidates = Array.from(document.querySelectorAll(
+      ".chapter-body, article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"
+    ));
+    let best = null, bestScore = 0;
+    for (const el of candidates) {
+      const pCount = el.querySelectorAll("p").length;
+      const textLen = (el.innerText || "").trim().length;
+      const score = (pCount * 1400) + textLen;
+      if (score > bestScore && textLen > 600) { bestScore = score; best = el; }
+    }
+    return best || document.body;
+  }
+
+  const SKIP_CLOSEST = [
+    "header","nav","footer","aside","form",
+    "button","input","textarea","select",
+    "[role='navigation']",
+    ".breadcrumbs",".breadcrumb",".toolbar",".tools",".tool",
+    ".pagination",".pager",".share",".social",
+    ".menu",".navbar",".nav",".btn",".button",
+    ".wtrpf-ui" // not present, just future-proof
+  ].join(",");
+
+  function isSkippable(el) {
+    return !!(el && el.closest && el.closest(SKIP_CLOSEST));
+  }
+
+  function getTextBlocks(root) {
+    const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
+    return blocks.filter(b => {
+      if (isSkippable(b)) return false;
+      const t = (b.innerText || "").trim();
+      return t.length >= 20;
+    });
+  }
+
+  // ==========================================================
+  // Glossary helpers
+  // ==========================================================
+  function pickKey(glossary) {
+    const url = location.href;
+    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
+    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
+    return matches[0] || "default";
+  }
+
+  function directionFromGender(g) {
+    return g === "female" ? "toFemale" : "toMale";
+  }
+
+  function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} */) {
+    const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentNode;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        const tag = parent.nodeName;
+        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return NodeFilter.FILTER_REJECT;
+        const el = parent.nodeType === 1 ? parent : parent.parentElement;
+        if (el && el.closest && el.closest("a, button, input, textarea, select")) return NodeFilter.FILTER_REJECT;
+        if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let changed = 0;
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const before = node.nodeValue;
+
+      // fast skip: no pronouns at all
+      if (!RX_ANY_PRONOUN.test(before)) continue;
+
+      const out = fnReplace(before);
+      const after = (out && typeof out === "object") ? out.text : before;
+      const delta = (out && typeof out === "object") ? (out.changed || 0) : 0;
+
+      if (after !== before) {
+        node.nodeValue = after;
+        changed += Math.max(1, delta || 1);
+      } else if (delta) {
+        changed += delta;
+      }
+    }
+    return changed;
+  }
+
+  // ==========================================================
+  // Per-chapter detection (more accurate)
+  // Strategy:
+  // - Use WTR spans first (text-patch.system) — these are the site’s known terms
+  // - Cross-reference against glossary characters by matching span text to name/aliases
+  // - Also include glossary characters detected in plain text (fallback)
+  // ==========================================================
+  function buildLookup(entries) {
+    const map = new Map(); // lower => [canonicalName, info]
+    for (const [name, info] of entries) {
+      const key = String(name || "").toLowerCase();
+      if (key) map.set(key, [name, info]);
+      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+      for (const a of aliases) {
+        const ak = String(a || "").toLowerCase();
+        if (ak && !map.has(ak)) map.set(ak, [name, info]);
+      }
+    }
+    return map;
+  }
+
+  function detectCharactersThisChapter(root, entries) {
+    const lookup = buildLookup(entries);
+    const detectedMap = new Map(); // canonicalName => [name, info]
+
+    // 1) WTR spans are authoritative terms on this chapter
+    const spans = root.querySelectorAll("span.text-patch.system");
+    spans.forEach(sp => {
+      const t = (sp.textContent || "").trim().toLowerCase();
+      if (!t) return;
+      const found = lookup.get(t);
+      if (found) detectedMap.set(found[0], found);
+    });
+
+    // 2) Fallback: check plain text contains (only for characters; might miss terms)
+    const hay = (root.innerText || "").toLowerCase();
+    for (const [name, info] of entries) {
+      const n = String(name || "").toLowerCase();
+      if (n && hay.includes(n)) detectedMap.set(name, [name, info]);
+      else {
+        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+        for (const a of aliases) {
+          const ak = String(a || "").toLowerCase();
+          if (ak && hay.includes(ak)) { detectedMap.set(name, [name, info]); break; }
+        }
+      }
+    }
+
+    return Array.from(detectedMap.values());
+  }
+
+  // ==========================================================
+  // Reliable glossary loader (+ cache)
+  // ==========================================================
+  function loadGlossaryJSON(url) {
+    return new Promise((resolve, reject) => {
+      const cached = localStorage.getItem(GLOSSARY_CACHE_KEY);
+      const cachedTs = Number(localStorage.getItem(GLOSSARY_CACHE_TS) || "0");
+      const cacheFresh = cached && cachedTs && (Date.now() - cachedTs) <= GLOSSARY_CACHE_TTL_MS;
+
+      const useCache = () => {
+        if (!cached) return reject(new Error("Glossary error"));
+        try { resolve(JSON.parse(cached)); }
+        catch { reject(new Error("Glossary error")); }
+      };
+
+      if (cacheFresh) return useCache();
+
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          headers: { "Cache-Control": "no-cache" },
+          onload: (r) => {
+            try {
+              if (r.status < 200 || r.status >= 300) {
+                if (cached) return useCache();
+                return reject(new Error("Glossary error"));
+              }
+              localStorage.setItem(GLOSSARY_CACHE_KEY, r.responseText);
+              localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
+              resolve(JSON.parse(r.responseText));
+            } catch {
+              if (cached) return useCache();
+              reject(new Error("Glossary error"));
+            }
+          },
+          onerror: () => {
+            if (cached) return useCache();
+            reject(new Error("Glossary error"));
+          }
+        });
+        return;
+      }
+
+      fetch(url, { cache: "no-store" })
+        .then(async (res) => {
+          const txt = await res.text();
+          if (!res.ok) throw new Error("Glossary error");
+          localStorage.setItem(GLOSSARY_CACHE_KEY, txt);
+          localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
+          return JSON.parse(txt);
+        })
+        .then(resolve)
+        .catch(() => {
+          if (cached) return useCache();
+          reject(new Error("Glossary error"));
+        });
+    });
+  }
+
+  // Keep cfg available for pin-save immediate apply
+  let currentCfgRef = null;
 
   // ==========================================================
   // Main
@@ -1358,6 +1172,7 @@
 
     const key = pickKey(glossary);
     const cfg = glossary[key] || {};
+    currentCfgRef = cfg;
 
     const upgrades = cfg.upgrades || {};
     const U = {
@@ -1366,20 +1181,25 @@
       passiveVoice: !!upgrades.passiveVoice,
       dialogueSpeaker: !!upgrades.dialogueSpeaker,
       roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
+
+      // IMPORTANT: this is now less aggressive than before (fixes your “50+ → 2” drop)
       onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong,
 
-      // NEW optional upgrades (defaults ON for consistency; set false per novel if needed)
-      termMemoryAssist: upgrades.termMemoryAssist !== false,
-      enforcePinnedTermsOnPlainText: upgrades.enforcePinnedTermsOnPlainText !== false
+      // New: normalize mixed pronouns even when no character is detected
+      // (runs ONLY when both male+female pronouns appear in same paragraph)
+      mixedPronounNormalize: !!upgrades.mixedPronounNormalize,
+
+      // Term patches on/off
+      termPatches: upgrades.termPatches !== false, // default true
     };
 
     const characters = {
       ...(glossary.default?.characters || {}),
       ...(cfg.characters || {})
     };
-    const entries = Object.entries(characters);
+    const entriesAll = Object.entries(characters);
 
-    if (!entries.length) {
+    if (!entriesAll.length) {
       ui.setGlossaryOk(false);
       return;
     }
@@ -1400,7 +1220,7 @@
       return `${t.length}|${head}|${tail}`;
     }
 
-    function computeGenderForText(text) {
+    function computeGenderForText(text, activeEntries) {
       if (forceGender === "male" || forceGender === "female") return forceGender;
 
       if (primaryCharacter && text.includes(primaryCharacter) && characters[primaryCharacter]) {
@@ -1409,23 +1229,22 @@
       }
 
       if (U.passiveVoice) {
-        const gAgent = detectPassiveAgentGender(text, entries);
+        const gAgent = detectPassiveAgentGender(text, activeEntries);
         if (gAgent) return gAgent;
       }
 
       if (U.dialogueSpeaker) {
-        const gSpeaker = detectDialogueSpeakerGender(text, entries);
+        const gSpeaker = detectDialogueSpeakerGender(text, activeEntries);
         if (gSpeaker) return gSpeaker;
       }
 
-      for (const [name, info] of entries) {
-        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
-
+      // First character present (name or alias) in activeEntries
+      for (const [name, info] of activeEntries) {
         if (text.includes(name)) {
           const g = String(info.gender || "").toLowerCase();
           if (g === "female" || g === "male") return g;
         }
-
+        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
         for (const a of aliases) {
           if (a && text.includes(a)) {
             const g = String(info.gender || "").toLowerCase();
@@ -1437,62 +1256,24 @@
       return null;
     }
 
+    // Build active entries for a paragraph quickly (for speed + accuracy)
+    function getActiveEntriesForBlockText(btLower) {
+      const active = [];
+      for (const [name, info] of entriesAll) {
+        const nLower = String(name || "").toLowerCase();
+        if (nLower && btLower.includes(nLower)) { active.push([name, info]); continue; }
+        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+        for (const a of aliases) {
+          const aLower = String(a || "").toLowerCase();
+          if (aLower && btLower.includes(aLower)) { active.push([name, info]); break; }
+        }
+      }
+      return active;
+    }
+
     // Role heuristic carry state
     let lastActorGender = null;
     let lastActorTTL = 0;
-
-    // ------------------------------
-    // TermMemory Assist triggers (NEW)
-    // ------------------------------
-    function selectionWithinRoot(root) {
-      const sel = window.getSelection?.();
-      if (!sel || sel.rangeCount === 0) return null;
-      const text = String(sel.toString() || "").trim();
-      if (!text) return null;
-
-      const range = sel.getRangeAt(0);
-      const container = range.commonAncestorContainer;
-      const el = container.nodeType === 1 ? container : container.parentElement;
-      if (!el) return null;
-      if (!root.contains(el)) return null;
-      if (isSkippable(el)) return null;
-      return text;
-    }
-
-    function attachTermMemoryHandlers() {
-      if (!U.termMemoryAssist) return;
-
-      document.addEventListener("click", (e) => {
-        // Only show when:
-        // 1) clicking a WTR-identified term (.text-patch.system[data-hash])
-        // OR
-        // 2) user has highlighted selection (mouseup+click on content)
-        const root = findContentRoot();
-        if (!root) return;
-        if (!root.contains(e.target)) return;
-        if (isSkippable(e.target)) return;
-
-        const termEl = e.target.closest?.(".text-patch.system[data-hash]");
-        if (termEl) {
-          const hash = termEl.getAttribute("data-hash") || "";
-          const rawText = (termEl.textContent || "").trim();
-          if (rawText) {
-            ui.openTermModal({ kind: "wtrTerm", hash, rawText });
-          }
-          return;
-        }
-
-        const selText = selectionWithinRoot(root);
-        if (selText) {
-          // Only open for “real” highlights (avoid 1-char noise)
-          if (selText.trim().length >= 2) {
-            ui.openTermModal({ kind: "selection", hash: null, rawText: selText });
-          }
-        }
-      }, true);
-    }
-
-    attachTermMemoryHandlers();
 
     function run() {
       if (!ui.isEnabled()) return;
@@ -1502,15 +1283,16 @@
       if (sig === lastSig) return;
       lastSig = sig;
 
-      // Always update “detected characters” chapter-by-chapter (fixes your stale count issue)
-      const detectedEntries = detectCharactersOnPage(root, entries);
-      ui.setCharacters(detectedEntries.length ? detectedEntries : entries);
+      // 1) Update detected characters (chapter-by-chapter accurate)
+      const detected = detectCharactersThisChapter(root, entriesAll);
+      ui.setDetectedCharacters(detected.length ? detected : entriesAll);
 
-      // Enforce pinned terms / consistency before pronoun logic
-      const memStats = { termEdits: 0 };
-      if (U.enforcePinnedTermsOnPlainText) {
-        const mem = loadTermMemory();
-        enforcePinnedTerms(root, mem, memStats);
+      // 2) Apply term patches (hash-based) using term memory + glossary defaults
+      // This also helps consistency across chapters.
+      let termChanged = 0;
+      if (U.termPatches) {
+        const termMem = ui.getTermMem();
+        termChanged = applyTermPatches(root, cfg, termMem);
       }
 
       const blocks = getTextBlocks(root);
@@ -1529,12 +1311,15 @@
 
       let lastGender = null;
       let carryLeft = 0;
+
       let changedThisRun = 0;
 
       for (const b of blocks) {
         const raw = (b.innerText || "");
         const bt = raw.trim();
         if (!bt) continue;
+
+        if (!RX_ANY_PRONOUN.test(bt)) continue; // big speed win; don’t touch pronoun-free blocks
 
         if (isSceneBreak(bt)) {
           lastGender = null;
@@ -1544,9 +1329,12 @@
           continue;
         }
 
-        // 1) Anchored local fixes (handles mixed-character paragraphs)
-        if (U.anchoredFixes) {
-          changedThisRun += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
+        const btLower = bt.toLowerCase();
+        const activeEntries = getActiveEntriesForBlockText(btLower);
+
+        // 1) Anchored local fixes (only for active entries)
+        if (U.anchoredFixes && activeEntries.length) {
+          changedThisRun += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, activeEntries, U));
         }
 
         // 2) Determine paragraph direction for fallback pass
@@ -1557,21 +1345,27 @@
           g = chapterGender;
           hadDirectMatch = true;
         } else {
-          const computed = computeGenderForText(bt);
-          if (computed) {
-            g = computed;
-            hadDirectMatch = true;
+          if (activeEntries.length) {
+            const computed = computeGenderForText(bt, activeEntries);
+            if (computed) {
+              g = computed;
+              hadDirectMatch = true;
 
-            if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
-              lastActorGender = computed;
-              lastActorTTL = 2;
+              if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
+                lastActorGender = computed;
+                lastActorTTL = 2;
+              }
             }
-          } else {
+          }
+
+          if (!g) {
+            // Normal carry
             if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
               g = lastGender;
               carryLeft--;
             }
 
+            // Role heuristic carry
             if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
               if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
                 g = lastActorGender;
@@ -1581,12 +1375,16 @@
           }
         }
 
+        // 3) Paragraph-wide fallback pass (restored accuracy)
         if (g) {
           const dir = directionFromGender(g);
 
           let doFull = true;
+
+          // If onlyChangeIfWrong is enabled, be *less strict* than before:
+          // apply full pass if paragraph contains ANY wrong pronoun, not only when “wrong dominates”.
           if (U.onlyChangeIfWrong) {
-            doFull = conservativeShouldApply(bt, g);
+            doFull = hasAnyWrongPronoun(bt, g);
           }
 
           if (doFull) {
@@ -1597,11 +1395,20 @@
             lastGender = g;
             carryLeft = carryParagraphs;
           }
+        } else if (U.mixedPronounNormalize) {
+          // 4) Optional: no character detected, but paragraph has both male+female pronouns.
+          // Normalize to majority pronoun set to reduce “he/she” flips for unknown characters.
+          const maleCount = countMatches(RX_PRONOUN_MALE, bt);
+          const femCount  = countMatches(RX_PRONOUN_FEMALE, bt);
+          if (maleCount > 0 && femCount > 0) {
+            const dir = (maleCount >= femCount) ? "toMale" : "toFemale";
+            changedThisRun += replaceInTextNodes(b, (txt) => ({ text: replacePronounsSmart(txt, dir), changed: 0 }));
+          }
         }
       }
 
-      ui.addChanged(changedThisRun);
-      ui.renderDraft(); // keep the draft UI synced (in case user opened other tab / etc)
+      // Include term patch changes in Changed counter (optional; keep it visible)
+      ui.addChanged(changedThisRun + termChanged);
     }
 
     run();
@@ -1610,7 +1417,7 @@
     const obs = new MutationObserver(() => {
       if (!ui.isEnabled()) return;
       if (timer) return;
-      timer = setTimeout(() => { timer = null; run(); }, 600);
+      timer = setTimeout(() => { timer = null; run(); }, 500);
     });
     obs.observe(document.body, { childList: true, subtree: true });
   })();
