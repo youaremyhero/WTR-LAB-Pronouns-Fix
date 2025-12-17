@@ -5,6 +5,14 @@
     "genre": "Apocalypse, Action, Adventure, Game, Supernatural",
     "novellink": "https://wtr-lab.com/en/novel/14370/top-road-survival-influencer-says-she-will-walk-to-the-end-of-the-highway",
     "carryParagraphs": 3,
+     "upgrades": {
+      "anchoredFixes": true,
+      "verbBasedWindow": true,
+      "passiveVoice": true,
+      "dialogueSpeaker": true,
+      "roleHeuristicCarry": true,
+      "onlyChangeIfWrong": true
+     },
     "characters": {
       "Qi Xu": { "gender": "female", "aliases": ["Asuna"] },
       "Magic Boy": { "gender": "male", "aliases": ["Retired Magical Boy", "Magical Boy"] },
