@@ -5,18 +5,16 @@
     "genre": "Apocalypse, Action, Adventure, Game, Supernatural",
     "novellink": "https://wtr-lab.com/en/novel/14370/top-road-survival-influencer-says-she-will-walk-to-the-end-of-the-highway",
     "carryParagraphs": 3,
-     "upgrades": {
+    "upgrades": {
       "anchoredFixes": true,
       "verbBasedWindow": true,
       "passiveVoice": true,
       "dialogueSpeaker": true,
       "roleHeuristicCarry": true,
       "onlyChangeIfWrong": true,
-        "termMemoryAssist": true,
-        "enforcePinnedTermsOnPlainText": true
-      }
-
-     },
+      "termMemoryAssist": true,
+      "enforcePinnedTermsOnPlainText": true
+    },
     "characters": {
       "Qi Xu": { "gender": "female", "aliases": ["Asuna", "Invincible Black Whirlwind"] },
       "Magic Boy": { "gender": "male", "aliases": ["Retired Magical Boy", "Magical Boy"] },
@@ -24,13 +22,10 @@
       "Li Zhi": { "gender": "male" },
       "Chinese Master Chef": { "gender": "male", "aliases": ["Chinese Cooking Master", "Chinese Cooking Boy", "Chinese Little Master", "Little Master", "Master Chef"] },
       "Energetic Girl Guo De Gang": { "gender": "female" }
-
+    },
+    "terms": {
+      "生命之境": { "preferred": "Realm of Life", "pinned": true, "aliases": ["Life Realm"] },
+      "世界竞技场": { "preferred": "World Arena", "pinned": true, "aliases": ["Arena"] }
     }
-
-    , "terms": {
-        "生命之境": { "preferred": "Realm of Life", "pinned": true, "aliases": ["Life Realm"] },
-        "世界竞技场": { "preferred": "World Arena", "pinned": true, "aliases": ["Arena"] }
-      }
-  
   }
 }
