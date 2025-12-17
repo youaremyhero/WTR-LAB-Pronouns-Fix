@@ -2,7 +2,7 @@
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
 // @version      4.9.0
-// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives). Also supports click-to-draft new characters for glossary updates.
+// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives). NEW: TermMemory Assist (Add Character/Add Term from WTR terms or highlighted selection, pin preferred terms across chapters, copy-ready JSON lines, persists until Copy/Clear).
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -41,9 +41,14 @@
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
   const UI_KEY_ON  = "wtrpf_enabled_v1";
 
-  // Draft character picker (saved locally across chapters)
-  const DRAFT_KEY = "wtrpf_draft_chars_v1";            // localStorage object: { "Name": {gender:"male"} }
-  const DRAFT_SESSION_KEY = "wtrpf_draft_session_v1";  // sessionStorage array: ["Name1","Name2"] for THIS tab/page session
+  // ==========================================================
+  // TermMemory (NEW)
+  // ==========================================================
+  const TERM_MEM_KEY = "wtrpf_term_memory_v1";
+  const TERM_MEM_META_KEY = "wtrpf_term_memory_meta_v1"; // small meta; safe to delete
+
+  // NOTE: If user clears browser data / site data (incl. Local Storage), TermMemory is lost.
+  // Clearing “cache” alone sometimes doesn’t remove Local Storage, but “Clear site data” usually does.
 
   // ==========================================================
   // Utilities
@@ -92,35 +97,40 @@
     return m ? m.length : 0;
   }
 
-  // ==========================================================
-  // Draft storage helpers
-  // ==========================================================
-  function getDrafts() {
-    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || "{}") || {}; }
-    catch { return {}; }
-  }
-  function setDrafts(obj) { localStorage.setItem(DRAFT_KEY, JSON.stringify(obj || {})); }
-  function clearDrafts() { localStorage.removeItem(DRAFT_KEY); }
-
-  function getDraftSessionSet() {
-    try {
-      const arr = JSON.parse(sessionStorage.getItem(DRAFT_SESSION_KEY) || "[]");
-      return new Set(Array.isArray(arr) ? arr : []);
-    } catch { return new Set(); }
-  }
-  function saveDraftSessionSet(set) {
-    sessionStorage.setItem(DRAFT_SESSION_KEY, JSON.stringify(Array.from(set || [])));
+  function nowISO() {
+    try { return new Date().toISOString(); } catch { return String(Date.now()); }
   }
 
-  // ✅ Copy format: easy paste into glossary characters object
-  // Produces lines like:  "Li Zhi": { "gender": "male" },
-  function formatDraftsForCopy(draftsObj) {
-    const names = Object.keys(draftsObj || {}).sort((a,b) => a.localeCompare(b));
-    return names.map(n => `"${n}": { "gender": "${draftsObj[n].gender}" },`).join("\n");
+  function safeJSONParse(s, fallback) {
+    try { return JSON.parse(s); } catch { return fallback; }
   }
 
   // ==========================================================
-  // Smart pronoun replacement (your existing engine)
+  // TermMemory store
+  // ==========================================================
+  function loadTermMemory() {
+    const raw = localStorage.getItem(TERM_MEM_KEY);
+    const data = safeJSONParse(raw, null);
+    if (!data || typeof data !== "object") {
+      return { items: {} };
+    }
+    if (!data.items || typeof data.items !== "object") data.items = {};
+    return data;
+  }
+
+  function saveTermMemory(mem) {
+    localStorage.setItem(TERM_MEM_KEY, JSON.stringify(mem));
+    localStorage.setItem(TERM_MEM_META_KEY, JSON.stringify({ updatedAt: nowISO() }));
+  }
+
+  function termKeyFrom(hash, text) {
+    if (hash) return `hash:${hash}`;
+    const t = String(text || "").trim();
+    return `text:${t.toLowerCase()}`;
+  }
+
+  // ==========================================================
+  // Smart pronoun replacement (existing engine)
   // ==========================================================
   function replacePronounsSmart(text, direction /* "toMale" | "toFemale" */) {
     text = normalizeWeirdSpaces(text);
@@ -224,9 +234,6 @@
     return null;
   }
 
-  // ==========================================================
-  // Upgrade: Anchored local fixes (with options)
-  // ==========================================================
   function applyAnchoredFixes(text, entries, opts) {
     let changed = 0;
     let s = normalizeWeirdSpaces(text);
@@ -295,7 +302,7 @@
   // ==========================================================
   function findContentRoot() {
     const candidates = Array.from(document.querySelectorAll(
-      "article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"
+      "article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section, .chapter-body"
     ));
     let best = null, bestScore = 0;
     for (const el of candidates) {
@@ -313,7 +320,8 @@
     "[role='navigation']",
     ".breadcrumbs",".breadcrumb",".toolbar",".tools",".tool",
     ".pagination",".pager",".share",".social",
-    ".menu",".navbar",".nav",".btn",".button"
+    ".menu",".navbar",".nav",".btn",".button",
+    ".mini-term-editor" // avoid interacting with WTR editor directly
   ].join(",");
 
   function isSkippable(el) {
@@ -330,7 +338,7 @@
   }
 
   // ==========================================================
-  // Replace in text nodes
+  // TreeWalker text node replacer
   // ==========================================================
   function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} */) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
@@ -365,7 +373,7 @@
   }
 
   // ==========================================================
-  // Character detection on current chapter/page
+  // Character detection on current chapter/page (existing)
   // ==========================================================
   function detectCharactersOnPage(root, entries) {
     const hay = (root?.innerText || "").toLowerCase();
@@ -392,193 +400,86 @@
   }
 
   // ==========================================================
-  // Click-to-draft name picker helpers
+  // Term detection: WTR terms (NEW)
   // ==========================================================
-  function expandSelectionToName(sel) {
-    if (!sel || sel.rangeCount === 0) return "";
-    const range = sel.getRangeAt(0);
-    const node = range.startContainer;
+  function collectWtrTerms(root) {
+    // Returns Map hash -> text (preferred as currently displayed)
+    const map = new Map();
+    if (!root) return map;
+    const nodes = root.querySelectorAll(".text-patch.system[data-hash]");
+    nodes.forEach(el => {
+      const h = el.getAttribute("data-hash") || "";
+      const t = (el.textContent || "").trim();
+      if (h && t) map.set(h, t);
+    });
+    return map;
+  }
 
-    const selectedText = (sel.toString() || "").trim().replace(/\s+/g, " ");
-    if (!node || node.nodeType !== Node.TEXT_NODE) return selectedText;
+  // ==========================================================
+  // Consistency enforcement: pinned terms (NEW)
+  // ==========================================================
+  function enforcePinnedTerms(root, mem, stats) {
+    if (!root || !mem || !mem.items) return;
 
-    const text = node.nodeValue || "";
-    let start = range.startOffset;
-    let end = range.endOffset;
+    // 1) Hash-based: update .text-patch by hash (most reliable)
+    const wtrMap = collectWtrTerms(root);
+    for (const [k, item] of Object.entries(mem.items)) {
+      if (!item || !item.pinned) continue;
+      if (!k.startsWith("hash:")) continue;
 
-    const isStop = (ch) => /[\n\r\t]|[.,!?;:()[\]{}"“”'‘’<>]/.test(ch);
+      const hash = k.slice("hash:".length);
+      const preferred = String(item.preferred || "").trim();
+      if (!hash || !preferred) continue;
 
-    while (start > 0 && !isStop(text[start - 1])) start--;
-    while (end < text.length && !isStop(text[end])) end++;
-
-    let chunk = text.slice(start, end).trim().replace(/\s+/g, " ");
-    chunk = chunk.replace(/^[-–—"“”'‘’]+|[-–—"“”'‘’]+$/g, "").trim();
-
-    // prevent grabbing full sentences: cap to 7 words
-    const words = chunk.split(" ").filter(Boolean);
-    if (words.length > 7) {
-      if (selectedText) {
-        const first = selectedText.split(" ")[0];
-        const idx = words.findIndex(w => w === first);
-        if (idx >= 0) chunk = words.slice(idx, idx + 7).join(" ");
-        else chunk = words.slice(0, 7).join(" ");
-      } else {
-        chunk = words.slice(0, 7).join(" ");
+      // If WTR term exists in this chapter, force its display text
+      // (also collects variants passively)
+      const current = wtrMap.get(hash);
+      if (current && current !== preferred) {
+        const els = root.querySelectorAll(`.text-patch.system[data-hash="${CSS.escape(hash)}"]`);
+        els.forEach(el => {
+          if ((el.textContent || "").trim() !== preferred) {
+            el.textContent = preferred;
+            stats.termEdits++;
+          }
+        });
       }
     }
 
-    return chunk;
-  }
+    // 2) Plain-text fallback: replace known variants -> preferred for pinned entries
+    // Conservative: only for pinned; uses variants list.
+    const pinned = Object.values(mem.items).filter(it => it && it.pinned && it.preferred);
+    if (!pinned.length) return;
 
-  function highlightAddedNames(root, namesSet) {
-    if (!root || !namesSet || namesSet.size === 0) return;
+    const blocks = getTextBlocks(root);
+    for (const b of blocks) {
+      replaceInTextNodes(b, (txt) => {
+        let s = txt;
+        for (const it of pinned) {
+          const preferred = String(it.preferred || "").trim();
+          if (!preferred) continue;
 
-    const names = Array.from(namesSet).filter(Boolean).sort((a,b)=>b.length-a.length);
-    if (!names.length) return;
+          const variants = Array.isArray(it.variants) ? it.variants : [];
+          for (const v of variants) {
+            const vv = String(v || "").trim();
+            if (!vv || vv === preferred) continue;
 
-    if (!document.getElementById("wtrpf-draft-hi-style")) {
-      const st = document.createElement("style");
-      st.id = "wtrpf-draft-hi-style";
-      st.textContent = `
-        .wtrpf-added-name{
-          background: rgba(255,255,255,0.12);
-          border-bottom: 1px dashed rgba(255,255,255,0.35);
-          padding: 0 1px;
-          border-radius: 3px;
+            // Very short variants are risky; skip unless explicitly long or multi-word
+            const riskyShort = vv.length <= 3 && !/\s/.test(vv);
+            if (riskyShort) continue;
+
+            // Word-boundary if "wordy", else simple replace
+            if (/^[\p{L}\p{N}_'-]+$/u.test(vv)) {
+              const re = new RegExp(String.raw`\b${escapeRegExp(vv)}\b`, "g");
+              s = s.replace(re, preferred);
+            } else {
+              // phrase variant
+              s = s.split(vv).join(preferred);
+            }
+          }
         }
-      `;
-      document.documentElement.appendChild(st);
+        return { text: s, changed: 0 };
+      });
     }
-
-    const rx = new RegExp(names.map(n => escapeRegExp(n)).join("|"), "g");
-
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const p = node.parentElement;
-        if (!p) return NodeFilter.FILTER_REJECT;
-        if (p.closest("a, button, input, textarea, select, script, style, noscript")) return NodeFilter.FILTER_REJECT;
-        if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
-        if (p.classList && p.classList.contains("wtrpf-added-name")) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
-    const nodes = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode);
-
-    for (const tn of nodes) {
-      const s = tn.nodeValue;
-      if (!rx.test(s)) continue;
-      rx.lastIndex = 0;
-
-      const frag = document.createDocumentFragment();
-      let last = 0;
-      let m;
-      while ((m = rx.exec(s)) !== null) {
-        const i = m.index;
-        const hit = m[0];
-        if (i > last) frag.appendChild(document.createTextNode(s.slice(last, i)));
-        const span = document.createElement("span");
-        span.className = "wtrpf-added-name";
-        span.textContent = hit;
-        frag.appendChild(span);
-        last = i + hit.length;
-      }
-      if (last < s.length) frag.appendChild(document.createTextNode(s.slice(last)));
-      tn.parentNode.replaceChild(frag, tn);
-    }
-  }
-
-  function installNamePickerUI(root, onAdded) {
-    let pop = null;
-
-    function closePop() {
-      if (pop) pop.remove();
-      pop = null;
-    }
-
-    function openPop(x, y, pickedName) {
-      closePop();
-      if (!pickedName) return;
-
-      pop = document.createElement("div");
-      pop.id = "wtrpf-name-pop";
-      pop.style.cssText = `
-        position: fixed;
-        left: ${x}px; top: ${y}px;
-        z-index: 2147483647;
-        background: rgba(0,0,0,0.72);
-        color:#fff;
-        border-radius: 12px;
-        padding: 10px;
-        box-shadow: 0 10px 28px rgba(0,0,0,.35);
-        backdrop-filter: blur(6px);
-        font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-        max-width: min(360px, 88vw);
-      `;
-
-      const t = document.createElement("div");
-      t.style.cssText = `font-weight:600; margin-bottom:8px;`;
-      t.textContent = `Add character: ${pickedName}`;
-
-      const row = document.createElement("div");
-      row.style.cssText = `display:flex; gap:8px;`;
-
-      const mkBtn = (label, gender) => {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.textContent = label;
-        b.style.cssText = `
-          appearance:none; border:0; cursor:pointer;
-          padding: 6px 10px; border-radius: 10px;
-          background: rgba(255,255,255,0.14); color:#fff;
-          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-        `;
-        b.onclick = () => {
-          const drafts = getDrafts();
-          drafts[pickedName] = { gender };
-          setDrafts(drafts);
-
-          const sessionSet = getDraftSessionSet();
-          sessionSet.add(pickedName);
-          saveDraftSessionSet(sessionSet);
-
-          onAdded?.(pickedName);
-          closePop();
-        };
-        return b;
-      };
-
-      row.appendChild(mkBtn("Male", "male"));
-      row.appendChild(mkBtn("Female", "female"));
-
-      pop.appendChild(t);
-      pop.appendChild(row);
-      document.documentElement.appendChild(pop);
-
-      setTimeout(() => {
-        document.addEventListener("mousedown", (e) => {
-          if (pop && !pop.contains(e.target)) closePop();
-        }, { once: true });
-      }, 0);
-    }
-
-    root.addEventListener("mouseup", (e) => {
-      const sel = window.getSelection();
-      const picked = expandSelectionToName(sel);
-
-      // guardrails
-      if (!picked || picked.length < 3) return;
-      if (picked.split(" ").length === 1 && picked.length < 4) return;
-
-      const anchorEl = sel?.anchorNode?.parentElement;
-      if (!anchorEl || !root.contains(anchorEl)) return;
-      if (anchorEl.closest("#wtrpf-name-pop")) return;
-
-      const x = Math.min(window.innerWidth - 20, e.clientX + 10);
-      const y = Math.min(window.innerHeight - 20, e.clientY + 10);
-      openPop(x, y, picked);
-    });
   }
 
   // ==========================================================
@@ -656,7 +557,7 @@
   }
 
   // ==========================================================
-  // UI (panel + minimized pill)
+  // UI + TermMemory Assist (NEW)
   // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
@@ -670,6 +571,11 @@
     let charactersList3 = "";
     let changedTotal = 0;
     let glossaryOk = true;
+
+    // TermMemory UI state
+    let draftCount = 0;
+    let draftLines = "";
+    const sessionHighlights = new Set(); // keys added during this chapter session (for visual emphasis)
 
     function applyPos(el) {
       if (savedPos.left != null) {
@@ -732,7 +638,10 @@
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
 
-      /* EDIT HERE: Expanded opacity (20% more transparent) */
+      /* ============================
+         EDIT HERE: Expanded opacity
+         - Reduced opacity by ~20%
+         ============================ */
       background: rgba(0,0,0,0.50);
 
       color: #fff;
@@ -741,13 +650,47 @@
       font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
 
-      /* EDIT HERE: Expanded width cap (slightly narrower) */
-      max-width: min(480px, 86vw);
+      /* ============================
+         EDIT HERE: Expanded width cap
+         - Slightly narrower than before
+         - Height auto (grows with content)
+         ============================ */
+      max-width: min(460px, 86vw);
       height: auto;
 
       backdrop-filter: blur(6px);
       user-select: none;
       touch-action: none;
+    `;
+
+    // Minimised pill container
+    const pill = document.createElement("div");
+    pill.style.cssText = `
+      display:none; position: fixed; z-index: 2147483647;
+
+      /* ============================
+         EDIT HERE: Minimised opacity
+         - Reduced opacity by ~40%
+         ============================ */
+      background: rgba(0,0,0,0.37);
+
+      color:#fff;
+      border-radius: 999px;
+
+      /* ============================
+         EDIT HERE: Minimised size
+         - Smaller padding + font
+         ============================ */
+      padding: 4px 6px;
+      font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+
+      box-shadow: 0 10px 28px rgba(0,0,0,.25);
+      backdrop-filter: blur(6px);
+      user-select: none;
+      touch-action: none;
+
+      /* Slightly narrower cap */
+      max-width: min(380px, 84vw);
     `;
 
     const topRow = document.createElement("div");
@@ -769,17 +712,6 @@
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     `;
 
-    const resetBtn = document.createElement("button");
-    resetBtn.type = "button";
-    resetBtn.textContent = "↺";
-    resetBtn.title = "Reset Changed";
-    resetBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:26px; height:26px; border-radius:9px;
-      background:rgba(255,255,255,0.12); color:#fff;
-      font-size:14px; line-height:26px; padding:0;
-    `;
-
     const minBtn = document.createElement("button");
     minBtn.type = "button";
     minBtn.textContent = "—";
@@ -791,38 +723,55 @@
       font-size:16px; line-height:26px; padding:0;
     `;
 
-    // ---- Expanded content arrangement ----
-    const stats = document.createElement("div");
-    stats.style.cssText = `white-space: pre-line; opacity: .95;`;
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.textContent = "↺";
+    resetBtn.title = "Reset Changed";
+    resetBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      width:26px; height:26px; border-radius:9px;
+      background:rgba(255,255,255,0.12); color:#fff;
+      font-size:14px; line-height:26px; padding:0;
+    `;
+
+    // --- Layout requested: info row -> divider -> copy/clear -> draft count
+    const info = document.createElement("div");
+    info.style.cssText = `white-space: pre-line; opacity: .95; margin-bottom: 8px;`;
 
     const divider = document.createElement("div");
     divider.style.cssText = `height:1px; background: rgba(255,255,255,0.14); margin: 8px 0;`;
 
-    const draftArea = document.createElement("textarea");
-    draftArea.readOnly = true;
-    draftArea.spellcheck = false;
-    draftArea.style.cssText = `
+    const draftLabel = document.createElement("div");
+    draftLabel.textContent = "Draft (copy to update glossary.json later):";
+    draftLabel.style.cssText = `font-weight:600; font-size:12px; margin: 4px 0 6px;`;
+
+    const draftBox = document.createElement("textarea");
+    draftBox.readOnly = true;
+    draftBox.spellcheck = false;
+    draftBox.style.cssText = `
       width: 100%;
-      box-sizing: border-box;
-      resize: none;
-      height: 84px;
-      padding: 8px 9px;
-      border-radius: 10px;
+      min-height: 78px;
+      max-height: 200px;
+      resize: vertical;
       border: 1px solid rgba(255,255,255,0.14);
-      background: rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.06);
       color: #fff;
-      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      outline: none;
     `;
 
-    const draftBtns = document.createElement("div");
-    draftBtns.style.cssText = `display:flex; gap:8px; align-items:center; margin-top:8px;`;
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = `display:flex; gap:8px; align-items:center; margin-top: 8px;`;
 
     const copyBtn = document.createElement("button");
     copyBtn.type = "button";
     copyBtn.textContent = "Copy JSON";
+    copyBtn.title = "Copy draft lines and clear (per your preference)";
     copyBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 10px;
+      padding: 7px 10px; border-radius: 10px;
       background: rgba(255,255,255,0.14); color:#fff;
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     `;
@@ -830,39 +779,19 @@
     const clearBtn = document.createElement("button");
     clearBtn.type = "button";
     clearBtn.textContent = "Clear";
+    clearBtn.title = "Clear draft (TermMemory)";
     clearBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 10px;
+      padding: 7px 10px; border-radius: 10px;
       background: rgba(255,255,255,0.10); color:#fff;
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     `;
 
-    const draftCount = document.createElement("div");
-    draftCount.style.cssText = `margin-top: 8px; opacity: .9;`;
+    const draftCountEl = document.createElement("div");
+    draftCountEl.style.cssText = `opacity:.85; margin-top: 8px;`;
+    draftCountEl.textContent = "Drafted: 0";
 
-    // Minimised pill container
-    const pill = document.createElement("div");
-    pill.style.cssText = `
-      display:none; position: fixed; z-index: 2147483647;
-
-      /* EDIT HERE: Minimised opacity (40% more transparent) */
-      background: rgba(0,0,0,0.37);
-
-      color:#fff;
-      border-radius: 999px;
-
-      /* EDIT HERE: Minimised size */
-      padding: 4px 6px;
-      font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-
-      box-shadow: 0 10px 28px rgba(0,0,0,.25);
-      backdrop-filter: blur(6px);
-      user-select: none;
-      touch-action: none;
-
-      max-width: min(420px, 84vw);
-    `;
-
+    // Min pill row
     const pillRow = document.createElement("div");
     pillRow.style.cssText = `display:flex; align-items:center; gap:8px;`;
 
@@ -880,6 +809,189 @@
       font-size:14px; line-height:22px; padding:0;
     `;
 
+    // Modal (Add Character / Add Term)
+    const modal = document.createElement("div");
+    modal.style.cssText = `
+      display:none; position: fixed; z-index: 2147483647;
+      right: 12px; top: 64px;
+      max-width: min(420px, 90vw);
+      background: rgba(0,0,0,0.72);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.16);
+      border-radius: 14px;
+      box-shadow: 0 18px 40px rgba(0,0,0,.35);
+      padding: 10px 12px;
+      backdrop-filter: blur(8px);
+      user-select: none;
+      touch-action: none;
+    `;
+
+    const modalTitle = document.createElement("div");
+    modalTitle.style.cssText = `font-weight:700; margin-bottom:6px;`;
+    modalTitle.textContent = "Add to PronounsFix";
+
+    const modalSub = document.createElement("div");
+    modalSub.style.cssText = `opacity:.9; margin-bottom:10px; word-break: break-word;`;
+
+    const modalStep = document.createElement("div");
+    modalStep.style.cssText = `display:flex; flex-direction:column; gap:10px;`;
+
+    // Step 1 buttons
+    const step1 = document.createElement("div");
+    step1.style.cssText = `display:flex; gap:8px; flex-wrap:wrap;`;
+
+    const addCharBtn = document.createElement("button");
+    addCharBtn.type = "button";
+    addCharBtn.textContent = "Add Character";
+    addCharBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.16); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const addTermBtn = document.createElement("button");
+    addTermBtn.type = "button";
+    addTermBtn.textContent = "Add Term";
+    addTermBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.10); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    // Step 2 (dynamic)
+    const step2 = document.createElement("div");
+    step2.style.cssText = `display:none; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 10px;`;
+
+    const nameRow = document.createElement("div");
+    nameRow.style.cssText = `display:flex; flex-direction:column; gap:6px;`;
+
+    const nameLabel = document.createElement("div");
+    nameLabel.style.cssText = `font-weight:600;`;
+    nameLabel.textContent = "Preferred name / term";
+
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.autocomplete = "off";
+    nameInput.spellcheck = false;
+    nameInput.style.cssText = `
+      width:100%;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.06);
+      color: #fff;
+      outline: none;
+      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const toggleRow = document.createElement("div");
+    toggleRow.style.cssText = `display:flex; align-items:center; gap:10px; flex-wrap:wrap;`;
+
+    const pinWrap = document.createElement("label");
+    pinWrap.style.cssText = `display:flex; align-items:center; gap:8px; cursor:pointer; opacity:.95;`;
+
+    const pinCb = document.createElement("input");
+    pinCb.type = "checkbox";
+    pinCb.checked = true;
+
+    const pinText = document.createElement("span");
+    pinText.textContent = "Pin term (enforce across chapters)";
+
+    pinWrap.appendChild(pinCb);
+    pinWrap.appendChild(pinText);
+
+    const genderRow = document.createElement("div");
+    genderRow.style.cssText = `display:none; align-items:center; gap:8px; flex-wrap:wrap;`;
+
+    const genderLabel = document.createElement("div");
+    genderLabel.style.cssText = `font-weight:600; margin-right:4px;`;
+    genderLabel.textContent = "Select gender:";
+
+    const gMale = document.createElement("button");
+    gMale.type = "button";
+    gMale.textContent = "Male";
+    gMale.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 7px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.14); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const gFemale = document.createElement("button");
+    gFemale.type = "button";
+    gFemale.textContent = "Female";
+    gFemale.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 7px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.14); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const gUnknown = document.createElement("button");
+    gUnknown.type = "button";
+    gUnknown.textContent = "Unknown";
+    gUnknown.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 7px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.08); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const actionRow = document.createElement("div");
+    actionRow.style.cssText = `display:flex; gap:8px; margin-top: 10px;`;
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save";
+    saveBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(76,175,80,0.18); color:#fff;
+      border: 1px solid rgba(76,175,80,0.28);
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.10); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
+
+    // Modal assembly
+    step1.appendChild(addCharBtn);
+    step1.appendChild(addTermBtn);
+
+    nameRow.appendChild(nameLabel);
+    nameRow.appendChild(nameInput);
+
+    genderRow.appendChild(genderLabel);
+    genderRow.appendChild(gMale);
+    genderRow.appendChild(gFemale);
+    genderRow.appendChild(gUnknown);
+
+    toggleRow.appendChild(pinWrap);
+
+    actionRow.appendChild(saveBtn);
+    actionRow.appendChild(cancelBtn);
+
+    step2.appendChild(nameRow);
+    step2.appendChild(genderRow);
+    step2.appendChild(toggleRow);
+    step2.appendChild(actionRow);
+
+    modalStep.appendChild(step1);
+    modalStep.appendChild(step2);
+
+    modal.appendChild(modalTitle);
+    modal.appendChild(modalSub);
+    modal.appendChild(modalStep);
+
     function refreshToggleUI() {
       const on = enabled();
       toggleBtn.textContent = on ? "ON" : "OFF";
@@ -887,20 +999,72 @@
       pillText.textContent = `PF (${on ? "ON" : "OFF"})`;
     }
 
-    function refreshPanelStats() {
+    function refreshInfo() {
       if (!glossaryOk) {
-        stats.textContent = "Glossary error";
+        info.textContent = "Glossary error";
         return;
       }
       const line1 = `• Characters: ${charactersCount}` + (charactersList3 ? ` • ${charactersList3}` : "");
       const line2 = `• Changed: ${changedTotal}`;
-      stats.textContent = `${line1}\n${line2}`;
+      info.textContent = `${line1}\n${line2}`;
     }
 
-    function refreshDraftUI() {
-      const drafts = getDrafts();
-      draftArea.value = formatDraftsForCopy(drafts);
-      draftCount.textContent = `Draft count: ${Object.keys(drafts).length}`;
+    function renderDraftFromMemory() {
+      const mem = loadTermMemory();
+      const items = mem.items || {};
+
+      // Copy output format (your requested “easy paste” lines):
+      // "Li Zhi": { "gender": "male" },
+      // Keep characters-only here, since glossary characters live under "characters".
+      const charLines = [];
+      let count = 0;
+
+      for (const it of Object.values(items)) {
+        if (!it || it.type !== "character") continue;
+        const name = String(it.preferred || "").trim();
+        if (!name) continue;
+
+        const g = String(it.gender || "unknown").toLowerCase();
+        if (g === "male" || g === "female") {
+          charLines.push(`"${name}": { "gender": "${g}" },`);
+        } else {
+          // If unknown, still output (optional). You can delete later.
+          charLines.push(`"${name}": { "gender": "unknown" },`);
+        }
+        count++;
+      }
+
+      draftCount = count;
+      draftLines = charLines.join("\n");
+      draftBox.value = draftLines;
+      draftCountEl.textContent = `Drafted: ${draftCount}`;
+    }
+
+    async function copyDraftAndClear() {
+      const text = (draftBox.value || "").trim();
+      if (!text) return;
+
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        // Fallback for stricter pages
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+
+      // Per your preference: keep until Copy or Clear -> Copy clears as well
+      clearTermMemory();
+    }
+
+    function clearTermMemory() {
+      saveTermMemory({ items: {} });
+      renderDraftFromMemory();
     }
 
     toggleBtn.onclick = () => {
@@ -911,36 +1075,11 @@
 
     resetBtn.onclick = () => {
       changedTotal = 0;
-      refreshPanelStats();
+      refreshInfo();
     };
 
-    // Copy JSON clears drafts after copy (as you requested)
-    copyBtn.onclick = async () => {
-      const txt = (draftArea.value || "").trim();
-      if (!txt) return;
-
-      let copied = false;
-      try {
-        await navigator.clipboard.writeText(txt);
-        copied = true;
-      } catch {
-        try {
-          draftArea.focus();
-          draftArea.select();
-          copied = document.execCommand("copy");
-        } catch { copied = false; }
-      }
-
-      if (copied) {
-        clearDrafts();
-        refreshDraftUI();
-      }
-    };
-
-    clearBtn.onclick = () => {
-      clearDrafts();
-      refreshDraftUI();
-    };
+    copyBtn.onclick = () => { copyDraftAndClear(); };
+    clearBtn.onclick = () => { clearTermMemory(); };
 
     function syncPos(fromEl, toEl) {
       const r = fromEl.getBoundingClientRect();
@@ -954,6 +1093,7 @@
       localStorage.setItem(UI_KEY_MIN, min ? "1" : "0");
       box.style.display = min ? "none" : "block";
       pill.style.display = min ? "block" : "none";
+      modal.style.display = "none";
       if (min) syncPos(box, pill);
       else syncPos(pill, box);
     }
@@ -974,26 +1114,30 @@
     topRow.appendChild(title);
     topRow.appendChild(controls);
 
+    // Expanded layout
     box.appendChild(topRow);
-    box.appendChild(stats);
+    box.appendChild(info);
     box.appendChild(divider);
-    box.appendChild(draftArea);
+    box.appendChild(draftLabel);
+    box.appendChild(draftBox);
+    box.appendChild(btnRow);
+    box.appendChild(draftCountEl);
 
-    draftBtns.appendChild(copyBtn);
-    draftBtns.appendChild(clearBtn);
-    box.appendChild(draftBtns);
-    box.appendChild(draftCount);
+    btnRow.appendChild(copyBtn);
+    btnRow.appendChild(clearBtn);
 
+    // Min pill
     pillRow.appendChild(pillText);
     pillRow.appendChild(pillExpandBtn);
     pill.appendChild(pillRow);
 
     document.documentElement.appendChild(box);
     document.documentElement.appendChild(pill);
+    document.documentElement.appendChild(modal);
 
     refreshToggleUI();
-    refreshPanelStats();
-    refreshDraftUI();
+    refreshInfo();
+    renderDraftFromMemory();
 
     if (localStorage.getItem(UI_KEY_MIN) === "1") setMin(true);
 
@@ -1001,9 +1145,173 @@
       clampToViewport(localStorage.getItem(UI_KEY_MIN) === "1" ? pill : box);
     });
 
+    // ------------------------------
+    // TermMemory Assist: modal logic
+    // ------------------------------
+    const modalState = {
+      source: null,   // { hash, rawText, kind: "wtrTerm"|"selection" }
+      mode: null,     // "character"|"term"
+      gender: "unknown"
+    };
+
+    function openModal(source) {
+      // Only open when expanded (keeps UX cleaner)
+      if (localStorage.getItem(UI_KEY_MIN) === "1") setMin(false);
+
+      modalState.source = source;
+      modalState.mode = null;
+      modalState.gender = "unknown";
+
+      // Step 1 visible, step 2 hidden
+      step2.style.display = "none";
+      addCharBtn.disabled = false;
+      addTermBtn.disabled = false;
+
+      // Default input is the selected/term text, but user can expand it (e.g. Energetic -> full name)
+      const raw = String(source?.rawText || "").trim();
+      nameInput.value = raw;
+
+      // Position modal near main box
+      try {
+        const r = box.getBoundingClientRect();
+        modal.style.left = (r.left) + "px";
+        modal.style.top = (r.bottom + 8) + "px";
+        modal.style.right = "auto";
+      } catch {}
+
+      modalSub.textContent = raw ? `Selected: ${raw}` : "Selected: (empty)";
+      modal.style.display = "block";
+      clampToViewport(modal);
+    }
+
+    function closeModal() {
+      modal.style.display = "none";
+      modalState.source = null;
+      modalState.mode = null;
+      modalState.gender = "unknown";
+    }
+
+    function setMode(mode) {
+      modalState.mode = mode;
+      step2.style.display = "block";
+
+      // Character mode shows gender, Term mode hides it
+      if (mode === "character") {
+        genderRow.style.display = "flex";
+        pinCb.checked = true; // recommended default ON for character names consistency
+      } else {
+        genderRow.style.display = "none";
+        pinCb.checked = true; // still useful for equipment/skills
+      }
+    }
+
+    addCharBtn.onclick = () => setMode("character");
+    addTermBtn.onclick = () => setMode("term");
+
+    function pickGender(g) {
+      modalState.gender = g;
+      // Small visual feedback
+      const on = "rgba(255,255,255,0.22)";
+      const off = "rgba(255,255,255,0.14)";
+      gMale.style.background = (g === "male") ? on : off;
+      gFemale.style.background = (g === "female") ? on : off;
+      gUnknown.style.background = (g === "unknown") ? "rgba(255,255,255,0.12)" : "rgba(255,255,255,0.08)";
+    }
+
+    gMale.onclick = () => pickGender("male");
+    gFemale.onclick = () => pickGender("female");
+    gUnknown.onclick = () => pickGender("unknown");
+
+    cancelBtn.onclick = () => closeModal();
+
+    function highlightCurrentChapterKey(key) {
+      sessionHighlights.add(key);
+
+      const root = findContentRoot();
+      if (!root) return;
+
+      if (key.startsWith("hash:")) {
+        const hash = key.slice("hash:".length);
+        const els = root.querySelectorAll(`.text-patch.system[data-hash="${CSS.escape(hash)}"]`);
+        els.forEach(el => {
+          el.style.textShadow = "0 0 10px rgba(76,175,80,0.55)";
+          el.style.outline = "1px solid rgba(76,175,80,0.40)";
+          el.style.borderRadius = "6px";
+          el.style.padding = "0 2px";
+        });
+      }
+      // Note: for plain-text selections (no hash), we keep it conservative and do not wrap text nodes.
+      // It avoids breaking WTR DOM / line structures.
+    }
+
+    function addToTermMemory({ type, hash, rawText, preferred, gender, pinned }) {
+      const mem = loadTermMemory();
+      const items = mem.items || {};
+      mem.items = items;
+
+      const key = termKeyFrom(hash, rawText);
+      const pref = String(preferred || rawText || "").trim();
+      if (!pref) return null;
+
+      const existing = items[key] || null;
+
+      // Build/merge
+      const out = {
+        type: type,
+        gender: type === "character" ? String(gender || "unknown").toLowerCase() : undefined,
+        preferred: pref,
+        pinned: !!pinned,
+        variants: [],
+        createdAt: existing?.createdAt || nowISO(),
+        updatedAt: nowISO(),
+        hash: hash || existing?.hash || undefined
+      };
+
+      // Variants: always include the raw text if different
+      const vset = new Set(Array.isArray(existing?.variants) ? existing.variants : []);
+      const raw = String(rawText || "").trim();
+      if (raw && raw !== pref) vset.add(raw);
+
+      // If existing preferred differs, keep old preferred as variant
+      if (existing?.preferred && existing.preferred !== pref) vset.add(existing.preferred);
+
+      out.variants = Array.from(vset).filter(Boolean).slice(0, 60);
+
+      items[key] = out;
+      saveTermMemory(mem);
+
+      highlightCurrentChapterKey(key);
+      renderDraftFromMemory();
+      return out;
+    }
+
+    saveBtn.onclick = () => {
+      if (!modalState.source) return;
+
+      const preferred = String(nameInput.value || "").trim();
+      if (!preferred) return;
+
+      const type = modalState.mode;
+      if (type !== "character" && type !== "term") return;
+
+      const src = modalState.source;
+      addToTermMemory({
+        type,
+        hash: src.hash || null,
+        rawText: src.rawText || "",
+        preferred,
+        gender: modalState.gender || "unknown",
+        pinned: !!pinCb.checked
+      });
+
+      closeModal();
+    };
+
+    // Public hooks for main loop
     return {
+      // existing hooks
       isEnabled: () => enabled(),
-      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshPanelStats(); },
+      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshInfo(); },
       setCharacters: (entries) => {
         charactersCount = entries.length;
         const names = entries.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
@@ -1012,14 +1320,18 @@
           return `${name} (${label})`;
         });
         charactersList3 = names.join(", ") + (entries.length > MAX_NAMES_SHOWN ? " …" : "");
-        refreshPanelStats();
+        refreshInfo();
       },
       addChanged: (delta) => {
         if (Number.isFinite(delta) && delta > 0) changedTotal += delta;
-        refreshPanelStats();
+        refreshInfo();
       },
       refreshUI: refreshToggleUI,
-      refreshDrafts: () => refreshDraftUI()
+
+      // NEW hooks
+      openTermModal: openModal,
+      closeTermModal: closeModal,
+      renderDraft: renderDraftFromMemory
     };
   }
 
@@ -1054,7 +1366,11 @@
       passiveVoice: !!upgrades.passiveVoice,
       dialogueSpeaker: !!upgrades.dialogueSpeaker,
       roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
-      onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong
+      onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong,
+
+      // NEW optional upgrades (defaults ON for consistency; set false per novel if needed)
+      termMemoryAssist: upgrades.termMemoryAssist !== false,
+      enforcePinnedTermsOnPlainText: upgrades.enforcePinnedTermsOnPlainText !== false
     };
 
     const characters = {
@@ -1067,22 +1383,7 @@
       ui.setGlossaryOk(false);
       return;
     }
-
     ui.setGlossaryOk(true);
-
-    // Detect only characters that actually appear in this chapter/page
-    const rootForDetect = findContentRoot();
-    const detectedEntries = detectCharactersOnPage(rootForDetect, entries);
-    ui.setCharacters(detectedEntries.length ? detectedEntries : entries);
-
-    // Install click-to-draft picker on the chapter root
-    const chapterRoot = findContentRoot();
-    installNamePickerUI(chapterRoot, () => {
-      ui.refreshDrafts();
-      highlightAddedNames(chapterRoot, getDraftSessionSet());
-    });
-    // Highlight any names drafted earlier in this same session/tab
-    highlightAddedNames(chapterRoot, getDraftSessionSet());
 
     const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
@@ -1140,6 +1441,59 @@
     let lastActorGender = null;
     let lastActorTTL = 0;
 
+    // ------------------------------
+    // TermMemory Assist triggers (NEW)
+    // ------------------------------
+    function selectionWithinRoot(root) {
+      const sel = window.getSelection?.();
+      if (!sel || sel.rangeCount === 0) return null;
+      const text = String(sel.toString() || "").trim();
+      if (!text) return null;
+
+      const range = sel.getRangeAt(0);
+      const container = range.commonAncestorContainer;
+      const el = container.nodeType === 1 ? container : container.parentElement;
+      if (!el) return null;
+      if (!root.contains(el)) return null;
+      if (isSkippable(el)) return null;
+      return text;
+    }
+
+    function attachTermMemoryHandlers() {
+      if (!U.termMemoryAssist) return;
+
+      document.addEventListener("click", (e) => {
+        // Only show when:
+        // 1) clicking a WTR-identified term (.text-patch.system[data-hash])
+        // OR
+        // 2) user has highlighted selection (mouseup+click on content)
+        const root = findContentRoot();
+        if (!root) return;
+        if (!root.contains(e.target)) return;
+        if (isSkippable(e.target)) return;
+
+        const termEl = e.target.closest?.(".text-patch.system[data-hash]");
+        if (termEl) {
+          const hash = termEl.getAttribute("data-hash") || "";
+          const rawText = (termEl.textContent || "").trim();
+          if (rawText) {
+            ui.openTermModal({ kind: "wtrTerm", hash, rawText });
+          }
+          return;
+        }
+
+        const selText = selectionWithinRoot(root);
+        if (selText) {
+          // Only open for “real” highlights (avoid 1-char noise)
+          if (selText.trim().length >= 2) {
+            ui.openTermModal({ kind: "selection", hash: null, rawText: selText });
+          }
+        }
+      }, true);
+    }
+
+    attachTermMemoryHandlers();
+
     function run() {
       if (!ui.isEnabled()) return;
 
@@ -1147,6 +1501,17 @@
       const sig = makeSignature(root);
       if (sig === lastSig) return;
       lastSig = sig;
+
+      // Always update “detected characters” chapter-by-chapter (fixes your stale count issue)
+      const detectedEntries = detectCharactersOnPage(root, entries);
+      ui.setCharacters(detectedEntries.length ? detectedEntries : entries);
+
+      // Enforce pinned terms / consistency before pronoun logic
+      const memStats = { termEdits: 0 };
+      if (U.enforcePinnedTermsOnPlainText) {
+        const mem = loadTermMemory();
+        enforcePinnedTerms(root, mem, memStats);
+      }
 
       const blocks = getTextBlocks(root);
 
@@ -1164,7 +1529,6 @@
 
       let lastGender = null;
       let carryLeft = 0;
-
       let changedThisRun = 0;
 
       for (const b of blocks) {
@@ -1180,10 +1544,12 @@
           continue;
         }
 
+        // 1) Anchored local fixes (handles mixed-character paragraphs)
         if (U.anchoredFixes) {
           changedThisRun += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
         }
 
+        // 2) Determine paragraph direction for fallback pass
         let g = null;
         let hadDirectMatch = false;
 
@@ -1219,7 +1585,9 @@
           const dir = directionFromGender(g);
 
           let doFull = true;
-          if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
+          if (U.onlyChangeIfWrong) {
+            doFull = conservativeShouldApply(bt, g);
+          }
 
           if (doFull) {
             changedThisRun += replaceInTextNodes(b, (txt) => ({ text: replacePronounsSmart(txt, dir), changed: 0 }));
@@ -1233,6 +1601,7 @@
       }
 
       ui.addChanged(changedThisRun);
+      ui.renderDraft(); // keep the draft UI synced (in case user opened other tab / etc)
     }
 
     run();
