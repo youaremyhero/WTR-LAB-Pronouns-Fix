@@ -14,11 +14,11 @@
       "onlyChangeIfWrong": true
      },
     "characters": {
-      "Qi Xu": { "gender": "female", "aliases": ["Asuna"] },
+      "Qi Xu": { "gender": "female", "aliases": ["Asuna", "Invincible Black Whirlwind"] },
       "Magic Boy": { "gender": "male", "aliases": ["Retired Magical Boy", "Magical Boy"] },
       "Awesome Plus": { "gender": "male" },
       "Li Zhi": { "gender": "male" },
-      "Chinese Cooking Master": { "gender": "male", "aliases": ["Chinese Master Chef", "Chinese Cooking Boy", "Chinese Little Master", "Little Master", "Master Chef"] }
+      "Chinese Master Chef": { "gender": "male", "aliases": ["Chinese Cooking Master", "Chinese Cooking Boy", "Chinese Little Master", "Little Master", "Master Chef"] }
     }
   }
 }
