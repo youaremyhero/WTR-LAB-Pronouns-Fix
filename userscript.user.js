@@ -770,11 +770,22 @@
         if (gSpeaker) return gSpeaker;
       }
 
-      // Otherwise: first named character present (predictable)
+      // Otherwise: first character present (name OR aliases)
       for (const [name, info] of entries) {
+        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+      
+        // Check primary name
         if (text.includes(name)) {
           const g = String(info.gender || "").toLowerCase();
           if (g === "female" || g === "male") return g;
+        }
+      
+        // Check aliases
+        for (const a of aliases) {
+          if (a && text.includes(a)) {
+            const g = String(info.gender || "").toLowerCase();
+            if (g === "female" || g === "male") return g;
+          }
         }
       }
 
