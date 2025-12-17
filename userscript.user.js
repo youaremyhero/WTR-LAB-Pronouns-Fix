@@ -356,16 +356,37 @@
       el.addEventListener("pointercancel", end);
     }
 
+    // Panel
     const box = document.createElement("div");
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
-      background: rgba(0,0,0,0.62); color: #fff;
-      border-radius: 12px; padding: 10px 12px;
+    
+      /* ============================
+         EDIT HERE: Expanded opacity
+         - Reduce opacity by ~20%
+         - Example: old 0.62 -> new 0.50 (0.62 * 0.8 ≈ 0.50)
+         ============================ */
+      background: rgba(0,0,0,0.50);
+    
+      color: #fff;
+      border-radius: 12px;
+      padding: 10px 12px;
       font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
-      max-width: min(520px, 88vw);
+    
+      /* ============================
+         EDIT HERE: Expanded width cap
+         - Slightly narrower than before
+         - Height remains auto (grows with content)
+         ============================ */
+      max-width: min(480px, 86vw);
+      height: auto;
+    
       backdrop-filter: blur(6px);
-      user-select: none; touch-action: none;
+      user-select: none;
+      touch-action: none;
+    `;
+
     `;
 
     const topRow = document.createElement("div");
@@ -412,24 +433,42 @@
     const bullets = document.createElement("div");
     bullets.style.cssText = `white-space: pre-line; opacity: .95;`;
 
+        // Minimised pill container
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
-      background: rgba(0,0,0,0.62); color:#fff;
+    
+      /* ============================
+         EDIT HERE: Minimised opacity
+         - Reduce opacity by ~40%
+         - Example: old 0.62 -> new 0.37 (0.62 * 0.6 ≈ 0.37)
+         ============================ */
+      background: rgba(0,0,0,0.37);
+    
+      color:#fff;
       border-radius: 999px;
-      padding: 6px 8px;
+    
+      /* ============================
+         EDIT HERE: Minimised size
+         - Smaller padding + font
+         ============================ */
+      padding: 4px 6px;
+      font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
       backdrop-filter: blur(6px);
-      user-select: none; touch-action: none;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      max-width: min(520px, 88vw);
+      user-select: none;
+      touch-action: none;
+    
+      /* Slightly narrower cap */
+      max-width: min(420px, 84vw);
     `;
 
     const pillRow = document.createElement("div");
     pillRow.style.cssText = `display:flex; align-items:center; gap:8px;`;
 
     const pillText = document.createElement("div");
-    pillText.style.cssText = `padding: 2px 6px; white-space: nowrap;`;
+    pillText.style.cssText = `padding: 1px 4px; white-space: nowrap;`;
 
     const pillExpandBtn = document.createElement("button");
     pillExpandBtn.type = "button";
@@ -437,9 +476,9 @@
     pillExpandBtn.title = "Expand";
     pillExpandBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
-      width:26px; height:26px; border-radius:9px;
-      background:rgba(255,255,255,0.12); color:#fff;
-      font-size:16px; line-height:26px; padding:0;
+      width:22px; height:22px; border-radius:8px;
+      background:rgba(255,255,255,0.10); color:#fff;
+      font-size:14px; line-height:22px; padding:0;
     `;
 
     function refreshToggleUI() {
@@ -627,6 +666,35 @@
     return changed;
   }
 
+    // ==========================================================
+    // Character detection on current chapter/page
+    // - "Detected" if name OR any alias appears in the chapter text
+    // - Count has no limit; UI name display is still limited elsewhere
+    // ==========================================================
+    function detectCharactersOnPage(root, entries) {
+      const hay = (root?.innerText || "").toLowerCase();
+      const detected = [];
+    
+      for (const [name, info] of entries) {
+        const nameLower = String(name || "").toLowerCase();
+        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+    
+        let hit = false;
+        if (nameLower && hay.includes(nameLower)) hit = true;
+    
+        if (!hit) {
+          for (const a of aliases) {
+            const aLower = String(a || "").toLowerCase();
+            if (aLower && hay.includes(aLower)) { hit = true; break; }
+          }
+        }
+    
+        if (hit) detected.push([name, info]);
+      }
+    
+      return detected;
+    }
+
   // ==========================================================
   // Reliable glossary loader (+ cache)
   // ==========================================================
@@ -733,7 +801,14 @@
     }
 
     ui.setGlossaryOk(true);
-    ui.setCharacters(entries);
+    
+    // Detect only characters that actually appear in this chapter/page
+    const rootForDetect = findContentRoot();
+    const detectedEntries = detectCharactersOnPage(rootForDetect, entries);
+    
+    // If none detected (e.g. unusual page), fall back to full list
+    ui.setCharacters(detectedEntries.length ? detectedEntries : entries);
+
 
     const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
