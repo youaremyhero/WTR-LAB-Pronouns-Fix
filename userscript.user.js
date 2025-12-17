@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.7.0
-// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds name-anchored local fixes for mixed-character paragraphs. Uses GM_xmlhttpRequest + cache fallback for reliable glossary loading.
+// @version      4.8.0
+// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives).
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -14,7 +14,6 @@
 
 (() => {
   "use strict";
-
   if (!location.hostname.endsWith("wtr-lab.com")) return;
 
   // ==========================================================
@@ -26,14 +25,13 @@
   const DEFAULT_CARRY_PARAGRAPHS = 2;
   const EARLY_PRONOUN_WINDOW = 160;
 
-  // NEW: Name-anchored local fix window
-  // Fix pronouns that occur close to a character name, even inside mixed paragraphs.
-  const LOCAL_ANCHOR_WINDOW = 160; // chars after the name; safe range 120–220
+  // Default anchor window if verbBasedWindow disabled
+  const LOCAL_ANCHOR_WINDOW = 160;
 
-  // UI character list settings
+  // UI
   const MAX_NAMES_SHOWN = 3;
 
-  // Glossary cache
+  // Cache
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
   const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v1";
   const GLOSSARY_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -49,6 +47,11 @@
   const SENT_PREFIX = String.raw`(^|[\r\n]+|[.!?…]\s+)(["'“‘(\[]\s*)?`;
   const LETTER = String.raw`\p{L}`;
 
+  const RX_PRONOUN_MALE = /\b(he|him|his|himself)\b/gi;
+  const RX_PRONOUN_FEMALE = /\b(she|her|hers|herself)\b/gi;
+
+  const RX_ATTACK_CUES = /\b(knife|blade|sword|dagger|stab|stabs|stabbed|slash|slashed|strike|struck|hit|hits|punched|kicked|cut|pierce|pierced|neck|chest)\b/i;
+
   function caseLike(src, target) {
     if (!src) return target;
     if (src.toUpperCase() === src) return target.toUpperCase();
@@ -57,7 +60,7 @@
   }
 
   function normalizeWeirdSpaces(s) {
-    return s.replace(/\u00A0|\u2009|\u202F/g, " ");
+    return String(s || "").replace(/\u00A0|\u2009|\u202F/g, " ");
   }
 
   function escapeRegExp(s) {
@@ -76,17 +79,22 @@
 
   function pronounAppearsEarly(t, limit = EARLY_PRONOUN_WINDOW) {
     const s = (t || "").trim();
-    const head = s.slice(0, limit);
-    return /\b(she|he|her|him|his|hers|herself|himself)\b/i.test(head);
+    return /\b(she|he|her|him|his|hers|herself|himself)\b/i.test(s.slice(0, limit));
+  }
+
+  function countMatches(rx, text) {
+    rx.lastIndex = 0;
+    const m = String(text).match(rx);
+    return m ? m.length : 0;
   }
 
   // ==========================================================
-  // Smart pronoun replacement (your current behavior)
+  // Smart pronoun replacement (your existing engine)
   // ==========================================================
   function replacePronounsSmart(text, direction /* "toMale" | "toFemale" */) {
     text = normalizeWeirdSpaces(text);
 
-    // Split/hy noted reflexives
+    // Split/hyphenated reflexives
     if (direction === "toFemale") {
       text = text.replace(/\bhim[\s\u00A0\u2009\u202F-]*self\b/giu, (m) => caseLike(m, "herself"));
     } else {
@@ -101,10 +109,8 @@
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Himself")}`);
       text = text.replace(new RegExp(SENT_PREFIX + `(hers)\\b`, "giu"),
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
-      // Her + noun => His + noun
       text = text.replace(new RegExp(SENT_PREFIX + `(her)\\b(?=\\s+${LETTER})`, "giu"),
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
-      // Her (object) => Him
       text = text.replace(new RegExp(SENT_PREFIX + `(her)\\b(?!\\s+${LETTER})`, "giu"),
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Him")}`);
     } else {
@@ -114,10 +120,8 @@
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Herself")}`);
       text = text.replace(new RegExp(SENT_PREFIX + `(him)\\b`, "giu"),
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
-      // His + noun => Her + noun
       text = text.replace(new RegExp(SENT_PREFIX + `(his)\\b(?=\\s+${LETTER})`, "giu"),
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
-      // standalone His => Hers
       text = text.replace(new RegExp(SENT_PREFIX + `(his)\\b(?!\\s+${LETTER})`, "giu"),
         (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Hers")}`);
     }
@@ -141,17 +145,89 @@
   }
 
   // ==========================================================
-  // PATCH A: Name-anchored local fixes for mixed paragraphs
-  // - Fixes "Qi Xu ... his knife" even if the paragraph also includes other characters.
-  // - Only edits a short region AFTER each found name to reduce collateral damage.
+  // Upgrade helpers
   // ==========================================================
-  function applyAnchoredFixes(text, entries) {
+  function getSentenceEndIndex(s, start, maxExtra = 320) {
+    const limit = Math.min(s.length, start + maxExtra);
+    for (let i = start; i < limit; i++) {
+      const ch = s[i];
+      if (ch === "." || ch === "!" || ch === "?" || ch === "…" || ch === "\n") return i + 1;
+    }
+    return Math.min(s.length, start + maxExtra);
+  }
+
+  function conservativeShouldApply(region, gender /* male|female */) {
+    // If onlyChangeIfWrong enabled:
+    // Apply ONLY when "wrong" pronouns dominate "right" pronouns in this region.
+    const maleCount = countMatches(RX_PRONOUN_MALE, region);
+    const femCount  = countMatches(RX_PRONOUN_FEMALE, region);
+
+    if (gender === "male") {
+      // We're trying to make it male: region should look "female-wrong" enough
+      return femCount > maleCount;
+    }
+    // gender === female
+    return maleCount > femCount;
+  }
+
+  function detectDialogueSpeakerGender(text, entries) {
+    // Very lightweight: find patterns like:
+    //   "....", said Qi Xu
+    //   Qi Xu said, "...."
+    // Then return that character gender if unique.
+    const s = text;
+
+    // Collect candidates
+    const found = [];
+
+    for (const [name, info] of entries) {
+      const g = String(info.gender || "").toLowerCase();
+      if (g !== "male" && g !== "female") continue;
+      const nEsc = escapeRegExp(name);
+
+      const rx1 = new RegExp(String.raw`["“][^"”]{3,}["”]\s*(?:,?\s*)?(?:said|asked|shouted|whispered|replied|muttered|yelled)\s+${nEsc}\b`, "i");
+      const rx2 = new RegExp(String.raw`\b${nEsc}\b\s*(?:said|asked|shouted|whispered|replied|muttered|yelled)\s*(?:,?\s*)?["“]`, "i");
+
+      if (rx1.test(s) || rx2.test(s)) found.push(g);
+    }
+
+    if (!found.length) return null;
+    // If mixed speakers in same paragraph, don't use
+    const allSame = found.every(x => x === found[0]);
+    return allSame ? found[0] : null;
+  }
+
+  function detectPassiveAgentGender(text, entries) {
+    // Detect: "was ... by NAME"
+    const s = text;
+    for (const [name, info] of entries) {
+      const g = String(info.gender || "").toLowerCase();
+      if (g !== "male" && g !== "female") continue;
+      const nEsc = escapeRegExp(name);
+      const rx = new RegExp(String.raw`\b(?:was|were|is|are|been)\b[^.?!\n]{0,80}\bby\s+${nEsc}\b`, "i");
+      if (rx.test(s)) return g;
+    }
+    return null;
+  }
+
+  // ==========================================================
+  // Upgrade: Anchored local fixes (with options)
+  // ==========================================================
+  function applyAnchoredFixes(text, entries, opts) {
     let changed = 0;
     let s = normalizeWeirdSpaces(text);
+
+    const {
+      verbBasedWindow = false,
+      passiveVoice = false,
+      onlyChangeIfWrong = false
+    } = opts;
 
     for (const [name, info] of entries) {
       const gender = String(info.gender || "").toLowerCase();
       if (gender !== "male" && gender !== "female") continue;
+
+      const strictPossessive = !!info.strictPossessive;
 
       const allNames = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
         .filter(Boolean)
@@ -161,20 +237,44 @@
 
       for (const n of allNames) {
         const nEsc = escapeRegExp(n);
-        const re = new RegExp(String.raw`\b${nEsc}\b`, "g"); // case-sensitive on purpose (names)
+        const re = new RegExp(String.raw`\b${nEsc}\b`, "g"); // names are case-sensitive on purpose
         let m;
 
         while ((m = re.exec(s)) !== null) {
           const start = m.index;
-          const end = Math.min(s.length, start + n.length + LOCAL_ANCHOR_WINDOW);
 
-          const before = s.slice(start, end);
-          const after  = replacePronounsSmart(before, dir);
+          // Anchor region start and end
+          const baseEnd = verbBasedWindow
+            ? getSentenceEndIndex(s, start + n.length, 360)
+            : Math.min(s.length, start + n.length + LOCAL_ANCHOR_WINDOW);
 
-          if (after !== before) {
+          let end = baseEnd;
+
+          // If strictPossessive, widen a bit to catch "NAME ... his/her knife"
+          if (strictPossessive) end = Math.min(s.length, Math.max(end, start + n.length + 220));
+
+          const region = s.slice(start, end);
+
+          // Optional: conservative mode (apply only if wrong pronouns dominate)
+          if (onlyChangeIfWrong && !conservativeShouldApply(region, gender)) {
+            continue;
+          }
+
+          let after = replacePronounsSmart(region, dir);
+
+          // Optional: passive voice agent correction (tiny extra pass)
+          // If region looks passive and contains "by NAME", force agent gender in region.
+          if (passiveVoice) {
+            const gAgent = detectPassiveAgentGender(region, entries);
+            if (gAgent) {
+              const d2 = (gAgent === "female") ? "toFemale" : "toMale";
+              after = replacePronounsSmart(after, d2);
+            }
+          }
+
+          if (after !== region) {
             s = s.slice(0, start) + after + s.slice(end);
             changed++;
-            // Keep regex index aligned after edits
             re.lastIndex = start + after.length;
           }
         }
@@ -185,7 +285,7 @@
   }
 
   // ==========================================================
-  // UI (same behavior as your current 4.6.2: PF pill + bullets)
+  // UI (unchanged: PF pill + bullets)
   // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
@@ -443,7 +543,7 @@
   }
 
   // ==========================================================
-  // Content targeting (avoid nav/footer/toolbars)
+  // Content targeting
   // ==========================================================
   function findContentRoot() {
     const candidates = Array.from(document.querySelectorAll(
@@ -495,8 +595,7 @@
     return g === "female" ? "toFemale" : "toMale";
   }
 
-  // Replace on text nodes (safe: leaves links/inputs alone)
-  function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} OR string */) {
+  function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} */) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const parent = node.parentNode;
@@ -514,12 +613,8 @@
     while (walker.nextNode()) {
       const node = walker.currentNode;
       const before = node.nodeValue;
-
-      let out;
-      if (typeof fnReplace === "function") out = fnReplace(before);
-      else out = before;
-
-      const after = (out && typeof out === "object") ? out.text : out;
+      const out = fnReplace(before);
+      const after = (out && typeof out === "object") ? out.text : before;
       const delta = (out && typeof out === "object") ? (out.changed || 0) : 0;
 
       if (after !== before) {
@@ -598,7 +693,6 @@
   (async () => {
     const ui = makeUI();
     ui.refreshUI();
-
     if (!ui.isEnabled()) return;
 
     if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
@@ -616,7 +710,21 @@
 
     const key = pickKey(glossary);
     const cfg = glossary[key] || {};
-    const characters = { ...(glossary.default?.characters || {}), ...(cfg.characters || {}) };
+
+    const upgrades = cfg.upgrades || {};
+    const U = {
+      anchoredFixes: upgrades.anchoredFixes !== false, // default true
+      verbBasedWindow: !!upgrades.verbBasedWindow,
+      passiveVoice: !!upgrades.passiveVoice,
+      dialogueSpeaker: !!upgrades.dialogueSpeaker,
+      roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
+      onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong
+    };
+
+    const characters = {
+      ...(glossary.default?.characters || {}),
+      ...(cfg.characters || {})
+    };
     const entries = Object.entries(characters);
 
     if (!entries.length) {
@@ -645,14 +753,24 @@
     function computeGenderForText(text) {
       if (forceGender === "male" || forceGender === "female") return forceGender;
 
-      // Keep your current “best character” logic simple:
-      // if primaryCharacter configured and present in paragraph, prefer it.
-      if (primaryCharacter && (text.includes(primaryCharacter))) {
-        const g0 = String(characters[primaryCharacter]?.gender || "").toLowerCase();
+      if (primaryCharacter && text.includes(primaryCharacter) && characters[primaryCharacter]) {
+        const g0 = String(characters[primaryCharacter].gender || "").toLowerCase();
         if (g0 === "female" || g0 === "male") return g0;
       }
 
-      // Otherwise: pick the first configured name that appears (fast + predictable)
+      // If passive voice upgrade: check agent “by NAME”
+      if (U.passiveVoice) {
+        const gAgent = detectPassiveAgentGender(text, entries);
+        if (gAgent) return gAgent;
+      }
+
+      // If dialogue upgrade: check speaker
+      if (U.dialogueSpeaker) {
+        const gSpeaker = detectDialogueSpeakerGender(text, entries);
+        if (gSpeaker) return gSpeaker;
+      }
+
+      // Otherwise: first named character present (predictable)
       for (const [name, info] of entries) {
         if (text.includes(name)) {
           const g = String(info.gender || "").toLowerCase();
@@ -662,6 +780,10 @@
 
       return null;
     }
+
+    // Role heuristic carry state
+    let lastActorGender = null;
+    let lastActorTTL = 0;
 
     function run() {
       if (!ui.isEnabled()) return;
@@ -691,19 +813,24 @@
       let changedThisRun = 0;
 
       for (const b of blocks) {
-        const bt = (b.innerText || "").trim();
+        const raw = (b.innerText || "");
+        const bt = raw.trim();
         if (!bt) continue;
 
         if (isSceneBreak(bt)) {
           lastGender = null;
           carryLeft = 0;
+          lastActorGender = null;
+          lastActorTTL = 0;
           continue;
         }
 
-        // PATCH A always runs first (name-anchored local fixes).
-        // This is what fixes: "Qi Xu ... his knife" inside mixed paragraphs.
-        changedThisRun += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries));
+        // 1) Anchored local fixes (handles mixed-character paragraphs)
+        if (U.anchoredFixes) {
+          changedThisRun += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
+        }
 
+        // 2) Determine paragraph direction for fallback pass
         let g = null;
         let hadDirectMatch = false;
 
@@ -715,21 +842,48 @@
           if (computed) {
             g = computed;
             hadDirectMatch = true;
-          } else if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt))) {
-            g = lastGender;
-            carryLeft--;
+
+            // Update role heuristic actor state if paragraph has attack cues
+            if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
+              lastActorGender = computed;
+              lastActorTTL = 2; // carry for next 2 paragraphs if needed
+            }
+          } else {
+            // Normal carry
+            if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
+              g = lastGender;
+              carryLeft--;
+            }
+
+            // Role heuristic carry: if pronoun-only + attack cues + last actor known
+            if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
+              if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
+                g = lastActorGender;
+                lastActorTTL--;
+              }
+            }
           }
         }
 
-        if (!g) continue;
+        if (g) {
+          const dir = directionFromGender(g);
 
-        // Paragraph-wide fallback (good for pronoun-only paragraphs)
-        const dir = directionFromGender(g);
-        changedThisRun += replaceInTextNodes(b, (txt) => ({ text: replacePronounsSmart(txt, dir), changed: 0 }));
+          // 3) Paragraph-wide fallback pass
+          // If onlyChangeIfWrong is enabled, be conservative:
+          // only do a full pass if the paragraph "looks wrong" overall.
+          let doFull = true;
+          if (U.onlyChangeIfWrong) {
+            doFull = conservativeShouldApply(bt, g);
+          }
 
-        if (usedMode !== "chapter" && hadDirectMatch) {
-          lastGender = g;
-          carryLeft = carryParagraphs;
+          if (doFull) {
+            changedThisRun += replaceInTextNodes(b, (txt) => ({ text: replacePronounsSmart(txt, dir), changed: 0 }));
+          }
+
+          if (usedMode !== "chapter" && hadDirectMatch) {
+            lastGender = g;
+            carryLeft = carryParagraphs;
+          }
         }
       }
 
