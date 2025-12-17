@@ -2,7 +2,7 @@
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
 // @version      4.9.0
-// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives). Adds "Quick Add Draft" to capture new character names from chapter text and copy JSON snippet for glossary.json.
+// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-refresh + stable Changed counter. Adds optional upgrades (anchored fixes, verb-based window, passive voice, dialogue speaker tracking, role carry heuristic, conservative-only-if-wrong mode, strict possessives). Also supports click-to-draft new characters for glossary updates.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -41,74 +41,9 @@
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
   const UI_KEY_ON  = "wtrpf_enabled_v1";
 
-  // ==========================================================
-  // Quick Add Draft (NEW)
-  // ==========================================================
-  // Stores user-added characters locally, per novel (so drafts don't mix across novels).
-  // Users can later "Copy JSON" (character-details-only) to paste into their glossary.json.
-  const DRAFT_KEY_PREFIX = "wtrpf_draft_chars_v1:";
-
-  function getDraftKey() {
-    // Stable-ish per novel: use /en/novel/{id}/
-    const m = location.pathname.match(/\/en\/novel\/(\d+)\//i);
-    const id = m ? m[1] : "unknown";
-    return `${DRAFT_KEY_PREFIX}${id}`;
-  }
-
-  function loadDraft() {
-    try {
-      const raw = localStorage.getItem(getDraftKey());
-      if (!raw) return {};
-      const obj = JSON.parse(raw);
-      return (obj && typeof obj === "object") ? obj : {};
-    } catch {
-      return {};
-    }
-  }
-
-  function saveDraft(obj) {
-    try { localStorage.setItem(getDraftKey(), JSON.stringify(obj)); } catch {}
-  }
-
-  function clearDraft() {
-    try { localStorage.removeItem(getDraftKey()); } catch {}
-  }
-
-  function normalizeNameCandidate(s) {
-    let t = String(s || "");
-    t = t.replace(/\s+/g, " ").trim();
-    // Strip wrapping quotes/brackets/punctuation
-    t = t.replace(/^["'“‘(\[]+/, "").replace(/["'”’)\].,;:!?]+$/, "").trim();
-    // Reject too short/long
-    if (t.length < 2 || t.length > 60) return "";
-    // Reject if it's only pronouns
-    if (/^(he|him|his|himself|she|her|hers|herself)$/i.test(t)) return "";
-    // Reject if contains newline
-    if (t.includes("\n")) return "";
-    return t;
-  }
-
-  async function copyToClipboard(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      // Fallback
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.style.position = "fixed";
-        ta.style.left = "-9999px";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-  }
+  // Draft character picker (saved locally across chapters)
+  const DRAFT_KEY = "wtrpf_draft_chars_v1";            // localStorage object: { "Name": {gender:"male"} }
+  const DRAFT_SESSION_KEY = "wtrpf_draft_session_v1";  // sessionStorage array: ["Name1","Name2"] for THIS tab/page session
 
   // ==========================================================
   // Utilities
@@ -158,7 +93,34 @@
   }
 
   // ==========================================================
-  // Smart pronoun replacement
+  // Draft storage helpers
+  // ==========================================================
+  function getDrafts() {
+    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || "{}") || {}; }
+    catch { return {}; }
+  }
+  function setDrafts(obj) { localStorage.setItem(DRAFT_KEY, JSON.stringify(obj || {})); }
+  function clearDrafts() { localStorage.removeItem(DRAFT_KEY); }
+
+  function getDraftSessionSet() {
+    try {
+      const arr = JSON.parse(sessionStorage.getItem(DRAFT_SESSION_KEY) || "[]");
+      return new Set(Array.isArray(arr) ? arr : []);
+    } catch { return new Set(); }
+  }
+  function saveDraftSessionSet(set) {
+    sessionStorage.setItem(DRAFT_SESSION_KEY, JSON.stringify(Array.from(set || [])));
+  }
+
+  // ✅ Copy format: easy paste into glossary characters object
+  // Produces lines like:  "Li Zhi": { "gender": "male" },
+  function formatDraftsForCopy(draftsObj) {
+    const names = Object.keys(draftsObj || {}).sort((a,b) => a.localeCompare(b));
+    return names.map(n => `"${n}": { "gender": "${draftsObj[n].gender}" },`).join("\n");
+  }
+
+  // ==========================================================
+  // Smart pronoun replacement (your existing engine)
   // ==========================================================
   function replacePronounsSmart(text, direction /* "toMale" | "toFemale" */) {
     text = normalizeWeirdSpaces(text);
@@ -263,7 +225,7 @@
   }
 
   // ==========================================================
-  // Upgrade: Anchored local fixes
+  // Upgrade: Anchored local fixes (with options)
   // ==========================================================
   function applyAnchoredFixes(text, entries, opts) {
     let changed = 0;
@@ -280,6 +242,7 @@
       if (gender !== "male" && gender !== "female") continue;
 
       const strictPossessive = !!info.strictPossessive;
+
       const allNames = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
         .filter(Boolean)
         .sort((a, b) => String(b).length - String(a).length);
@@ -367,19 +330,8 @@
   }
 
   // ==========================================================
-  // Glossary helpers
+  // Replace in text nodes
   // ==========================================================
-  function pickKey(glossary) {
-    const url = location.href;
-    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
-    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
-    return matches[0] || "default";
-  }
-
-  function directionFromGender(g) {
-    return g === "female" ? "toFemale" : "toMale";
-  }
-
   function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} */) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
@@ -437,6 +389,210 @@
     }
 
     return detected;
+  }
+
+  // ==========================================================
+  // Click-to-draft name picker helpers
+  // ==========================================================
+  function expandSelectionToName(sel) {
+    if (!sel || sel.rangeCount === 0) return "";
+    const range = sel.getRangeAt(0);
+    const node = range.startContainer;
+
+    const selectedText = (sel.toString() || "").trim().replace(/\s+/g, " ");
+    if (!node || node.nodeType !== Node.TEXT_NODE) return selectedText;
+
+    const text = node.nodeValue || "";
+    let start = range.startOffset;
+    let end = range.endOffset;
+
+    const isStop = (ch) => /[\n\r\t]|[.,!?;:()[\]{}"“”'‘’<>]/.test(ch);
+
+    while (start > 0 && !isStop(text[start - 1])) start--;
+    while (end < text.length && !isStop(text[end])) end++;
+
+    let chunk = text.slice(start, end).trim().replace(/\s+/g, " ");
+    chunk = chunk.replace(/^[-–—"“”'‘’]+|[-–—"“”'‘’]+$/g, "").trim();
+
+    // prevent grabbing full sentences: cap to 7 words
+    const words = chunk.split(" ").filter(Boolean);
+    if (words.length > 7) {
+      if (selectedText) {
+        const first = selectedText.split(" ")[0];
+        const idx = words.findIndex(w => w === first);
+        if (idx >= 0) chunk = words.slice(idx, idx + 7).join(" ");
+        else chunk = words.slice(0, 7).join(" ");
+      } else {
+        chunk = words.slice(0, 7).join(" ");
+      }
+    }
+
+    return chunk;
+  }
+
+  function highlightAddedNames(root, namesSet) {
+    if (!root || !namesSet || namesSet.size === 0) return;
+
+    const names = Array.from(namesSet).filter(Boolean).sort((a,b)=>b.length-a.length);
+    if (!names.length) return;
+
+    if (!document.getElementById("wtrpf-draft-hi-style")) {
+      const st = document.createElement("style");
+      st.id = "wtrpf-draft-hi-style";
+      st.textContent = `
+        .wtrpf-added-name{
+          background: rgba(255,255,255,0.12);
+          border-bottom: 1px dashed rgba(255,255,255,0.35);
+          padding: 0 1px;
+          border-radius: 3px;
+        }
+      `;
+      document.documentElement.appendChild(st);
+    }
+
+    const rx = new RegExp(names.map(n => escapeRegExp(n)).join("|"), "g");
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (p.closest("a, button, input, textarea, select, script, style, noscript")) return NodeFilter.FILTER_REJECT;
+        if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
+        if (p.classList && p.classList.contains("wtrpf-added-name")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+
+    for (const tn of nodes) {
+      const s = tn.nodeValue;
+      if (!rx.test(s)) continue;
+      rx.lastIndex = 0;
+
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      let m;
+      while ((m = rx.exec(s)) !== null) {
+        const i = m.index;
+        const hit = m[0];
+        if (i > last) frag.appendChild(document.createTextNode(s.slice(last, i)));
+        const span = document.createElement("span");
+        span.className = "wtrpf-added-name";
+        span.textContent = hit;
+        frag.appendChild(span);
+        last = i + hit.length;
+      }
+      if (last < s.length) frag.appendChild(document.createTextNode(s.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    }
+  }
+
+  function installNamePickerUI(root, onAdded) {
+    let pop = null;
+
+    function closePop() {
+      if (pop) pop.remove();
+      pop = null;
+    }
+
+    function openPop(x, y, pickedName) {
+      closePop();
+      if (!pickedName) return;
+
+      pop = document.createElement("div");
+      pop.id = "wtrpf-name-pop";
+      pop.style.cssText = `
+        position: fixed;
+        left: ${x}px; top: ${y}px;
+        z-index: 2147483647;
+        background: rgba(0,0,0,0.72);
+        color:#fff;
+        border-radius: 12px;
+        padding: 10px;
+        box-shadow: 0 10px 28px rgba(0,0,0,.35);
+        backdrop-filter: blur(6px);
+        font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        max-width: min(360px, 88vw);
+      `;
+
+      const t = document.createElement("div");
+      t.style.cssText = `font-weight:600; margin-bottom:8px;`;
+      t.textContent = `Add character: ${pickedName}`;
+
+      const row = document.createElement("div");
+      row.style.cssText = `display:flex; gap:8px;`;
+
+      const mkBtn = (label, gender) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          padding: 6px 10px; border-radius: 10px;
+          background: rgba(255,255,255,0.14); color:#fff;
+          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        `;
+        b.onclick = () => {
+          const drafts = getDrafts();
+          drafts[pickedName] = { gender };
+          setDrafts(drafts);
+
+          const sessionSet = getDraftSessionSet();
+          sessionSet.add(pickedName);
+          saveDraftSessionSet(sessionSet);
+
+          onAdded?.(pickedName);
+          closePop();
+        };
+        return b;
+      };
+
+      row.appendChild(mkBtn("Male", "male"));
+      row.appendChild(mkBtn("Female", "female"));
+
+      pop.appendChild(t);
+      pop.appendChild(row);
+      document.documentElement.appendChild(pop);
+
+      setTimeout(() => {
+        document.addEventListener("mousedown", (e) => {
+          if (pop && !pop.contains(e.target)) closePop();
+        }, { once: true });
+      }, 0);
+    }
+
+    root.addEventListener("mouseup", (e) => {
+      const sel = window.getSelection();
+      const picked = expandSelectionToName(sel);
+
+      // guardrails
+      if (!picked || picked.length < 3) return;
+      if (picked.split(" ").length === 1 && picked.length < 4) return;
+
+      const anchorEl = sel?.anchorNode?.parentElement;
+      if (!anchorEl || !root.contains(anchorEl)) return;
+      if (anchorEl.closest("#wtrpf-name-pop")) return;
+
+      const x = Math.min(window.innerWidth - 20, e.clientX + 10);
+      const y = Math.min(window.innerHeight - 20, e.clientY + 10);
+      openPop(x, y, picked);
+    });
+  }
+
+  // ==========================================================
+  // Glossary helpers
+  // ==========================================================
+  function pickKey(glossary) {
+    const url = location.href;
+    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
+    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
+    return matches[0] || "default";
+  }
+
+  function directionFromGender(g) {
+    return g === "female" ? "toFemale" : "toMale";
   }
 
   // ==========================================================
@@ -500,118 +656,7 @@
   }
 
   // ==========================================================
-  // Quick Add Draft UI helpers (NEW)
-  // ==========================================================
-  function buildDraftJSONSnippet(draftObj) {
-    // OUTPUT MUST BE character-details-only:
-    // {
-    //   "Name": { "gender": "male", "aliases": [] }
-    // }
-    const out = {};
-    const keys = Object.keys(draftObj || {}).sort((a, b) => a.localeCompare(b));
-    for (const name of keys) {
-      const v = draftObj[name] || {};
-      const gender = (String(v.gender || "").toLowerCase() === "female") ? "female" : "male";
-      const aliases = Array.isArray(v.aliases) ? v.aliases.filter(Boolean) : [];
-      out[name] = { gender, aliases };
-    }
-    return JSON.stringify(out, null, 2);
-  }
-
-  function makeQuickAddPopover() {
-    const pop = document.createElement("div");
-    pop.style.cssText = `
-      position: fixed; z-index: 2147483647;
-      display:none;
-      background: rgba(0,0,0,0.78);
-      color:#fff;
-      border-radius: 12px;
-      padding: 8px;
-      box-shadow: 0 12px 30px rgba(0,0,0,.28);
-      backdrop-filter: blur(6px);
-      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      user-select: none;
-    `;
-
-    const row1 = document.createElement("div");
-    row1.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px;";
-
-    const label = document.createElement("div");
-    label.style.cssText = "font-weight:600; opacity:.95; max-width: 360px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;";
-    label.textContent = "Add character";
-
-    const close = document.createElement("button");
-    close.type = "button";
-    close.textContent = "×";
-    close.title = "Close";
-    close.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:24px; height:24px; border-radius:8px;
-      background:rgba(255,255,255,0.10); color:#fff;
-      font-size:16px; line-height:24px; padding:0;
-    `;
-
-    const row2 = document.createElement("div");
-    row2.style.cssText = "display:flex; gap:8px; align-items:center;";
-
-    const btnMale = document.createElement("button");
-    btnMale.type = "button";
-    btnMale.textContent = "Male";
-    btnMale.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding:6px 10px; border-radius:999px;
-      background:rgba(255,255,255,0.14); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const btnFemale = document.createElement("button");
-    btnFemale.type = "button";
-    btnFemale.textContent = "Female";
-    btnFemale.style.cssText = btnMale.style.cssText;
-
-    row1.appendChild(label);
-    row1.appendChild(close);
-    row2.appendChild(btnMale);
-    row2.appendChild(btnFemale);
-
-    pop.appendChild(row1);
-    pop.appendChild(row2);
-
-    document.documentElement.appendChild(pop);
-
-    let currentName = "";
-    let onPick = null;
-
-    function hide() {
-      pop.style.display = "none";
-      currentName = "";
-      onPick = null;
-    }
-
-    function showAt(x, y, name, cb) {
-      currentName = name;
-      onPick = cb;
-      label.textContent = `Add: ${name}`;
-      pop.style.left = Math.max(6, Math.min(x, window.innerWidth - 240)) + "px";
-      pop.style.top  = Math.max(6, Math.min(y, window.innerHeight - 80)) + "px";
-      pop.style.display = "block";
-    }
-
-    close.onclick = hide;
-    btnMale.onclick = () => { if (onPick) onPick(currentName, "male"); hide(); };
-    btnFemale.onclick = () => { if (onPick) onPick(currentName, "female"); hide(); };
-
-    // Click outside closes
-    document.addEventListener("mousedown", (e) => {
-      if (pop.style.display !== "block") return;
-      if (!pop.contains(e.target)) hide();
-    }, true);
-
-    return { showAt, hide };
-  }
-
-  // ==========================================================
-  // UI
+  // UI (panel + minimized pill)
   // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
@@ -625,9 +670,6 @@
     let charactersList3 = "";
     let changedTotal = 0;
     let glossaryOk = true;
-
-    // Draft state (NEW)
-    let draftCount = 0;
 
     function applyPos(el) {
       if (savedPos.left != null) {
@@ -690,10 +732,7 @@
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
 
-      /* ============================
-         EDIT HERE: Expanded opacity
-         - Reduce opacity by ~20%
-         ============================ */
+      /* EDIT HERE: Expanded opacity (20% more transparent) */
       background: rgba(0,0,0,0.50);
 
       color: #fff;
@@ -702,9 +741,7 @@
       font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
 
-      /* ============================
-         EDIT HERE: Expanded width cap
-         ============================ */
+      /* EDIT HERE: Expanded width cap (slightly narrower) */
       max-width: min(480px, 86vw);
       height: auto;
 
@@ -721,7 +758,7 @@
     title.style.cssText = `font-weight: 600;`;
 
     const controls = document.createElement("div");
-    controls.style.cssText = `display:flex; gap:8px; align-items:center; flex-wrap: wrap; justify-content:flex-end;`;
+    controls.style.cssText = `display:flex; gap:8px; align-items:center;`;
 
     const toggleBtn = document.createElement("button");
     toggleBtn.type = "button";
@@ -754,44 +791,67 @@
       font-size:16px; line-height:26px; padding:0;
     `;
 
-    // Draft buttons (NEW)
-    const copyDraftBtn = document.createElement("button");
-    copyDraftBtn.type = "button";
-    copyDraftBtn.textContent = "Copy JSON";
-    copyDraftBtn.title = "Copy character-details-only JSON for glossary.json";
-    copyDraftBtn.style.cssText = `
+    // ---- Expanded content arrangement ----
+    const stats = document.createElement("div");
+    stats.style.cssText = `white-space: pre-line; opacity: .95;`;
+
+    const divider = document.createElement("div");
+    divider.style.cssText = `height:1px; background: rgba(255,255,255,0.14); margin: 8px 0;`;
+
+    const draftArea = document.createElement("textarea");
+    draftArea.readOnly = true;
+    draftArea.spellcheck = false;
+    draftArea.style.cssText = `
+      width: 100%;
+      box-sizing: border-box;
+      resize: none;
+      height: 84px;
+      padding: 8px 9px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.08);
+      color: #fff;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    `;
+
+    const draftBtns = document.createElement("div");
+    draftBtns.style.cssText = `display:flex; gap:8px; align-items:center; margin-top:8px;`;
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.textContent = "Copy JSON";
+    copyBtn.style.cssText = `
       appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 999px;
-      background: rgba(255,255,255,0.12); color:#fff;
+      padding: 6px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.14); color:#fff;
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     `;
 
-    const clearDraftBtn = document.createElement("button");
-    clearDraftBtn.type = "button";
-    clearDraftBtn.textContent = "Clear";
-    clearDraftBtn.title = "Clear Draft";
-    clearDraftBtn.style.cssText = copyDraftBtn.style.cssText;
+    const clearBtn = document.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.textContent = "Clear";
+    clearBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      padding: 6px 10px; border-radius: 10px;
+      background: rgba(255,255,255,0.10); color:#fff;
+      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    `;
 
-    const bullets = document.createElement("div");
-    bullets.style.cssText = `white-space: pre-line; opacity: .95;`;
+    const draftCount = document.createElement("div");
+    draftCount.style.cssText = `margin-top: 8px; opacity: .9;`;
 
     // Minimised pill container
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
 
-      /* ============================
-         EDIT HERE: Minimised opacity
-         - Reduce opacity by ~40%
-         ============================ */
+      /* EDIT HERE: Minimised opacity (40% more transparent) */
       background: rgba(0,0,0,0.37);
 
       color:#fff;
       border-radius: 999px;
 
-      /* ============================
-         EDIT HERE: Minimised size
-         ============================ */
+      /* EDIT HERE: Minimised size */
       padding: 4px 6px;
       font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
 
@@ -827,15 +887,20 @@
       pillText.textContent = `PF (${on ? "ON" : "OFF"})`;
     }
 
-    function refreshPanelBullets() {
+    function refreshPanelStats() {
       if (!glossaryOk) {
-        bullets.textContent = "Glossary error";
+        stats.textContent = "Glossary error";
         return;
       }
       const line1 = `• Characters: ${charactersCount}` + (charactersList3 ? ` • ${charactersList3}` : "");
       const line2 = `• Changed: ${changedTotal}`;
-      const line3 = `• Draft: ${draftCount} (select a name in chapter text → pick Male/Female)`;
-      bullets.textContent = `${line1}\n${line2}\n${line3}`;
+      stats.textContent = `${line1}\n${line2}`;
+    }
+
+    function refreshDraftUI() {
+      const drafts = getDrafts();
+      draftArea.value = formatDraftsForCopy(drafts);
+      draftCount.textContent = `Draft count: ${Object.keys(drafts).length}`;
     }
 
     toggleBtn.onclick = () => {
@@ -846,25 +911,35 @@
 
     resetBtn.onclick = () => {
       changedTotal = 0;
-      refreshPanelBullets();
+      refreshPanelStats();
     };
 
-    copyDraftBtn.onclick = async () => {
-      const draft = loadDraft();
-      const snippet = buildDraftJSONSnippet(draft);
-      const ok = await copyToClipboard(snippet);
-      if (ok) {
-        copyDraftBtn.textContent = "Copied!";
-        setTimeout(() => (copyDraftBtn.textContent = "Copy JSON"), 900);
+    // Copy JSON clears drafts after copy (as you requested)
+    copyBtn.onclick = async () => {
+      const txt = (draftArea.value || "").trim();
+      if (!txt) return;
+
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(txt);
+        copied = true;
+      } catch {
+        try {
+          draftArea.focus();
+          draftArea.select();
+          copied = document.execCommand("copy");
+        } catch { copied = false; }
+      }
+
+      if (copied) {
+        clearDrafts();
+        refreshDraftUI();
       }
     };
 
-    clearDraftBtn.onclick = () => {
-      clearDraft();
-      draftCount = 0;
-      refreshPanelBullets();
-      clearDraftBtn.textContent = "Cleared!";
-      setTimeout(() => (clearDraftBtn.textContent = "Clear"), 900);
+    clearBtn.onclick = () => {
+      clearDrafts();
+      refreshDraftUI();
     };
 
     function syncPos(fromEl, toEl) {
@@ -894,15 +969,20 @@
 
     controls.appendChild(toggleBtn);
     controls.appendChild(resetBtn);
-    controls.appendChild(copyDraftBtn);
-    controls.appendChild(clearDraftBtn);
     controls.appendChild(minBtn);
 
     topRow.appendChild(title);
     topRow.appendChild(controls);
 
     box.appendChild(topRow);
-    box.appendChild(bullets);
+    box.appendChild(stats);
+    box.appendChild(divider);
+    box.appendChild(draftArea);
+
+    draftBtns.appendChild(copyBtn);
+    draftBtns.appendChild(clearBtn);
+    box.appendChild(draftBtns);
+    box.appendChild(draftCount);
 
     pillRow.appendChild(pillText);
     pillRow.appendChild(pillExpandBtn);
@@ -911,11 +991,9 @@
     document.documentElement.appendChild(box);
     document.documentElement.appendChild(pill);
 
-    // Init counts (draft)
-    draftCount = Object.keys(loadDraft()).length;
-
     refreshToggleUI();
-    refreshPanelBullets();
+    refreshPanelStats();
+    refreshDraftUI();
 
     if (localStorage.getItem(UI_KEY_MIN) === "1") setMin(true);
 
@@ -925,7 +1003,7 @@
 
     return {
       isEnabled: () => enabled(),
-      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshPanelBullets(); },
+      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshPanelStats(); },
       setCharacters: (entries) => {
         charactersCount = entries.length;
         const names = entries.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
@@ -934,17 +1012,14 @@
           return `${name} (${label})`;
         });
         charactersList3 = names.join(", ") + (entries.length > MAX_NAMES_SHOWN ? " …" : "");
-        refreshPanelBullets();
+        refreshPanelStats();
       },
       addChanged: (delta) => {
         if (Number.isFinite(delta) && delta > 0) changedTotal += delta;
-        refreshPanelBullets();
+        refreshPanelStats();
       },
-      bumpDraftCount: () => {
-        draftCount = Object.keys(loadDraft()).length;
-        refreshPanelBullets();
-      },
-      refreshUI: refreshToggleUI
+      refreshUI: refreshToggleUI,
+      refreshDrafts: () => refreshDraftUI()
     };
   }
 
@@ -979,10 +1054,7 @@
       passiveVoice: !!upgrades.passiveVoice,
       dialogueSpeaker: !!upgrades.dialogueSpeaker,
       roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
-      onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong,
-
-      // NEW: enable Quick Add Draft (default true unless explicitly disabled)
-      quickAddDraft: upgrades.quickAddDraft !== false
+      onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong
     };
 
     const characters = {
@@ -1003,73 +1075,15 @@
     const detectedEntries = detectCharactersOnPage(rootForDetect, entries);
     ui.setCharacters(detectedEntries.length ? detectedEntries : entries);
 
-    // ==========================================================
-    // Quick Add Draft: selection → popover (NEW)
-    // ==========================================================
-    const pop = makeQuickAddPopover();
+    // Install click-to-draft picker on the chapter root
+    const chapterRoot = findContentRoot();
+    installNamePickerUI(chapterRoot, () => {
+      ui.refreshDrafts();
+      highlightAddedNames(chapterRoot, getDraftSessionSet());
+    });
+    // Highlight any names drafted earlier in this same session/tab
+    highlightAddedNames(chapterRoot, getDraftSessionSet());
 
-    function selectionWithinContent(sel, root) {
-      if (!sel || sel.rangeCount === 0) return false;
-      const r = sel.getRangeAt(0);
-      const node = r.commonAncestorContainer;
-      const el = (node && node.nodeType === 1) ? node : node?.parentElement;
-      if (!el) return false;
-      if (isSkippable(el)) return false;
-      return root && root.contains(el);
-    }
-
-    function isExistingCharacter(name) {
-      const n = String(name || "");
-      if (!n) return false;
-      for (const [k, info] of entries) {
-        if (k === n) return true;
-        const aliases = Array.isArray(info.aliases) ? info.aliases : [];
-        if (aliases.includes(n)) return true;
-      }
-      return false;
-    }
-
-    function addDraft(name, gender) {
-      const nm = normalizeNameCandidate(name);
-      if (!nm) return;
-
-      // If already in glossary, ignore (draft is for "not yet in glossary")
-      if (isExistingCharacter(nm)) return;
-
-      const draft = loadDraft();
-      if (!draft[nm]) draft[nm] = { gender, aliases: [] };
-      else draft[nm].gender = gender;
-
-      // Ensure aliases array exists
-      if (!Array.isArray(draft[nm].aliases)) draft[nm].aliases = [];
-
-      saveDraft(draft);
-      ui.bumpDraftCount();
-    }
-
-    if (U.quickAddDraft) {
-      document.addEventListener("mouseup", (e) => {
-        const root = findContentRoot();
-        const sel = window.getSelection();
-        if (!selectionWithinContent(sel, root)) return;
-
-        const txt = sel.toString();
-        const nm = normalizeNameCandidate(txt);
-        if (!nm) return;
-
-        // Don't pop if selection is already in glossary
-        if (isExistingCharacter(nm)) return;
-
-        // Show popover near cursor
-        pop.showAt(e.clientX + 8, e.clientY + 10, nm, (pickedName, g) => {
-          addDraft(pickedName, g);
-        });
-      }, true);
-    }
-
-    // ==========================================================
-    // Pronoun engine (your existing flow)
-    // ==========================================================
     const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
     const forceGender = String(cfg.forceGender || "").toLowerCase();
@@ -1166,12 +1180,10 @@
           continue;
         }
 
-        // 1) Anchored local fixes (handles mixed-character paragraphs)
         if (U.anchoredFixes) {
           changedThisRun += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
         }
 
-        // 2) Determine paragraph direction for fallback pass
         let g = null;
         let hadDirectMatch = false;
 
