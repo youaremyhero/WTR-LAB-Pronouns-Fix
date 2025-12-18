@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.3b
+// @version      4.9.4
 // @description  WTR-LAB Pronouns Fix — fixes self-triggered rerun clobbering Changed counter + restores per-chapter character detection + mobile UI sizing.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
