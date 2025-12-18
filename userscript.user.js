@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         WTR PF
+// @name         WTR PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
 // @version      4.9.5-hotfix4
 // @description  WTR-LAB Pronouns Fix — adds URL-based navigation sweep (Firefox Android Next button fix) + extra-compact gender picker w/ close.
