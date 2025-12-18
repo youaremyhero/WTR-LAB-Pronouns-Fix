@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WTR PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.6
-// @description  WTR-LAB Pronouns Fix — keeps v4.9.4 stable base + adds: URL chapter fallback, safe Next-button hook + post-nav sweep (no refresh), smaller closable add popup, onboarding ?, New Character (JSON) toggle.
+// @version      4.9.7
+// @description  WTR-LAB Pronouns Fix — stable v4.9.4 base + working Add popup (smaller + X + Male/Female only) + onboarding (?) + stronger Next-chapter reliability (ready-sweep + click hook) without conflicting with WTR native term selection.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -48,13 +48,10 @@
   // Prevent "Changed" being overwritten by self-triggered reruns
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
-  // Navigation sweep (helps Firefox Android where content lands late)
-  const NAV_SWEEP_MS = 2800;
-  const NAV_SWEEP_INTERVAL_MS = 160;
-
-  // Long press for add popup (mobile-first)
-  const LONGPRESS_MS = 380;
-  const LONGPRESS_MOVE_PX = 10;
+  // Navigation reliability (Firefox Android / Next button)
+  const NAV_SWEEP_MS = 8000;        // how long to keep checking after "Next"
+  const NAV_POLL_MS  = 250;
+  const LONGPRESS_MS = 420;         // long-press to open Add popup on WTR span
 
   // ==========================================================
   // Utilities
@@ -104,6 +101,11 @@
   }
 
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+
+  function getChapterFromURL() {
+    const m = location.href.match(/\/chapter-(\d+)(?:\/|$|\?)/i);
+    return m ? `chapter-${m[1]}` : "unknown";
+  }
 
   // ==========================================================
   // Smart pronoun replacement (COUNTED)
@@ -355,21 +357,6 @@
   }
 
   // ==========================================================
-  // Draft helpers
-  // ==========================================================
-  function loadDraft() {
-    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
-    catch { return { items: [], snippet: "" }; }
-  }
-  function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
-
-  function oneLineCharacterSnippet(name, gender, aliases) {
-    const obj = { gender: String(gender) };
-    if (Array.isArray(aliases) && aliases.length) obj.aliases = aliases;
-    return `"${name}": ${JSON.stringify(obj)},`;
-  }
-
-  // ==========================================================
   // UI
   // ==========================================================
   function makeUI() {
@@ -385,7 +372,9 @@
     let changedTotal = 0;
     let glossaryOk = true;
 
-    const isMobile = window.innerWidth <= 480;
+    // onboarding (hidden unless ? toggled)
+    const ONBOARD_KEY = "wtrpf_onboard_seen_v1"; // once user toggles, we mark seen
+    let showOnboard = false;
 
     const style = document.createElement("style");
     style.textContent = `
@@ -403,8 +392,8 @@
         el.style.left = savedPos.left + "px";
         el.style.right = "auto";
       } else {
-        el.style.left = "12px";
-        el.style.right = "auto";
+        el.style.right = "12px";
+        el.style.left = "auto";
       }
       el.style.top = (savedPos.top ?? 12) + "px";
     }
@@ -454,6 +443,8 @@
       el.addEventListener("pointercancel", end);
     }
 
+    const isMobile = window.innerWidth <= 480;
+
     const box = document.createElement("div");
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
@@ -490,7 +481,6 @@
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
     `;
 
-    // onboarding "?"
     const helpBtn = document.createElement("button");
     helpBtn.type = "button";
     helpBtn.textContent = "?";
@@ -516,63 +506,50 @@
     const summary = document.createElement("div");
     summary.style.cssText = `white-space: pre-line; opacity: .95; margin-top:8px;`;
 
-    // Help section (hidden until ? clicked)
-    const helpWrap = document.createElement("div");
-    helpWrap.style.cssText = `display:none; margin-top:10px; opacity:.95;`;
-
-    const helpText = document.createElement("div");
-    helpText.style.cssText = `
-      border: 1px solid rgba(255,255,255,0.10);
-      background: rgba(255,255,255,0.06);
-      border-radius: 10px;
+    const onboard = document.createElement("div");
+    onboard.style.cssText = `
+      display:none;
+      margin-top:10px;
       padding: 8px 10px;
-      line-height: 1.35;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.12);
+      opacity: .95;
     `;
-    helpText.textContent =
-      "Quick help:\n" +
-      "• Long-press a WTR term (highlighted/patch span) to add Character or pin Term.\n" +
-      "• Use “New Character (JSON)” to collect one-line snippets to paste into glossary.json.\n" +
-      "• The pill minimises automatically on chapter navigation.";
-
-    helpWrap.appendChild(helpText);
+    onboard.textContent =
+      "Tips:\n" +
+      "• Long-press a WTR term (span) to open Add menu.\n" +
+      "• Choose Male/Female to add a one-line JSON snippet to Draft.\n" +
+      "• Draft persists; Copy JSON copies the snippet.\n" +
+      "• Pronoun fixes rerun automatically when you go Next.";
 
     const divider = document.createElement("div");
     divider.style.cssText = `height:1px; background: rgba(255,255,255,0.12); margin:10px 0;`;
 
-    // New Character (JSON) header (click to show/hide draft tools)
-    const draftToggleRow = document.createElement("div");
-    draftToggleRow.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px;`;
+    // Section header: New Character (JSON)
+    const sectionHeader = document.createElement("div");
+    sectionHeader.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:8px;`;
 
-    const draftToggleBtn = document.createElement("button");
-    draftToggleBtn.type = "button";
-    draftToggleBtn.textContent = "New Character (JSON)";
-    draftToggleBtn.style.cssText = `
+    const sectionTitle = document.createElement("div");
+    sectionTitle.textContent = "New Character (JSON)";
+    sectionTitle.style.cssText = `font-weight: 700; opacity:.95;`;
+
+    const sectionToggle = document.createElement("button");
+    sectionToggle.type = "button";
+    sectionToggle.textContent = "Open";
+    sectionToggle.style.cssText = `
       appearance:none; border:0; cursor:pointer;
       padding: 6px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.14); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      flex: 1;
-      text-align: left;
-    `;
-
-    // Optional "Export Tool" stub (safe: just reuses copy)
-    const exportBtn = document.createElement("button");
-    exportBtn.type = "button";
-    exportBtn.textContent = "Export Tool";
-    exportBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.08); color:#fff;
+      background: rgba(255,255,255,0.12); color:#fff;
       font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       flex: 0 0 auto;
     `;
 
-    const innerDivider = document.createElement("div");
-    innerDivider.style.cssText = `height:1px; background: rgba(255,255,255,0.10); margin:10px 0; display:none;`;
+    // Draft box (only visible when section open AND draft exists)
+    let draftSectionOpen = false;
 
-    // Draft tools (hidden until New Character (JSON) opened AND draft exists)
     const draftWrap = document.createElement("div");
-    draftWrap.style.cssText = `display:none;`;
+    draftWrap.style.cssText = `display:none; margin-top:10px;`;
 
     const draftLabel = document.createElement("div");
     draftLabel.textContent = "Draft (copy into glossary.json)";
@@ -622,7 +599,7 @@
     draftCountRow.style.cssText = `opacity:.85; margin-top:8px;`;
     draftCountRow.textContent = "Draft: 0";
 
-    // Minimized pill
+    // Minimised pill
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
@@ -657,9 +634,6 @@
       flex: 0 0 auto;
     `;
 
-    let draftPanelOpen = false;
-    let exportPanelOpen = false;
-
     function refreshToggleUI() {
       const on = enabled();
       toggleBtn.textContent = on ? "ON" : "OFF";
@@ -677,34 +651,18 @@
       summary.textContent = `${line1}\n${line2}`;
     }
 
-    function applyDraftVisibility(hasDraft, snippet, count) {
-      // New Character panel controls visibility of inner divider + draft tools.
-      innerDivider.style.display = draftPanelOpen ? "block" : "none";
+    function setDraftUI(jsonSnippet, count) {
+      const draftCount = count || 0;
+      draftCountRow.textContent = `Draft: ${draftCount}`;
 
-      draftCountRow.textContent = `Draft: ${count || 0}`;
+      const hasDraft = draftCount > 0 && !!jsonSnippet;
+      const show = draftSectionOpen && hasDraft;
 
-      if (!draftPanelOpen) {
-        draftWrap.style.display = "none";
-        btnRow.style.display = "none";
-        return;
-      }
+      draftWrap.style.display = show ? "block" : "none";
+      draftBox.value = show ? jsonSnippet : "";
 
-      // Draft box itself only appears if draft exists (your earlier rule)
-      if (hasDraft && snippet) {
-        draftWrap.style.display = "block";
-        draftBox.value = snippet;
-      } else {
-        draftWrap.style.display = "none";
-        draftBox.value = "";
-      }
-
-      // Copy/Clear ONLY when New Character panel open
-      btnRow.style.display = "flex";
-    }
-
-    function setDraftUI(snippet, count) {
-      const hasDraft = (count || 0) > 0;
-      applyDraftVisibility(hasDraft, snippet || "", count || 0);
+      // update toggle label
+      sectionToggle.textContent = draftSectionOpen ? "Close" : "Open";
     }
 
     toggleBtn.onclick = () => {
@@ -714,26 +672,10 @@
     };
 
     helpBtn.onclick = () => {
-      helpWrap.style.display = (helpWrap.style.display === "none") ? "block" : "none";
-    };
-
-    draftToggleBtn.onclick = () => {
-      draftPanelOpen = !draftPanelOpen;
-      const d = loadDraft();
-      setDraftUI(d?.snippet || "", (d?.items || []).length);
-    };
-
-    exportBtn.onclick = async () => {
-      // Safe “export”: copies the current draft snippet if present.
-      // (No term memory clearing option — per your instruction.)
-      exportPanelOpen = !exportPanelOpen;
-      // For now, treat export as “copy draft” (minimal + safe).
-      if (exportPanelOpen) {
-        const d = loadDraft();
-        const txt = d?.snippet || "";
-        if (txt) await writeClipboard(txt);
-      }
-      exportPanelOpen = false;
+      showOnboard = !showOnboard;
+      onboard.style.display = showOnboard ? "block" : "none";
+      localStorage.setItem(ONBOARD_KEY, "1");
+      clampToViewport(box);
     };
 
     function setMin(min) {
@@ -746,6 +688,13 @@
     pillExpandBtn.onclick = () => setMin(false);
     pillText.onclick = () => setMin(false);
 
+    sectionToggle.onclick = () => {
+      draftSectionOpen = !draftSectionOpen;
+      const d = loadDraft();
+      setDraftUI(d?.snippet || "", (d?.items || []).length);
+      clampToViewport(box);
+    };
+
     controls.appendChild(toggleBtn);
     controls.appendChild(helpBtn);
     controls.appendChild(minBtn);
@@ -753,8 +702,14 @@
     topRow.appendChild(title);
     topRow.appendChild(controls);
 
-    draftToggleRow.appendChild(draftToggleBtn);
-    draftToggleRow.appendChild(exportBtn);
+    sectionHeader.appendChild(sectionTitle);
+    sectionHeader.appendChild(sectionToggle);
+
+    box.appendChild(topRow);
+    box.appendChild(summary);
+    box.appendChild(onboard);
+    box.appendChild(divider);
+    box.appendChild(sectionHeader);
 
     draftWrap.appendChild(draftLabel);
     draftWrap.appendChild(draftBox);
@@ -762,15 +717,8 @@
     btnRow.appendChild(copyBtn);
     btnRow.appendChild(clearBtn);
 
-    box.appendChild(topRow);
-    box.appendChild(summary);
-    box.appendChild(helpWrap);
-    box.appendChild(divider);
-
-    box.appendChild(draftToggleRow);
-    box.appendChild(innerDivider);
+    draftWrap.appendChild(btnRow);
     box.appendChild(draftWrap);
-    box.appendChild(btnRow);
     box.appendChild(draftCountRow);
 
     pillRow.appendChild(pillText);
@@ -788,8 +736,14 @@
     refreshToggleUI();
     refreshSummary();
 
-    // Minimised by default (your requirement)
-    if (localStorage.getItem(UI_KEY_MIN) !== "0") setMin(true);
+    // Minimised by default
+    setMin(true);
+
+    // Onboarding initially hidden unless user clicks ?
+    if (localStorage.getItem(ONBOARD_KEY) === "1") {
+      showOnboard = false;
+      onboard.style.display = "none";
+    }
 
     async function writeClipboard(text) {
       try {
@@ -825,21 +779,19 @@
       setDraftUI("", 0);
     };
 
-    // Initialize draft UI (panel closed by default)
-    const d0 = loadDraft();
-    setDraftUI(d0?.snippet || "", (d0?.items || []).length);
-
     return {
       isEnabled: () => enabled(),
       setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshSummary(); },
       setCharacters: (detectedEntries) => {
         charactersCount = detectedEntries.length;
+
         const base = detectedEntries.length ? detectedEntries : [];
         const names = base.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
           const g = String(info.gender || "").toLowerCase();
           const label = (g === "female" || g === "male") ? g : "unknown";
           return `${name} (${label})`;
         });
+
         charactersList3 = names.join(", ") + (base.length > MAX_NAMES_SHOWN ? " …" : "");
         refreshSummary();
       },
@@ -848,7 +800,11 @@
         refreshSummary();
       },
       setMinimized: (min) => setMin(!!min),
-      setDraftUI
+      setDraftUI,
+      refreshDraftUI: () => {
+        const d = loadDraft();
+        setDraftUI(d?.snippet || "", (d?.items || []).length);
+      }
     };
   }
 
@@ -856,11 +812,8 @@
   // Content targeting
   // ==========================================================
   function findContentRoot() {
-    // Best known container (from your inspector)
-    const cb = document.querySelector(".chapter-body.menu-target[data-chapter-id]") ||
-               document.querySelector(".chapter-body.menu-target") ||
-               document.querySelector(".chapter-body");
-
+    // WTR: chapter body container
+    const cb = document.querySelector(".chapter-body");
     if (cb) return cb;
 
     const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
@@ -877,15 +830,10 @@
     return best || document.body;
   }
 
-  function getChapterIdFromURL() {
-    const m = location.pathname.match(/\/chapter-(\d+)\b/i);
-    return m ? `url:${m[1]}` : null;
-  }
-
   function getChapterId(root) {
     const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
     const id = el?.getAttribute?.("data-chapter-id");
-    return id || getChapterIdFromURL() || "unknown";
+    return id || getChapterFromURL();
   }
 
   const SKIP_CLOSEST = [
@@ -902,8 +850,8 @@
   }
 
   function getTextBlocks(root) {
-    // WTR lines are typically p.pr-line-text / p.pr-line-array
-    const blocks = Array.from(root.querySelectorAll("p.pr-line-text, p.pr-line-array, p, blockquote, li"));
+    // WTR often uses p.pr-line-text / p.pr-line-array
+    const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
     return blocks.filter(b => {
       if (isSkippable(b)) return false;
       const t = (b.innerText || "").trim();
@@ -1000,6 +948,22 @@
   }
 
   // ==========================================================
+  // Draft helpers
+  // ==========================================================
+  function loadDraft() {
+    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
+    catch { return { items: [], snippet: "" }; }
+  }
+  function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
+
+  function oneLineCharacterSnippet(name, gender, aliases) {
+    const obj = { gender: String(gender) };
+    if (Array.isArray(aliases) && aliases.length) obj.aliases = aliases;
+    const inner = JSON.stringify(obj);
+    return `"${name}": ${inner},`;
+  }
+
+  // ==========================================================
   // Node replacement counting (robust)
   // ==========================================================
   function replaceInTextNodes(blockEl, fnReplace) {
@@ -1040,219 +1004,7 @@
   }
 
   // ==========================================================
-  // Signature (skip only identical content)
-  // ==========================================================
-  function makeSignature(root) {
-    const t = (root.innerText || "").trim();
-    const head = t.slice(0, 240);
-    const tail = t.slice(Math.max(0, t.length - 240));
-    return `${t.length}|${head}|${tail}`;
-  }
-
-  // ==========================================================
-  // Add popup (small, closable, Male/Female only)
-  // Long-press on WTR term span: span.text-patch.system[data-hash]
-  // ==========================================================
-  function installAddPopup({ ui, novelKey }) {
-    const popup = document.createElement("div");
-    popup.style.cssText = `
-      position: fixed; z-index: 2147483647;
-      display:none;
-      background: rgba(0,0,0,0.82);
-      color:#fff;
-      border: 1px solid rgba(255,255,255,0.12);
-      border-radius: 10px;
-      padding: 8px;
-      font: 12px/1.25 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      box-shadow: 0 10px 22px rgba(0,0,0,.28);
-      backdrop-filter: blur(6px);
-      max-width: min(240px, 72vw);
-      user-select: none;
-    `;
-
-    const head = document.createElement("div");
-    head.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px;`;
-
-    const cap = document.createElement("div");
-    cap.textContent = "Add";
-    cap.style.cssText = `font-weight:700; opacity:.95;`;
-
-    const xBtn = document.createElement("button");
-    xBtn.type = "button";
-    xBtn.textContent = "✕";
-    xBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:24px; height:24px; border-radius:8px;
-      background:rgba(255,255,255,0.10); color:#fff;
-      font-size:13px; line-height:24px; padding:0;
-      flex: 0 0 auto;
-    `;
-
-    const picked = document.createElement("div");
-    picked.style.cssText = `margin-top:6px; opacity:.92; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;`;
-
-    const row = document.createElement("div");
-    row.style.cssText = `display:flex; gap:6px; margin-top:8px;`;
-
-    const btn = (label, strong=false) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = label;
-      b.style.cssText = `
-        appearance:none; border:0; cursor:pointer;
-        padding: 6px 8px;
-        border-radius: 9px;
-        background: ${strong ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.10)"};
-        color:#fff;
-        font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-        flex: 1;
-      `;
-      return b;
-    };
-
-    const addCharBtn = btn("Character", true);
-    const addTermBtn = btn("Term");
-
-    const step = document.createElement("div");
-    step.style.cssText = `display:none; margin-top:8px; border-top:1px solid rgba(255,255,255,0.10); padding-top:8px;`;
-
-    const stepTitle = document.createElement("div");
-    stepTitle.style.cssText = `font-weight:700; margin-bottom:6px;`;
-    const stepRow = document.createElement("div");
-    stepRow.style.cssText = `display:flex; gap:6px;`;
-
-    const maleBtn = btn("Male", true);
-    maleBtn.style.padding = "6px 6px";
-    const femaleBtn = btn("Female", true);
-    femaleBtn.style.padding = "6px 6px";
-
-    stepRow.appendChild(maleBtn);
-    stepRow.appendChild(femaleBtn);
-
-    step.appendChild(stepTitle);
-    step.appendChild(stepRow);
-
-    head.appendChild(cap);
-    head.appendChild(xBtn);
-
-    row.appendChild(addCharBtn);
-    row.appendChild(addTermBtn);
-
-    popup.appendChild(head);
-    popup.appendChild(picked);
-    popup.appendChild(row);
-    popup.appendChild(step);
-
-    document.documentElement.appendChild(popup);
-
-    let ctx = null; // { text, span, hash, x, y }
-
-    function hide() {
-      popup.style.display = "none";
-      step.style.display = "none";
-      ctx = null;
-    }
-
-    function showAt(x, y, context) {
-      ctx = context;
-      picked.textContent = context?.text ? context.text : "(none)";
-      step.style.display = "none";
-      const w = 240;
-      const h = 120;
-      popup.style.left = clamp(x, 6, window.innerWidth - w - 6) + "px";
-      popup.style.top  = clamp(y, 6, window.innerHeight - h - 6) + "px";
-      popup.style.display = "block";
-    }
-
-    xBtn.onclick = hide;
-    popup.addEventListener("pointerdown", (e) => e.stopPropagation(), true);
-
-    function upsertDraftLine(line) {
-      const d = loadDraft();
-      const items = Array.isArray(d.items) ? d.items : [];
-      if (!items.includes(line)) items.push(line);
-      const snippet = items.join("\n");
-      saveDraft({ items, snippet });
-      ui.setDraftUI(snippet, items.length);
-    }
-
-    addCharBtn.onclick = () => {
-      if (!ctx?.text) return;
-      stepTitle.textContent = "Select Gender";
-      step.style.display = "block";
-    };
-
-    maleBtn.onclick = () => {
-      if (!ctx?.text) return;
-      upsertDraftLine(oneLineCharacterSnippet(ctx.text.trim(), "male"));
-      hide();
-    };
-    femaleBtn.onclick = () => {
-      if (!ctx?.text) return;
-      upsertDraftLine(oneLineCharacterSnippet(ctx.text.trim(), "female"));
-      hide();
-    };
-
-    addTermBtn.onclick = () => {
-      if (!ctx?.hash || !ctx?.text) return;
-      const mem = loadTermMemory(novelKey);
-      mem[ctx.hash] = { preferred: ctx.text, pinned: true, aliases: [] };
-      saveTermMemory(novelKey, mem);
-      if (ctx.span) ctx.span.classList.add("wtrpf-added-term");
-      hide();
-    };
-
-    document.addEventListener("scroll", hide, true);
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
-    document.addEventListener("pointerdown", (e) => {
-      if (popup.style.display === "none") return;
-      if (!popup.contains(e.target)) hide();
-    }, true);
-
-    // Long-press handler on WTR term spans (mobile-first)
-    let lpTimer = null;
-    let startX = 0, startY = 0;
-    let activeSpan = null;
-
-    function clearLP() {
-      if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
-      activeSpan = null;
-    }
-
-    document.addEventListener("pointerdown", (e) => {
-      const sp = e.target && e.target.closest && e.target.closest("span.text-patch.system[data-hash]");
-      if (!sp) return;
-
-      // Allow normal tap navigation/select; only show after long press
-      startX = e.clientX;
-      startY = e.clientY;
-      activeSpan = sp;
-
-      clearLP();
-      activeSpan = sp;
-
-      lpTimer = setTimeout(() => {
-        if (!activeSpan) return;
-        const txt = (activeSpan.textContent || "").trim();
-        const hash = activeSpan.getAttribute("data-hash") || "";
-        if (!txt || !hash) return;
-        showAt(startX + 6, startY + 6, { text: txt, span: activeSpan, hash });
-      }, LONGPRESS_MS);
-    }, true);
-
-    document.addEventListener("pointermove", (e) => {
-      if (!lpTimer) return;
-      const dx = Math.abs(e.clientX - startX);
-      const dy = Math.abs(e.clientY - startY);
-      if (dx > LONGPRESS_MOVE_PX || dy > LONGPRESS_MOVE_PX) clearLP();
-    }, true);
-
-    document.addEventListener("pointerup", clearLP, true);
-    document.addEventListener("pointercancel", clearLP, true);
-  }
-
-  // ==========================================================
-  // Navigation hooks
+  // Navigation hooks + Next click hook
   // ==========================================================
   function installNavHooks(onNav) {
     const fire = () => setTimeout(onNav, 80);
@@ -1263,33 +1015,198 @@
     history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
     history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
 
-    // keep very light; actual heavy work is inside run() with cooldowns
     const mo = new MutationObserver(() => fire());
     mo.observe(document.body, { childList: true, subtree: true });
   }
 
-  // Safe click hook for Next navigation (NO noisy || true)
-  function installNextClickHook(onNext) {
+  function installNextButtonHook(onNav) {
     document.addEventListener("click", (e) => {
-      const a = e.target?.closest?.("a");
-      const btn = e.target?.closest?.("button");
-      const el = a || btn;
+      const t = e.target;
+      if (!t) return;
+      const el = t.closest?.("a, button");
       if (!el) return;
 
-      const txt = ((el.innerText || el.textContent || "") + "").trim().toLowerCase();
-      const aria = ((el.getAttribute && (el.getAttribute("aria-label") || "")) || "").toLowerCase();
-      const rel = ((a && a.getAttribute && (a.getAttribute("rel") || "")) || "").toLowerCase();
-      const href = (a && a.href) ? String(a.href) : "";
+      // Heuristics: Next chapter controls
+      const txt = (el.textContent || "").trim().toLowerCase();
+      const rel = (el.getAttribute?.("rel") || "").toLowerCase();
+      const href = (el.getAttribute?.("href") || "");
 
-      const looksNextRel = rel.includes("next");
-      const looksNextAria = aria.includes("next");
-      const looksNextText = /\bnext\b/.test(txt) || txt === "›" || txt === ">" || txt === "→";
-      const looksChapterHref = /\/chapter-\d+\b/i.test(href);
+      const looksNext =
+        rel.includes("next") ||
+        txt === "next" || txt.includes("next chapter") || txt.includes("next »") || txt.includes("next›") ||
+        /\/chapter-\d+/i.test(href) && (txt.includes("next") || el.className.toLowerCase().includes("next"));
 
-      if (looksNextRel || looksNextAria || (looksNextText && looksChapterHref) || looksChapterHref) {
-        onNext();
-      }
+      if (!looksNext) return;
+
+      setTimeout(onNav, 30);
     }, true);
+  }
+
+  // ==========================================================
+  // Add popup (smaller + X, Male/Female only) — long press on WTR span OR text selection
+  // ==========================================================
+  function installAddPopup({ ui, novelKey }) {
+    const popup = document.createElement("div");
+    popup.style.cssText = `
+      position: fixed; z-index: 2147483647;
+      display:none;
+      background: rgba(0,0,0,0.80);
+      color:#fff;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      padding: 8px;
+      font: 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      box-shadow: 0 10px 28px rgba(0,0,0,.25);
+      backdrop-filter: blur(6px);
+      width: min(220px, 70vw);
+      user-select: none;
+    `;
+
+    const header = document.createElement("div");
+    header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;`;
+
+    const hTitle = document.createElement("div");
+    hTitle.textContent = "Add Character";
+    hTitle.style.cssText = `font-weight:700; opacity:.95;`;
+
+    const xBtn = document.createElement("button");
+    xBtn.type = "button";
+    xBtn.textContent = "✕";
+    xBtn.style.cssText = `
+      appearance:none; border:0; cursor:pointer;
+      width:24px; height:24px; border-radius:9px;
+      background:rgba(255,255,255,0.10); color:#fff;
+      font-size:13px; line-height:24px; padding:0;
+      flex: 0 0 auto;
+    `;
+
+    const picked = document.createElement("div");
+    picked.style.cssText = `opacity:.92; margin-bottom:8px; white-space: nowrap; overflow:hidden; text-overflow: ellipsis;`;
+
+    const row = document.createElement("div");
+    row.style.cssText = `display:flex; gap:6px;`;
+
+    const mkBtn = (label) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.style.cssText = `
+        appearance:none; border:0; cursor:pointer;
+        padding: 6px 8px; border-radius: 10px;
+        background: rgba(255,255,255,0.14); color:#fff;
+        font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        flex: 1;
+      `;
+      return b;
+    };
+
+    const maleBtn = mkBtn("Male");
+    const femaleBtn = mkBtn("Female");
+
+    header.appendChild(hTitle);
+    header.appendChild(xBtn);
+    row.appendChild(maleBtn);
+    row.appendChild(femaleBtn);
+
+    popup.appendChild(header);
+    popup.appendChild(picked);
+    popup.appendChild(row);
+    document.documentElement.appendChild(popup);
+
+    let ctxText = "";
+
+    function hide() {
+      popup.style.display = "none";
+      ctxText = "";
+    }
+
+    function showAt(x, y, text) {
+      ctxText = (text || "").trim();
+      if (!ctxText) return;
+
+      picked.textContent = `Selected: ${ctxText}`;
+
+      const w = 240;
+      const h = 120;
+      const left = clamp(x, 6, window.innerWidth - w);
+      const top  = clamp(y, 6, window.innerHeight - h);
+
+      popup.style.left = left + "px";
+      popup.style.top  = top + "px";
+      popup.style.display = "block";
+    }
+
+    xBtn.onclick = hide;
+    popup.addEventListener("pointerdown", (e) => e.stopPropagation());
+    document.addEventListener("scroll", hide, true);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
+
+    function upsertDraftLine(line) {
+      const d = loadDraft();
+      const items = Array.isArray(d.items) ? d.items : [];
+      if (!items.includes(line)) items.push(line);
+      const snippet = items.join("\n");
+      saveDraft({ items, snippet });
+      ui.refreshDraftUI?.();
+    }
+
+    maleBtn.onclick = () => {
+      if (!ctxText) return;
+      upsertDraftLine(oneLineCharacterSnippet(ctxText, "male"));
+      hide();
+    };
+    femaleBtn.onclick = () => {
+      if (!ctxText) return;
+      upsertDraftLine(oneLineCharacterSnippet(ctxText, "female"));
+      hide();
+    };
+
+    // Long-press on WTR term spans (does NOT change WTR native tap behavior)
+    let lpTimer = null;
+    let lpTarget = null;
+
+    function clearLP() {
+      if (lpTimer) clearTimeout(lpTimer);
+      lpTimer = null;
+      lpTarget = null;
+    }
+
+    document.addEventListener("pointerdown", (e) => {
+      const sp = e.target?.closest?.("span.text-patch.system[data-hash]");
+      if (!sp) return;
+
+      // only primary touch/press
+      lpTarget = sp;
+      clearLP();
+      lpTimer = setTimeout(() => {
+        const txt = (lpTarget?.textContent || "").trim();
+        if (!txt) return;
+        showAt(e.clientX + 6, e.clientY + 6, txt);
+      }, LONGPRESS_MS);
+    }, true);
+
+    document.addEventListener("pointerup", clearLP, true);
+    document.addEventListener("pointercancel", clearLP, true);
+    document.addEventListener("pointermove", (e) => {
+      // cancel if finger drags too much
+      if (!lpTimer) return;
+      if (Math.abs(e.movementX) + Math.abs(e.movementY) > 6) clearLP();
+    }, true);
+
+    // Selection (mouseup) — optional
+    document.addEventListener("mouseup", (e) => {
+      const sel = window.getSelection?.();
+      const s = sel ? String(sel.toString() || "") : "";
+      const txt = s.trim();
+      if (!txt || txt.length < 2) return;
+
+      const root = findContentRoot();
+      if (!root || !root.contains(e.target)) return;
+
+      showAt(e.clientX + 6, e.clientY + 6, txt);
+    }, true);
+
+    return { hide };
   }
 
   // ==========================================================
@@ -1299,8 +1216,8 @@
     const ui = makeUI();
     if (!ui.isEnabled()) return;
 
-    const initialDraft = loadDraft();
-    ui.setDraftUI?.(initialDraft?.snippet || "", (initialDraft?.items || []).length);
+    // Load initial draft
+    ui.refreshDraftUI?.();
 
     if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
       ui.setGlossaryOk(false);
@@ -1343,7 +1260,7 @@
     const novelKey = key === "default" ? getNovelKeyFromURL() : key;
     const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
 
-    // Add popup (small, long-press)
+    // Add popup (small + X + Male/Female only)
     installAddPopup({ ui, novelKey });
 
     const mode = String(cfg.mode || "paragraph").toLowerCase();
@@ -1407,64 +1324,70 @@
     let lastActorTTL = 0;
 
     let lastChapterId = null;
-    let lastSigForSkip = "";
-    let processedOnce = false;
-
     let running = false;
     let lastRunAt = 0;
+
+    // Upgrade 1: per-chapter marker (prevents expensive reprocessing loops)
+    function rootPatchedFor(root, chapterId) {
+      return root?.dataset?.wtrpfPatchedChapter === String(chapterId);
+    }
+    function markRootPatched(root, chapterId) {
+      if (!root || !root.dataset) return;
+      root.dataset.wtrpfPatchedChapter = String(chapterId);
+    }
+
+    // Upgrade 2: incremental blocks (only reprocess new blocks after the first full pass)
+    function blockIsPatched(b) {
+      return b?.dataset?.wtrpfPatched === "1";
+    }
+    function markBlockPatched(b) {
+      if (!b || !b.dataset) return;
+      b.dataset.wtrpfPatched = "1";
+    }
 
     function contentReady(root) {
       if (!root) return false;
       const blocks = getTextBlocks(root);
       const textLen = (root.innerText || "").trim().length;
-      return blocks.length >= 6 && textLen >= 450;
+      return blocks.length >= 6 && textLen >= 600;
     }
 
     function updateDetectedCharactersUI(root) {
       const detected = detectCharactersOnPage(root, entries);
-      if (detected.length) {
-        ui.setCharacters(detected);
-      } else {
-        // fallback: show first few configured (keeps UI stable)
-        ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
-      }
+      if (detected.length) ui.setCharacters(detected);
+      else ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
     }
 
-    function run({ force = false } = {}) {
+    function run({ forceFull = false } = {}) {
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
       if (running) return;
 
       const now = Date.now();
-      if (!force && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
+      if (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS) return;
 
       const root = findContentRoot();
       const chapterId = getChapterId(root);
 
-      if (!processedOnce && !contentReady(root)) return;
-      processedOnce = true;
+      // If not ready yet, bail (nav sweep will retry)
+      if (!contentReady(root)) return;
 
       running = true;
       try {
-        // If chapter changed: minimize by default
+        // Minimise whenever chapter changes
         if (chapterId !== lastChapterId) {
           lastChapterId = chapterId;
           localStorage.setItem(UI_KEY_MIN, "1");
           ui.setMinimized(true);
-          lastSigForSkip = "";
           lastActorGender = null;
           lastActorTTL = 0;
         }
 
-        const sigBefore = makeSignature(root);
-        const compositeSig = `${chapterId}|${sigBefore}`;
-        if (!force && compositeSig === lastSigForSkip) return;
-        lastSigForSkip = compositeSig;
-
-        // Restore last known changed for this chapter (prevents flicker to 0)
+        // Restore last known changed for this chapter (prevents UI flashing to 0)
         const st0 = loadChapterState();
         const lastChanged = getChapterLastChanged(st0, chapterId);
-        ui.setChanged(lastChanged > 0 ? lastChanged : 0);
+        if (lastChanged > 0) ui.setChanged(lastChanged);
+        else ui.setChanged(0);
 
         // Term patches first
         if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
@@ -1487,20 +1410,32 @@
           if (!chapterGender) usedMode = "paragraph";
         }
 
-        const blocks = getTextBlocks(root);
+        // Decide whether to full-pass or incremental
+        const alreadyPatched = rootPatchedFor(root, chapterId);
+        const doFullPass = forceFull || !alreadyPatched;
+
+        const blocksAll = getTextBlocks(root);
+        const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
+
+        if (!blocks.length) {
+          // Nothing new; keep last changed count
+          return;
+        }
+
         let lastGender = null;
         let carryLeft = 0;
         let pronounEdits = 0;
 
         for (const b of blocks) {
           const bt = (b.innerText || "").trim();
-          if (!bt) continue;
+          if (!bt) { markBlockPatched(b); continue; }
 
           if (isSceneBreak(bt)) {
             lastGender = null;
             carryLeft = 0;
             lastActorGender = null;
             lastActorTTL = 0;
+            markBlockPatched(b);
             continue;
           }
 
@@ -1543,6 +1478,7 @@
 
           if (g) {
             const dir = (g === "female") ? "toFemale" : "toMale";
+
             let doFull = true;
             if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
 
@@ -1555,9 +1491,14 @@
               carryLeft = carryParagraphs;
             }
           }
+
+          markBlockPatched(b);
         }
 
-        // Prevent "0 overwrite" during reruns
+        // Mark chapter patched after first full successful pass
+        if (doFullPass) markRootPatched(root, chapterId);
+
+        // Prevent "0 overwrite" clobbering
         const st = loadChapterState();
         const prev = getChapterLastChanged(st, chapterId);
 
@@ -1578,64 +1519,63 @@
       }
     }
 
-    // Initial run
-    run({ force: true });
+    // Nav sweep: keep retrying until content is truly ready (fixes “needs refresh”)
+    let navSweepTimer = null;
+    function startNavSweep() {
+      if (navSweepTimer) clearInterval(navSweepTimer);
 
-    // Mobile boot retry window (avoid “needs refresh” on initial load)
-    const bootStart = Date.now();
-    const bootTimer = setInterval(() => {
-      if (processedOnce) { clearInterval(bootTimer); return; }
-      if (Date.now() - bootStart > 9000) { clearInterval(bootTimer); return; }
-      run({ force: true });
-    }, 260);
+      const startHref = location.href;
+      const startAt = Date.now();
+      let forcedOnce = false;
+
+      navSweepTimer = setInterval(() => {
+        // If URL changed again mid-sweep, reset baseline
+        const elapsed = Date.now() - startAt;
+        if (elapsed > NAV_SWEEP_MS) {
+          clearInterval(navSweepTimer);
+          navSweepTimer = null;
+          return;
+        }
+
+        const root = findContentRoot();
+        const chap = getChapterId(root);
+
+        // If content is ready, do one forced full pass (then incremental later)
+        if (contentReady(root)) {
+          if (!forcedOnce) {
+            forcedOnce = true;
+            // Always minimize on nav
+            localStorage.setItem(UI_KEY_MIN, "1");
+            ui.setMinimized(true);
+            run({ forceFull: true });
+          } else {
+            run({ forceFull: false });
+          }
+        }
+      }, NAV_POLL_MS);
+    }
+
+    // Initial run
+    run({ forceFull: true });
 
     // Mutation observer debounce
     let timer = null;
     const obs = new MutationObserver(() => {
       if (!ui.isEnabled()) return;
       if (timer) return;
-      timer = setTimeout(() => { timer = null; run({ force: false }); }, 220);
+      timer = setTimeout(() => { timer = null; run({ forceFull: false }); }, 220);
     });
     obs.observe(document.body, { childList: true, subtree: true, characterData: true });
 
-    // SPA navigation hooks (safe)
-    installNavHooks(() => {
+    // SPA hooks + Next click hook
+    const onNav = () => {
       localStorage.setItem(UI_KEY_MIN, "1");
       ui.setMinimized(true);
-      lastSigForSkip = "";
-      processedOnce = false;
-      run({ force: true });
-    });
+      startNavSweep();
+    };
 
-    // Post-navigation sweep (key for Firefox Android Next button)
-    let sweepTimer = null;
-    function startSweep() {
-      if (sweepTimer) clearInterval(sweepTimer);
-      const start = Date.now();
-      const beforeUrl = location.href;
+    installNavHooks(onNav);
+    installNextButtonHook(onNav);
 
-      // reset skip so we don't incorrectly skip a fresh chapter
-      lastSigForSkip = "";
-      processedOnce = false;
-
-      sweepTimer = setInterval(() => {
-        if (Date.now() - start > NAV_SWEEP_MS) {
-          clearInterval(sweepTimer);
-          sweepTimer = null;
-          return;
-        }
-        // If url changed, force at least one processing cycle
-        const urlChanged = location.href !== beforeUrl;
-        run({ force: urlChanged });
-      }, NAV_SWEEP_INTERVAL_MS);
-    }
-
-    // Safe Next click hook (corrected; no noisy || true)
-    installNextClickHook(() => {
-      // minimize on nav as per requirement
-      localStorage.setItem(UI_KEY_MIN, "1");
-      ui.setMinimized(true);
-      startSweep();
-    });
   })();
 })();
