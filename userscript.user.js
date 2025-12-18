@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WTR PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.5-hotfix1
-// @description  WTR-LAB Pronouns Fix — v4.9.4 stable base + (A) safe long-press add character + (B) draft normalize/dedupe. Mobile-first picker w/ X. No unknown gender. Minimised by default.
+// @version      4.9.5-hotfix2
+// @description  WTR-LAB Pronouns Fix — stable base + safe long-press add character w/ multiword phrase expansion + compact picker. Male/Female only. Minimised by default.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -48,7 +48,7 @@
   // IMPORTANT: prevent "Changed" being overwritten by self-triggered reruns
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
-  // (A) Long-press
+  // Long-press
   const LONGPRESS_MS = 520;
   const LONGPRESS_MOVE_PX = 12;
 
@@ -62,6 +62,8 @@
   const RX_PRONOUN_FEMALE = /\b(she|her|hers|herself)\b/gi;
 
   const RX_ATTACK_CUES = /\b(knife|blade|sword|dagger|stab|stabs|stabbed|slash|slashed|strike|struck|hit|hits|punched|kicked|cut|pierce|pierced|neck|chest)\b/i;
+
+  const RX_CJK = /[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]/;
 
   function caseLike(src, target) {
     if (!src) return target;
@@ -102,7 +104,7 @@
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
 
   // ==========================================================
-  // (B) Draft helpers — normalize + dedupe
+  // Draft helpers — normalize + dedupe
   // ==========================================================
   function loadDraft() {
     try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
@@ -425,7 +427,7 @@
         el.style.left = savedPos.left + "px";
         el.style.right = "auto";
       } else {
-        el.style.left = "12px";     // top-left by default (your preference)
+        el.style.left = "12px";
         el.style.right = "auto";
       }
       el.style.top = (savedPos.top ?? 12) + "px";
@@ -697,7 +699,7 @@
     refreshToggleUI();
     refreshSummary();
 
-    // ALWAYS minimised by default (your request)
+    // Always minimised by default
     setMin(true);
 
     async function writeClipboard(text) {
@@ -734,7 +736,7 @@
       setDraftUI("", 0);
     };
 
-    // Small picker with X, tap-outside, Esc. Male/Female only.
+    // Compact picker (smaller) with X, tap-outside, Esc. Male/Female only.
     function showGenderPicker(name, onPick) {
       const backdrop = document.createElement("div");
       backdrop.setAttribute("data-wtrpf-ui", "1");
@@ -749,23 +751,24 @@
         position: fixed;
         z-index: 2147483647;
         left: 50%;
-        top: 55%;
+        top: 58%;
         transform: translate(-50%, -50%);
         background: rgba(0,0,0,0.86);
         color: #fff;
         border-radius: 12px;
-        padding: 12px;
-        width: min(320px, 78vw);
+        padding: 10px;
+        width: min(240px, 64vw);
         box-shadow: 0 12px 30px rgba(0,0,0,.4);
         backdrop-filter: blur(6px);
-        font: 13px system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        font: 12px system-ui, -apple-system, Segoe UI, Roboto, Arial;
       `;
 
       const header = document.createElement("div");
-      header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px;`;
+      header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;`;
 
       const t = document.createElement("div");
-      t.textContent = `Add: ${String(name).length > 30 ? String(name).slice(0, 30) + "…" : String(name)}`;
+      const nm = String(name);
+      t.textContent = `Add: ${nm.length > 26 ? nm.slice(0, 26) + "…" : nm}`;
       t.style.cssText = `font-weight:600;`;
 
       const close = document.createElement("button");
@@ -774,9 +777,9 @@
       close.title = "Close";
       close.style.cssText = `
         appearance:none; border:0; cursor:pointer;
-        width:28px; height:28px; border-radius:10px;
+        width:26px; height:26px; border-radius:10px;
         background: rgba(255,255,255,0.12);
-        color:#fff; font-size:18px; line-height:28px;
+        color:#fff; font-size:18px; line-height:26px;
         padding:0;
       `;
 
@@ -784,7 +787,7 @@
       header.appendChild(close);
 
       const btnWrap = document.createElement("div");
-      btnWrap.style.cssText = `display:flex; gap:10px;`;
+      btnWrap.style.cssText = `display:flex; gap:8px;`;
 
       const mkBtn = (label) => {
         const b = document.createElement("button");
@@ -793,11 +796,11 @@
         b.style.cssText = `
           flex:1;
           appearance:none; border:0; cursor:pointer;
-          padding:10px;
+          padding:8px 8px;
           border-radius:10px;
           background: rgba(255,255,255,0.15);
           color:#fff;
-          font-size:13px;
+          font-size:12px;
         `;
         return b;
       };
@@ -1068,40 +1071,122 @@
   }
 
   // ==========================================================
-  // (A) Long-press handler — SAFE (no work until timer fires)
+  // Long-press helpers — multiword phrase expansion
   // ==========================================================
-  function getSelectionTextWithin(root) {
+  function caretRangeAtPoint(x, y) {
     try {
-      const sel = window.getSelection?.();
-      const txt = sel ? String(sel.toString() || "").trim() : "";
-      if (!txt || txt.length < 2) return "";
-      const anchorNode = sel.anchorNode;
-      if (!anchorNode) return txt;
-      const nodeEl = anchorNode.nodeType === 1 ? anchorNode : anchorNode.parentElement;
-      if (root && nodeEl && root.contains(nodeEl)) return txt;
-      return "";
-    } catch { return ""; }
+      if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
+      if (document.caretPositionFromPoint) {
+        const pos = document.caretPositionFromPoint(x, y);
+        if (!pos) return null;
+        const r = document.createRange();
+        r.setStart(pos.offsetNode, pos.offset);
+        r.setEnd(pos.offsetNode, pos.offset);
+        return r;
+      }
+      return null;
+    } catch { return null; }
+  }
+
+  function paragraphAndIndexFromRange(r) {
+    try {
+      const n = r?.startContainer;
+      const el = n?.nodeType === 1 ? n : n?.parentElement;
+      if (!el) return null;
+      const p = el.closest("p, li, blockquote");
+      if (!p) return null;
+
+      // index = length of text from p-start to caret
+      const pre = document.createRange();
+      pre.setStart(p, 0);
+      pre.setEnd(r.startContainer, r.startOffset);
+      const idx = (pre.toString() || "").length;
+
+      const text = normalizeWeirdSpaces(p.innerText || "");
+      return { p, text, idx: clamp(idx, 0, text.length) };
+    } catch { return null; }
+  }
+
+  function isTitleWord(w) {
+    if (!w) return false;
+    if (RX_CJK.test(w)) return true;
+    // TitleCase or ALLCAPS word
+    if (/^[A-Z][a-z]+$/.test(w)) return true;
+    if (/^[A-Z]{2,}$/.test(w)) return true;
+    // allow "Chef", "Master" etc (already matched), also allow hyphenated Title
+    if (/^[A-Z][a-z]+(?:-[A-Z][a-z]+)+$/.test(w)) return true;
+    return false;
+  }
+
+  function tokenizeWithSpans(text) {
+    // returns [{w, s, e}] for word-ish tokens (letters/numbers/CJK)
+    const out = [];
+    const rx = /[\p{L}\p{N}_-]+/gu;
+    let m;
+    while ((m = rx.exec(text)) !== null) {
+      out.push({ w: m[0], s: m.index, e: m.index + m[0].length });
+    }
+    return out;
+  }
+
+  function expandToTitlePhrase(text, idx) {
+    // Find token at idx then expand to adjacent Title-like words (up to 5 words total)
+    const toks = tokenizeWithSpans(text);
+    if (!toks.length) return "";
+
+    let i = toks.findIndex(t => idx >= t.s && idx <= t.e);
+    if (i < 0) {
+      // nearest by distance
+      let best = 0, bestD = 1e9;
+      for (let k = 0; k < toks.length; k++) {
+        const d = Math.min(Math.abs(idx - toks[k].s), Math.abs(idx - toks[k].e));
+        if (d < bestD) { bestD = d; best = k; }
+      }
+      i = best;
+    }
+
+    // If the touched word is not Title-like, still allow single word fallback.
+    let L = i, R = i;
+
+    // Expand left/right while Title-like, but cap length
+    const MAX_WORDS = 5;
+
+    // Prefer phrases that include Title-like words around
+    // Expand right first
+    while (R + 1 < toks.length && (R - L + 1) < MAX_WORDS && isTitleWord(toks[R + 1].w)) R++;
+    while (L - 1 >= 0 && (R - L + 1) < MAX_WORDS && isTitleWord(toks[L - 1].w)) L--;
+
+    // If center word is Title-like, ensure we include contiguous Title-like runs
+    if (isTitleWord(toks[i].w)) {
+      while (R + 1 < toks.length && (R - L + 1) < MAX_WORDS && isTitleWord(toks[R + 1].w)) R++;
+      while (L - 1 >= 0 && (R - L + 1) < MAX_WORDS && isTitleWord(toks[L - 1].w)) L--;
+    }
+
+    const slice = text.slice(toks[L].s, toks[R].e);
+    const name = normalizeNameForKey(slice);
+
+    // If phrase is too short or looks like random lowercase, fallback to single token
+    const single = normalizeNameForKey(toks[i].w);
+    if (!name) return single;
+    if (name.length < 2) return single;
+
+    // If expanded phrase is basically one word, return it
+    if (name.split(" ").length <= 1) return single;
+
+    return name;
   }
 
   function wordFromPoint(x, y, root) {
     try {
-      let range = null;
-      if (document.caretRangeFromPoint) range = document.caretRangeFromPoint(x, y);
-      else if (document.caretPositionFromPoint) {
-        const pos = document.caretPositionFromPoint(x, y);
-        if (pos) {
-          range = document.createRange();
-          range.setStart(pos.offsetNode, pos.offset);
-          range.setEnd(pos.offsetNode, pos.offset);
-        }
-      }
-      if (!range) return "";
-      const n = range.startContainer;
-      if (!n || n.nodeType !== 3) return "";
-      const el = n.parentElement;
+      const r = caretRangeAtPoint(x, y);
+      if (!r) return "";
+      const n = r.startContainer;
+      if (!n) return "";
+      const el = n.nodeType === 1 ? n : n.parentElement;
       if (!el || (root && !root.contains(el))) return "";
-      const t = String(n.nodeValue || "");
-      const i = clamp(range.startOffset || 0, 0, t.length);
+      const t = (n.nodeType === 3) ? String(n.nodeValue || "") : "";
+      if (!t) return "";
+      const i = clamp(r.startOffset || 0, 0, t.length);
 
       const isWordish = (ch) => /[\p{L}\p{N}_-]/u.test(ch);
       let L = i, R = i;
@@ -1118,8 +1203,9 @@
     let timer = null;
     let sx = 0, sy = 0;
     let active = false;
+    let downTarget = null;
 
-    const clear = () => { if (timer) clearTimeout(timer); timer = null; active = false; };
+    const clear = () => { if (timer) clearTimeout(timer); timer = null; active = false; downTarget = null; };
 
     document.addEventListener("pointerdown", (e) => {
       if (!ui.isEnabled?.()) return;
@@ -1129,6 +1215,7 @@
       if (t && t.closest && t.closest("[data-wtrpf-ui]")) return;
 
       active = true;
+      downTarget = t;
       sx = e.clientX || 0;
       sy = e.clientY || 0;
 
@@ -1139,19 +1226,23 @@
         const root = findContentRoot();
         if (!root) return;
 
-        // 1) WTR span
-        const sp = t && t.closest && t.closest("span.text-patch.system[data-hash]");
+        // 1) WTR term span direct
+        const sp = downTarget && downTarget.closest && downTarget.closest("span.text-patch.system[data-hash]");
         if (sp) {
           const name = normalizeNameForKey(sp.textContent || "");
           if (name) ui.addCharacterFlow(name);
           return;
         }
 
-        // 2) selection inside content
-        const sel = getSelectionTextWithin(root);
-        if (sel) { ui.addCharacterFlow(sel); return; }
+        // 2) Expand from caret position within paragraph (multiword)
+        const r = caretRangeAtPoint(sx, sy);
+        const info = r ? paragraphAndIndexFromRange(r) : null;
+        if (info && info.text && info.text.length > 0) {
+          const phrase = expandToTitlePhrase(info.text, info.idx);
+          if (phrase) { ui.addCharacterFlow(phrase); return; }
+        }
 
-        // 3) word under finger (last resort)
+        // 3) Fallback single word under finger
         const w = wordFromPoint(sx, sy, root);
         if (w) ui.addCharacterFlow(w);
       }, LONGPRESS_MS);
@@ -1178,7 +1269,7 @@
     const initialDraft = loadDraft();
     ui.setDraftUI?.(initialDraft?.snippet || "", (initialDraft?.items || []).length);
 
-    // Install (A)
+    // long-press
     installLongPress(ui);
 
     if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
