@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WTR PF Test
+// @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.5-hotfix3
-// @description  WTR-LAB Pronouns Fix — stable base + safe long-press add character w/ multiword phrase expansion + EXTRA compact picker + nav sweep to avoid refresh-needed chapters.
+// @version      4.9.5-hotfix4
+// @description  WTR-LAB Pronouns Fix — adds URL-based navigation sweep (Firefox Android Next button fix) + extra-compact gender picker w/ close.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -27,28 +27,35 @@
   const LOCAL_ANCHOR_WINDOW = 160;
   const MAX_NAMES_SHOWN = 3;
 
+  // Storage safety
   const TERM_MEM_MAX_KEYS = 300;
 
+  // Glossary cache
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
   const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v1";
   const GLOSSARY_CACHE_TTL_MS = 10 * 60 * 1000;
 
+  // Persistent UI state
   const UI_KEY_MIN = "wtrpf_ui_min_v1";
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
   const UI_KEY_ON  = "wtrpf_enabled_v1";
 
+  // Draft + term memory
   const DRAFT_KEY = "wtrpf_draft_v1";
   const TERM_MEM_KEY_PREFIX = "wtrpf_term_mem_v1:";
   const CHAPTER_STATE_KEY_PREFIX = "wtrpf_chapter_state_v1:";
 
+  // Prevent self-triggered rerun clobbering
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
+  // Long press
   const LONGPRESS_MS = 520;
   const LONGPRESS_MOVE_PX = 12;
 
-  // After navigation, keep retrying to catch late-loaded chapter content.
-  const NAV_SWEEP_MS = 5000;      // total sweep duration
-  const NAV_SWEEP_TICK = 220;     // how often to retry
+  // Navigation sweep — more aggressive for Firefox Android
+  const NAV_SWEEP_MS = 6500;     // total sweep duration
+  const NAV_SWEEP_TICK = 180;    // retry frequency
+  const URL_POLL_MS = 260;       // URL poll frequency (Next button often changes URL reliably)
 
   // ==========================================================
   // Utilities
@@ -100,6 +107,11 @@
   }
 
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+
+  function urlKey() {
+    // ignore hashes and trivial params ordering changes
+    return (location.href || "").split("#")[0];
+  }
 
   // ==========================================================
   // Draft helpers — normalize + dedupe
@@ -405,7 +417,7 @@
   }
 
   // ==========================================================
-  // UI
+  // UI (minimised by default + compact picker w/ X)
   // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
@@ -429,18 +441,6 @@
         el.style.right = "auto";
       }
       el.style.top = (savedPos.top ?? 12) + "px";
-    }
-
-    function clampToViewport(el) {
-      const rect = el.getBoundingClientRect();
-      const maxLeft = Math.max(6, window.innerWidth - rect.width - 6);
-      const maxTop = Math.max(6, window.innerHeight - rect.height - 6);
-      const left = Math.min(Math.max(6, rect.left), maxLeft);
-      const top = Math.min(Math.max(6, rect.top), maxTop);
-      el.style.left = left + "px";
-      el.style.top = top + "px";
-      el.style.right = "auto";
-      localStorage.setItem(UI_KEY_POS, JSON.stringify({ left: Math.round(left), top: Math.round(top) }));
     }
 
     function enableDrag(el, allowButtonClicks = true) {
@@ -469,7 +469,15 @@
       const end = () => {
         if (!dragging) return;
         dragging = false;
-        clampToViewport(el);
+        const rect = el.getBoundingClientRect();
+        const maxLeft = Math.max(6, window.innerWidth - rect.width - 6);
+        const maxTop = Math.max(6, window.innerHeight - rect.height - 6);
+        const left = Math.min(Math.max(6, rect.left), maxLeft);
+        const top = Math.min(Math.max(6, rect.top), maxTop);
+        el.style.left = left + "px";
+        el.style.top = top + "px";
+        el.style.right = "auto";
+        localStorage.setItem(UI_KEY_POS, JSON.stringify({ left: Math.round(left), top: Math.round(top) }));
       };
 
       el.addEventListener("pointerup", end);
@@ -754,19 +762,19 @@
         background: rgba(0,0,0,0.86);
         color: #fff;
         border-radius: 12px;
-        padding: 8px;
-        width: min(210px, 56vw);
+        padding: 6px;
+        width: min(190px, 52vw);
         box-shadow: 0 12px 30px rgba(0,0,0,.4);
         backdrop-filter: blur(6px);
         font: 12px system-ui, -apple-system, Segoe UI, Roboto, Arial;
       `;
 
       const header = document.createElement("div");
-      header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;`;
+      header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:5px;`;
 
       const t = document.createElement("div");
       const nm = String(name);
-      t.textContent = `Add: ${nm.length > 24 ? nm.slice(0, 24) + "…" : nm}`;
+      t.textContent = `Add: ${nm.length > 22 ? nm.slice(0, 22) + "…" : nm}`;
       t.style.cssText = `font-weight:600; font-size:12px;`;
 
       const close = document.createElement("button");
@@ -775,9 +783,9 @@
       close.title = "Close";
       close.style.cssText = `
         appearance:none; border:0; cursor:pointer;
-        width:24px; height:24px; border-radius:10px;
+        width:22px; height:22px; border-radius:10px;
         background: rgba(255,255,255,0.10);
-        color:#fff; font-size:18px; line-height:24px;
+        color:#fff; font-size:18px; line-height:22px;
         padding:0;
       `;
 
@@ -785,7 +793,7 @@
       header.appendChild(close);
 
       const btnWrap = document.createElement("div");
-      btnWrap.style.cssText = `display:flex; gap:6px;`;
+      btnWrap.style.cssText = `display:flex; gap:5px;`;
 
       const mkBtn = (label) => {
         const b = document.createElement("button");
@@ -794,7 +802,7 @@
         b.style.cssText = `
           flex:1;
           appearance:none; border:0; cursor:pointer;
-          padding:6px 6px;
+          padding:5px 6px;
           border-radius:10px;
           background: rgba(255,255,255,0.14);
           color:#fff;
@@ -901,9 +909,7 @@
     ".menu",".navbar",".nav",".btn",".button"
   ].join(",");
 
-  function isSkippable(el) {
-    return !!(el && el.closest && el.closest(SKIP_CLOSEST));
-  }
+  function isSkippable(el) { return !!(el && el.closest && el.closest(SKIP_CLOSEST)); }
 
   function getTextBlocks(root) {
     const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
@@ -915,7 +921,7 @@
   }
 
   // ==========================================================
-  // Character detection (restored)
+  // Character detection
   // ==========================================================
   function detectCharactersOnPage(root, entries) {
     const hay = (root?.innerText || "").toLowerCase();
@@ -1003,7 +1009,7 @@
   }
 
   // ==========================================================
-  // Node replacement counting (robust)
+  // Node replacement counting
   // ==========================================================
   function replaceInTextNodes(blockEl, fnReplace) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
@@ -1043,7 +1049,7 @@
   }
 
   // ==========================================================
-  // Signature (used ONLY for skipping duplicate identical content)
+  // Signature for skip (disabled during sweep)
   // ==========================================================
   function makeSignature(root) {
     const t = (root.innerText || "").trim();
@@ -1053,23 +1059,7 @@
   }
 
   // ==========================================================
-  // Navigation hooks
-  // ==========================================================
-  function installNavHooks(onNav) {
-    const fire = () => setTimeout(onNav, 80);
-    window.addEventListener("popstate", fire);
-
-    const _push = history.pushState;
-    const _rep  = history.replaceState;
-    history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
-    history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
-
-    const mo = new MutationObserver(() => fire());
-    mo.observe(document.body, { childList: true, subtree: true });
-  }
-
-  // ==========================================================
-  // Long-press helpers — multiword phrase expansion
+  // Long-press multiword phrase expansion (kept)
   // ==========================================================
   function caretRangeAtPoint(x, y) {
     try {
@@ -1117,9 +1107,7 @@
     const out = [];
     const rx = /[\p{L}\p{N}_-]+/gu;
     let m;
-    while ((m = rx.exec(text)) !== null) {
-      out.push({ w: m[0], s: m.index, e: m.index + m[0].length });
-    }
+    while ((m = rx.exec(text)) !== null) out.push({ w: m[0], s: m.index, e: m.index + m[0].length });
     return out;
   }
 
@@ -1142,11 +1130,6 @@
 
     while (R + 1 < toks.length && (R - L + 1) < MAX_WORDS && isTitleWord(toks[R + 1].w)) R++;
     while (L - 1 >= 0 && (R - L + 1) < MAX_WORDS && isTitleWord(toks[L - 1].w)) L--;
-
-    if (isTitleWord(toks[i].w)) {
-      while (R + 1 < toks.length && (R - L + 1) < MAX_WORDS && isTitleWord(toks[R + 1].w)) R++;
-      while (L - 1 >= 0 && (R - L + 1) < MAX_WORDS && isTitleWord(toks[L - 1].w)) L--;
-    }
 
     const slice = text.slice(toks[L].s, toks[R].e);
     const name = normalizeNameForKey(slice);
@@ -1237,6 +1220,23 @@
 
     document.addEventListener("pointerup", clear, true);
     document.addEventListener("pointercancel", clear, true);
+  }
+
+  // ==========================================================
+  // Navigation hooks
+  // ==========================================================
+  function installNavHooks(onNav) {
+    const fire = () => setTimeout(onNav, 50);
+    window.addEventListener("popstate", fire);
+
+    const _push = history.pushState;
+    const _rep  = history.replaceState;
+    history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
+    history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
+
+    // Some variants do DOM swaps without pushing state — still helps sometimes
+    const mo = new MutationObserver(() => fire());
+    mo.observe(document.body, { childList: true, subtree: true });
   }
 
   // ==========================================================
@@ -1359,12 +1359,19 @@
     let running = false;
     let lastRunAt = 0;
 
-    // NAV SWEEP state
+    // URL-based navigation detection
+    let lastURL = urlKey();
+
+    // Sweep state
     let navSweepUntil = 0;
     let navSweepTimer = null;
 
-    function startNavSweep() {
+    function startNavSweep(reason = "nav") {
       navSweepUntil = Date.now() + NAV_SWEEP_MS;
+      // IMPORTANT: wipe signature to avoid accidental "skip" during swaps
+      lastSigForSkip = "";
+      processedOnce = false;
+
       if (navSweepTimer) return;
       navSweepTimer = setInterval(() => {
         if (Date.now() > navSweepUntil) {
@@ -1372,7 +1379,7 @@
           navSweepTimer = null;
           return;
         }
-        run(true); // force-ish mode during sweep
+        run(true);
       }, NAV_SWEEP_TICK);
     }
 
@@ -1395,43 +1402,49 @@
       if (running) return;
 
       const now = Date.now();
-      // During nav sweep, relax cooldown slightly so we can catch the new content ASAP.
-      const cooldown = isSweep ? 220 : SELF_MUTATION_COOLDOWN_MS;
+      const cooldown = isSweep ? 140 : SELF_MUTATION_COOLDOWN_MS;
       if (now - lastRunAt < cooldown) return;
 
       const root = findContentRoot();
       const chapterId = getChapterId(root);
 
-      // During sweep, don't permanently "accept" early partial content:
-      // only proceed if ready OR we already processed once for this chapter.
       if (!processedOnce && !contentReady(root)) return;
 
       running = true;
       try {
-        // Chapter change reset
+        // Reset when chapter changes OR when URL changed (URL is the reliable signal on FF Android)
+        const u = urlKey();
+        if (u !== lastURL) {
+          lastURL = u;
+          lastChapterId = null;
+          lastActorGender = null;
+          lastActorTTL = 0;
+          lastSigForSkip = "";
+          processedOnce = false;
+        }
+
         if (chapterId !== lastChapterId) {
           lastChapterId = chapterId;
           ui.setMinimized(true);
           lastSigForSkip = "";
           lastActorGender = null;
           lastActorTTL = 0;
-          // allow re-entry for this new chapter
           processedOnce = false;
         }
 
+        // Signature skip only when NOT sweeping
         const sigBefore = makeSignature(root);
-        const compositeSig = `${chapterId}|${sigBefore}`;
+        const compositeSig = `${lastURL}|${chapterId}|${sigBefore}`;
 
-        // If sweeping, we still allow reruns even if sig same *until* we've actually processedOnce.
         if (!isSweep) {
           if (compositeSig === lastSigForSkip) return;
           lastSigForSkip = compositeSig;
         } else {
-          if (processedOnce && compositeSig === lastSigForSkip) return;
+          // During sweep, allow repeated runs even with identical signature,
+          // because FF sometimes "finalizes" text nodes after a short delay.
           lastSigForSkip = compositeSig;
         }
 
-        // Now mark processedOnce once we see reasonable content (prevents premature accept on stale DOM)
         if (!processedOnce) {
           if (!contentReady(root)) return;
           processedOnce = true;
@@ -1531,11 +1544,15 @@
         if (pronounEdits > 0) {
           setChapterLastChanged(st, chapterId, pronounEdits);
           ui.setChanged(pronounEdits);
+
+          // If we made edits during sweep, we can stop early.
+          if (isSweep) navSweepUntil = 0;
         } else if (prev > 0) {
           ui.setChanged(prev);
         } else {
           ui.setChanged(0);
         }
+
         saveChapterState(st);
 
       } finally {
@@ -1546,11 +1563,10 @@
 
     // Initial run + boot retries
     run(false);
-
     const bootStart = Date.now();
     const bootTimer = setInterval(() => {
       if (processedOnce) { clearInterval(bootTimer); return; }
-      if (Date.now() - bootStart > 8000) { clearInterval(bootTimer); return; }
+      if (Date.now() - bootStart > 9000) { clearInterval(bootTimer); return; }
       run(true);
     }, 250);
 
@@ -1568,8 +1584,21 @@
       ui.setMinimized(true);
       lastSigForSkip = "";
       processedOnce = false;
-      startNavSweep();   // KEY FIX: keep retrying until the new chapter content is actually present
+      startNavSweep("spa");
       run(true);
     });
+
+    // URL poller — main fix for FF Android Next button
+    setInterval(() => {
+      const u = urlKey();
+      if (u !== lastURL) {
+        lastURL = u;
+        ui.setMinimized(true);
+        lastSigForSkip = "";
+        processedOnce = false;
+        startNavSweep("url");
+        run(true);
+      }
+    }, URL_POLL_MS);
   })();
 })();
