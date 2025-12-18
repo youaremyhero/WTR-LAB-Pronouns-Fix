@@ -441,8 +441,8 @@
       padding: 10px 12px;
       font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 10px 28px rgba(0,0,0,.25);
-      max-width: ${isMobile ? "92vw" : "min(520px, 90vw)"};
-      width: ${isMobile ? "92vw" : "auto"};
+      max-width: ${isMobile ? "60vw" : "min(520px, 58vw)"};
+      width: ${isMobile ? "60vw" : "auto"};
       height: auto;
       backdrop-filter: blur(6px);
       user-select: none;
