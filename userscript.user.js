@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         WTR-LAB Pronouns Fix
+// @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
 // @version      4.9.5
 // @description  Fix gender pronouns in WTR-LAB translations using a shared glossary. Mobile-first UI, reliable counters, SPA-safe, Add Character/Term with long-press.
