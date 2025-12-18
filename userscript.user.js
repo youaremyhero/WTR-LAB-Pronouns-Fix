@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WTR PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.5-hotfix2
-// @description  WTR-LAB Pronouns Fix — stable base + safe long-press add character w/ multiword phrase expansion + compact picker. Male/Female only. Minimised by default.
+// @version      4.9.5-hotfix3
+// @description  WTR-LAB Pronouns Fix — stable base + safe long-press add character w/ multiword phrase expansion + EXTRA compact picker + nav sweep to avoid refresh-needed chapters.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -27,30 +27,28 @@
   const LOCAL_ANCHOR_WINDOW = 160;
   const MAX_NAMES_SHOWN = 3;
 
-  // Term memory cap (basic storage safety)
   const TERM_MEM_MAX_KEYS = 300;
 
-  // Cache
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
   const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v1";
   const GLOSSARY_CACHE_TTL_MS = 10 * 60 * 1000;
 
-  // Persistent UI state
   const UI_KEY_MIN = "wtrpf_ui_min_v1";
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
   const UI_KEY_ON  = "wtrpf_enabled_v1";
 
-  // Draft + term memory
   const DRAFT_KEY = "wtrpf_draft_v1";
   const TERM_MEM_KEY_PREFIX = "wtrpf_term_mem_v1:";
   const CHAPTER_STATE_KEY_PREFIX = "wtrpf_chapter_state_v1:";
 
-  // IMPORTANT: prevent "Changed" being overwritten by self-triggered reruns
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
-  // Long-press
   const LONGPRESS_MS = 520;
   const LONGPRESS_MOVE_PX = 12;
+
+  // After navigation, keep retrying to catch late-loaded chapter content.
+  const NAV_SWEEP_MS = 5000;      // total sweep duration
+  const NAV_SWEEP_TICK = 220;     // how often to retry
 
   // ==========================================================
   // Utilities
@@ -736,7 +734,7 @@
       setDraftUI("", 0);
     };
 
-    // Compact picker (smaller) with X, tap-outside, Esc. Male/Female only.
+    // EXTRA compact picker (smaller padding + tighter buttons), with X, tap-outside, Esc. Male/Female only.
     function showGenderPicker(name, onPick) {
       const backdrop = document.createElement("div");
       backdrop.setAttribute("data-wtrpf-ui", "1");
@@ -756,20 +754,20 @@
         background: rgba(0,0,0,0.86);
         color: #fff;
         border-radius: 12px;
-        padding: 10px;
-        width: min(240px, 64vw);
+        padding: 8px;
+        width: min(210px, 56vw);
         box-shadow: 0 12px 30px rgba(0,0,0,.4);
         backdrop-filter: blur(6px);
         font: 12px system-ui, -apple-system, Segoe UI, Roboto, Arial;
       `;
 
       const header = document.createElement("div");
-      header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;`;
+      header.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;`;
 
       const t = document.createElement("div");
       const nm = String(name);
-      t.textContent = `Add: ${nm.length > 26 ? nm.slice(0, 26) + "…" : nm}`;
-      t.style.cssText = `font-weight:600;`;
+      t.textContent = `Add: ${nm.length > 24 ? nm.slice(0, 24) + "…" : nm}`;
+      t.style.cssText = `font-weight:600; font-size:12px;`;
 
       const close = document.createElement("button");
       close.type = "button";
@@ -777,9 +775,9 @@
       close.title = "Close";
       close.style.cssText = `
         appearance:none; border:0; cursor:pointer;
-        width:26px; height:26px; border-radius:10px;
-        background: rgba(255,255,255,0.12);
-        color:#fff; font-size:18px; line-height:26px;
+        width:24px; height:24px; border-radius:10px;
+        background: rgba(255,255,255,0.10);
+        color:#fff; font-size:18px; line-height:24px;
         padding:0;
       `;
 
@@ -787,7 +785,7 @@
       header.appendChild(close);
 
       const btnWrap = document.createElement("div");
-      btnWrap.style.cssText = `display:flex; gap:8px;`;
+      btnWrap.style.cssText = `display:flex; gap:6px;`;
 
       const mkBtn = (label) => {
         const b = document.createElement("button");
@@ -796,9 +794,9 @@
         b.style.cssText = `
           flex:1;
           appearance:none; border:0; cursor:pointer;
-          padding:8px 8px;
+          padding:6px 6px;
           border-radius:10px;
-          background: rgba(255,255,255,0.15);
+          background: rgba(255,255,255,0.14);
           color:#fff;
           font-size:12px;
         `;
@@ -1096,7 +1094,6 @@
       const p = el.closest("p, li, blockquote");
       if (!p) return null;
 
-      // index = length of text from p-start to caret
       const pre = document.createRange();
       pre.setStart(p, 0);
       pre.setEnd(r.startContainer, r.startOffset);
@@ -1110,16 +1107,13 @@
   function isTitleWord(w) {
     if (!w) return false;
     if (RX_CJK.test(w)) return true;
-    // TitleCase or ALLCAPS word
     if (/^[A-Z][a-z]+$/.test(w)) return true;
     if (/^[A-Z]{2,}$/.test(w)) return true;
-    // allow "Chef", "Master" etc (already matched), also allow hyphenated Title
     if (/^[A-Z][a-z]+(?:-[A-Z][a-z]+)+$/.test(w)) return true;
     return false;
   }
 
   function tokenizeWithSpans(text) {
-    // returns [{w, s, e}] for word-ish tokens (letters/numbers/CJK)
     const out = [];
     const rx = /[\p{L}\p{N}_-]+/gu;
     let m;
@@ -1130,13 +1124,11 @@
   }
 
   function expandToTitlePhrase(text, idx) {
-    // Find token at idx then expand to adjacent Title-like words (up to 5 words total)
     const toks = tokenizeWithSpans(text);
     if (!toks.length) return "";
 
     let i = toks.findIndex(t => idx >= t.s && idx <= t.e);
     if (i < 0) {
-      // nearest by distance
       let best = 0, bestD = 1e9;
       for (let k = 0; k < toks.length; k++) {
         const d = Math.min(Math.abs(idx - toks[k].s), Math.abs(idx - toks[k].e));
@@ -1145,18 +1137,12 @@
       i = best;
     }
 
-    // If the touched word is not Title-like, still allow single word fallback.
     let L = i, R = i;
-
-    // Expand left/right while Title-like, but cap length
     const MAX_WORDS = 5;
 
-    // Prefer phrases that include Title-like words around
-    // Expand right first
     while (R + 1 < toks.length && (R - L + 1) < MAX_WORDS && isTitleWord(toks[R + 1].w)) R++;
     while (L - 1 >= 0 && (R - L + 1) < MAX_WORDS && isTitleWord(toks[L - 1].w)) L--;
 
-    // If center word is Title-like, ensure we include contiguous Title-like runs
     if (isTitleWord(toks[i].w)) {
       while (R + 1 < toks.length && (R - L + 1) < MAX_WORDS && isTitleWord(toks[R + 1].w)) R++;
       while (L - 1 >= 0 && (R - L + 1) < MAX_WORDS && isTitleWord(toks[L - 1].w)) L--;
@@ -1165,12 +1151,9 @@
     const slice = text.slice(toks[L].s, toks[R].e);
     const name = normalizeNameForKey(slice);
 
-    // If phrase is too short or looks like random lowercase, fallback to single token
     const single = normalizeNameForKey(toks[i].w);
     if (!name) return single;
     if (name.length < 2) return single;
-
-    // If expanded phrase is basically one word, return it
     if (name.split(" ").length <= 1) return single;
 
     return name;
@@ -1226,7 +1209,6 @@
         const root = findContentRoot();
         if (!root) return;
 
-        // 1) WTR term span direct
         const sp = downTarget && downTarget.closest && downTarget.closest("span.text-patch.system[data-hash]");
         if (sp) {
           const name = normalizeNameForKey(sp.textContent || "");
@@ -1234,7 +1216,6 @@
           return;
         }
 
-        // 2) Expand from caret position within paragraph (multiword)
         const r = caretRangeAtPoint(sx, sy);
         const info = r ? paragraphAndIndexFromRange(r) : null;
         if (info && info.text && info.text.length > 0) {
@@ -1242,7 +1223,6 @@
           if (phrase) { ui.addCharacterFlow(phrase); return; }
         }
 
-        // 3) Fallback single word under finger
         const w = wordFromPoint(sx, sy, root);
         if (w) ui.addCharacterFlow(w);
       }, LONGPRESS_MS);
@@ -1269,7 +1249,6 @@
     const initialDraft = loadDraft();
     ui.setDraftUI?.(initialDraft?.snippet || "", (initialDraft?.items || []).length);
 
-    // long-press
     installLongPress(ui);
 
     if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
@@ -1380,6 +1359,23 @@
     let running = false;
     let lastRunAt = 0;
 
+    // NAV SWEEP state
+    let navSweepUntil = 0;
+    let navSweepTimer = null;
+
+    function startNavSweep() {
+      navSweepUntil = Date.now() + NAV_SWEEP_MS;
+      if (navSweepTimer) return;
+      navSweepTimer = setInterval(() => {
+        if (Date.now() > navSweepUntil) {
+          clearInterval(navSweepTimer);
+          navSweepTimer = null;
+          return;
+        }
+        run(true); // force-ish mode during sweep
+      }, NAV_SWEEP_TICK);
+    }
+
     function contentReady(root) {
       if (!root) return false;
       const blocks = getTextBlocks(root);
@@ -1393,34 +1389,53 @@
       else ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
     }
 
-    function run() {
+    function run(isSweep = false) {
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
       if (running) return;
 
       const now = Date.now();
-      if (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS) return;
+      // During nav sweep, relax cooldown slightly so we can catch the new content ASAP.
+      const cooldown = isSweep ? 220 : SELF_MUTATION_COOLDOWN_MS;
+      if (now - lastRunAt < cooldown) return;
 
       const root = findContentRoot();
       const chapterId = getChapterId(root);
 
+      // During sweep, don't permanently "accept" early partial content:
+      // only proceed if ready OR we already processed once for this chapter.
       if (!processedOnce && !contentReady(root)) return;
-      processedOnce = true;
 
       running = true;
       try {
+        // Chapter change reset
         if (chapterId !== lastChapterId) {
           lastChapterId = chapterId;
           ui.setMinimized(true);
           lastSigForSkip = "";
           lastActorGender = null;
           lastActorTTL = 0;
+          // allow re-entry for this new chapter
+          processedOnce = false;
         }
 
         const sigBefore = makeSignature(root);
         const compositeSig = `${chapterId}|${sigBefore}`;
-        if (compositeSig === lastSigForSkip) return;
-        lastSigForSkip = compositeSig;
+
+        // If sweeping, we still allow reruns even if sig same *until* we've actually processedOnce.
+        if (!isSweep) {
+          if (compositeSig === lastSigForSkip) return;
+          lastSigForSkip = compositeSig;
+        } else {
+          if (processedOnce && compositeSig === lastSigForSkip) return;
+          lastSigForSkip = compositeSig;
+        }
+
+        // Now mark processedOnce once we see reasonable content (prevents premature accept on stale DOM)
+        if (!processedOnce) {
+          if (!contentReady(root)) return;
+          processedOnce = true;
+        }
 
         const st0 = loadChapterState();
         const lastChanged = getChapterLastChanged(st0, chapterId);
@@ -1529,28 +1544,32 @@
       }
     }
 
-    run();
+    // Initial run + boot retries
+    run(false);
 
     const bootStart = Date.now();
     const bootTimer = setInterval(() => {
       if (processedOnce) { clearInterval(bootTimer); return; }
       if (Date.now() - bootStart > 8000) { clearInterval(bootTimer); return; }
-      run();
+      run(true);
     }, 250);
 
+    // Mutation observer
     let timer = null;
     const obs = new MutationObserver(() => {
       if (!ui.isEnabled()) return;
       if (timer) return;
-      timer = setTimeout(() => { timer = null; run(); }, 220);
+      timer = setTimeout(() => { timer = null; run(false); }, 220);
     });
     obs.observe(document.body, { childList: true, subtree: true, characterData: true });
 
+    // SPA navigation hooks
     installNavHooks(() => {
       ui.setMinimized(true);
       lastSigForSkip = "";
       processedOnce = false;
-      run();
+      startNavSweep();   // KEY FIX: keep retrying until the new chapter content is actually present
+      run(true);
     });
   })();
 })();
