@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.3a
-// @description  WTR-LAB Pronouns Fix — mobile-ready boot + reliable Changed counter + tighter mobile UI.
+// @version      4.9.3b
+// @description  WTR-LAB Pronouns Fix — fixes self-triggered rerun clobbering Changed counter + restores per-chapter character detection + mobile UI sizing.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -27,7 +27,7 @@
   const LOCAL_ANCHOR_WINDOW = 160;
   const MAX_NAMES_SHOWN = 3;
 
-  // Term memory cap
+  // Term memory cap (basic storage safety)
   const TERM_MEM_MAX_KEYS = 300;
 
   // Cache
@@ -44,6 +44,9 @@
   const DRAFT_KEY = "wtrpf_draft_v1";
   const TERM_MEM_KEY_PREFIX = "wtrpf_term_mem_v1:";
   const CHAPTER_STATE_KEY_PREFIX = "wtrpf_chapter_state_v1:";
+
+  // IMPORTANT: prevent "Changed" being overwritten by self-triggered reruns
+  const SELF_MUTATION_COOLDOWN_MS = 450;
 
   // ==========================================================
   // Utilities
@@ -147,9 +150,6 @@
     return { text, changed: text === original ? 0 : changed };
   }
 
-  // ==========================================================
-  // "onlyChangeIfWrong" gate: apply if ANY wrong pronoun exists
-  // ==========================================================
   function conservativeShouldApply(region, gender) {
     const maleCount = countMatches(RX_PRONOUN_MALE, region);
     const femCount  = countMatches(RX_PRONOUN_FEMALE, region);
@@ -431,7 +431,6 @@
 
     const isMobile = window.innerWidth <= 480;
 
-    // Expanded panel — tighter on mobile
     const box = document.createElement("div");
     box.style.cssText = `
       position: fixed; z-index: 2147483647;
@@ -536,7 +535,6 @@
     draftCountRow.style.cssText = `opacity:.85; margin-top:8px;`;
     draftCountRow.textContent = "Draft: 0";
 
-    // Minimised pill (compact)
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
@@ -606,20 +604,10 @@
       setTimeout(() => location.reload(), 150);
     };
 
-    function syncPos(fromEl, toEl) {
-      const r = fromEl.getBoundingClientRect();
-      toEl.style.top = r.top + "px";
-      toEl.style.left = r.left + "px";
-      toEl.style.right = "auto";
-      clampToViewport(toEl);
-    }
-
     function setMin(min) {
       localStorage.setItem(UI_KEY_MIN, min ? "1" : "0");
       box.style.display = min ? "none" : "block";
       pill.style.display = min ? "block" : "none";
-      if (min) syncPos(box, pill);
-      else syncPos(pill, box);
     }
 
     minBtn.onclick = () => setMin(true);
@@ -700,14 +688,17 @@
     return {
       isEnabled: () => enabled(),
       setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshSummary(); },
-      setCharacters: (entries) => {
-        charactersCount = entries.length;
-        const names = entries.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
+      setCharacters: (detectedEntries) => {
+        charactersCount = detectedEntries.length;
+
+        const base = detectedEntries.length ? detectedEntries : [];
+        const names = base.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
           const g = String(info.gender || "").toLowerCase();
           const label = (g === "female" || g === "male") ? g : "unknown";
           return `${name} (${label})`;
         });
-        charactersList3 = names.join(", ") + (entries.length > MAX_NAMES_SHOWN ? " …" : "");
+
+        charactersList3 = names.join(", ") + (base.length > MAX_NAMES_SHOWN ? " …" : "");
         refreshSummary();
       },
       setChanged: (val) => {
@@ -725,13 +716,12 @@
   }
 
   // ==========================================================
-  // Content targeting (mobile-safe)
+  // Content targeting
   // ==========================================================
   function findContentRoot() {
     const cb = document.querySelector(".chapter-body.menu-target[data-chapter-id]");
     if (cb) return cb;
 
-    // Some mobile layouts use different wrappers
     const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
     if (likely) return likely;
 
@@ -772,6 +762,24 @@
       const t = (b.innerText || "").trim();
       return t.length >= 20;
     });
+  }
+
+  // ==========================================================
+  // Character detection (restored)
+  // ==========================================================
+  function detectCharactersOnPage(root, entries) {
+    const hay = (root?.innerText || "").toLowerCase();
+    const detected = [];
+    for (const [name, info] of entries) {
+      const nameLower = String(name || "").toLowerCase();
+      if (nameLower && hay.includes(nameLower)) { detected.push([name, info]); continue; }
+      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+      for (const a of aliases) {
+        const aLower = String(a || "").toLowerCase();
+        if (aLower && hay.includes(aLower)) { detected.push([name, info]); break; }
+      }
+    }
+    return detected;
   }
 
   // ==========================================================
@@ -854,8 +862,7 @@
   function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
 
   // ==========================================================
-  // Accurate node replacement counting (WITH FALLBACK)
-  // - fallback counts difference in pronoun tokens if WTR DOM splits nodes oddly
+  // Node replacement counting (robust)
   // ==========================================================
   function replaceInTextNodes(blockEl, fnReplace) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
@@ -882,7 +889,6 @@
       let delta = Number(out.changed || 0);
 
       if (after !== before) {
-        // Fallback: estimate token changes if delta didn't record
         if (delta <= 0) {
           const b0 = countMatches(RX_PRONOUN_MALE, before) + countMatches(RX_PRONOUN_FEMALE, before);
           const b1 = countMatches(RX_PRONOUN_MALE, after) + countMatches(RX_PRONOUN_FEMALE, after);
@@ -896,7 +902,7 @@
   }
 
   // ==========================================================
-  // Chapter state
+  // Signature (used ONLY for skipping duplicate identical content)
   // ==========================================================
   function makeSignature(root) {
     const t = (root.innerText || "").trim();
@@ -919,16 +925,6 @@
 
     const mo = new MutationObserver(() => fire());
     mo.observe(document.body, { childList: true, subtree: true });
-  }
-
-  // ==========================================================
-  // Add menu (unchanged behaviour, trimmed for brevity)
-  // ==========================================================
-  function installAddMenu({ ui, novelKey }) {
-    // Keep your existing add menu implementation here.
-    // (No changes needed for the current issues.)
-    // If you want, I can re-inject the full menu block, but it's unchanged from your last copy.
-    return { hide(){} };
   }
 
   // ==========================================================
@@ -982,8 +978,6 @@
     const novelKey = key === "default" ? getNovelKeyFromURL() : key;
     const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
 
-    installAddMenu({ ui, novelKey });
-
     const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
     const forceGender = String(cfg.forceGender || "").toLowerCase();
@@ -999,9 +993,13 @@
       sessionStorage.setItem(chapterStateKey, JSON.stringify(st || {}));
     }
 
-    function updateDetectedCharactersUI(root) {
-      // lightweight: show all if detection is unreliable on mobile
-      ui.setCharacters(entries);
+    // Keep last meaningful changed per chapter to prevent clobbering by reruns
+    function getChapterLastChanged(st, chapterId) {
+      return Number(st?.lastByChapter?.[chapterId] || 0);
+    }
+    function setChapterLastChanged(st, chapterId, val) {
+      if (!st.lastByChapter) st.lastByChapter = {};
+      st.lastByChapter[chapterId] = val;
     }
 
     function computeGenderForText(text) {
@@ -1045,149 +1043,182 @@
     let lastSigForSkip = "";
     let processedOnce = false;
 
+    let running = false;
+    let lastRunAt = 0;
+
     function contentReady(root) {
       if (!root) return false;
       const blocks = getTextBlocks(root);
       const textLen = (root.innerText || "").trim().length;
-      // mobile boot: ensure enough text exists before first real run
       return blocks.length >= 6 && textLen >= 600;
+    }
+
+    function updateDetectedCharactersUI(root) {
+      const detected = detectCharactersOnPage(root, entries);
+      if (detected.length) {
+        ui.setCharacters(detected);
+      } else {
+        // fallback: show a stable small preview (first 3 configured) if none detected
+        ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
+      }
     }
 
     function run() {
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
+      if (running) return;
+
+      const now = Date.now();
+      if (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS) return;
 
       const root = findContentRoot();
       const chapterId = getChapterId(root);
 
-      // If first runs happen too early on mobile, wait for content
       if (!processedOnce && !contentReady(root)) return;
-
       processedOnce = true;
 
-      if (chapterId !== lastChapterId) {
-        lastChapterId = chapterId;
-        localStorage.setItem(UI_KEY_MIN, "1");
-        ui.setMinimized(true);
-        lastSigForSkip = "";
-        lastActorGender = null;
-        lastActorTTL = 0;
-      }
-
-      const sig = makeSignature(root);
-      const compositeSig = `${chapterId}|${sig}`;
-      if (compositeSig === lastSigForSkip) return;
-      lastSigForSkip = compositeSig;
-
-      const st = loadChapterState();
-      if (st[compositeSig] && Number.isFinite(st[compositeSig].changed)) ui.setChanged(st[compositeSig].changed);
-      else ui.setChanged(0);
-
-      // Term patches first
-      if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
-        const mem = loadTermMemory(novelKey);
-        applyTermPatches(root, cfgTerms, mem, U);
-      }
-
-      updateDetectedCharactersUI(root);
-
-      let usedMode = mode;
-      let chapterGender = null;
-
-      if (mode === "chapter") {
-        if (forceGender === "male" || forceGender === "female") chapterGender = forceGender;
-        else if (primaryCharacter && characters[primaryCharacter]) {
-          const g = String(characters[primaryCharacter].gender || "").toLowerCase();
-          if (g === "female" || g === "male") chapterGender = g;
-        }
-        if (!chapterGender) usedMode = "paragraph";
-      }
-
-      const blocks = getTextBlocks(root);
-      let lastGender = null;
-      let carryLeft = 0;
-      let pronounEdits = 0;
-
-      for (const b of blocks) {
-        const bt = (b.innerText || "").trim();
-        if (!bt) continue;
-
-        if (isSceneBreak(bt)) {
-          lastGender = null;
-          carryLeft = 0;
+      running = true;
+      try {
+        if (chapterId !== lastChapterId) {
+          lastChapterId = chapterId;
+          localStorage.setItem(UI_KEY_MIN, "1");
+          ui.setMinimized(true);
+          lastSigForSkip = "";
           lastActorGender = null;
           lastActorTTL = 0;
-          continue;
         }
 
-        // anchored fixes
-        if (U.anchoredFixes) {
-          pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
+        const sigBefore = makeSignature(root);
+        const compositeSig = `${chapterId}|${sigBefore}`;
+        if (compositeSig === lastSigForSkip) return;
+        lastSigForSkip = compositeSig;
+
+        // Restore last known changed for this chapter (prevents UI flashing to 0)
+        const st0 = loadChapterState();
+        const lastChanged = getChapterLastChanged(st0, chapterId);
+        if (lastChanged > 0) ui.setChanged(lastChanged);
+        else ui.setChanged(0);
+
+        // Term patches first
+        if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
+          const mem = loadTermMemory(novelKey);
+          applyTermPatches(root, cfgTerms, mem, U);
         }
 
-        // gender
-        let g = null;
-        let hadDirectMatch = false;
+        updateDetectedCharactersUI(root);
 
-        if (usedMode === "chapter") {
-          g = chapterGender;
-          hadDirectMatch = true;
-        } else {
-          const computed = computeGenderForText(bt);
-          if (computed) {
-            g = computed;
+        // Determine chapter mode
+        let usedMode = mode;
+        let chapterGender = null;
+
+        if (mode === "chapter") {
+          if (forceGender === "male" || forceGender === "female") chapterGender = forceGender;
+          else if (primaryCharacter && characters[primaryCharacter]) {
+            const g = String(characters[primaryCharacter].gender || "").toLowerCase();
+            if (g === "female" || g === "male") chapterGender = g;
+          }
+          if (!chapterGender) usedMode = "paragraph";
+        }
+
+        const blocks = getTextBlocks(root);
+        let lastGender = null;
+        let carryLeft = 0;
+        let pronounEdits = 0;
+
+        for (const b of blocks) {
+          const bt = (b.innerText || "").trim();
+          if (!bt) continue;
+
+          if (isSceneBreak(bt)) {
+            lastGender = null;
+            carryLeft = 0;
+            lastActorGender = null;
+            lastActorTTL = 0;
+            continue;
+          }
+
+          // anchored fixes
+          if (U.anchoredFixes) {
+            pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
+          }
+
+          // gender selection
+          let g = null;
+          let hadDirectMatch = false;
+
+          if (usedMode === "chapter") {
+            g = chapterGender;
             hadDirectMatch = true;
-
-            if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
-              lastActorGender = computed;
-              lastActorTTL = 2;
-            }
           } else {
-            if (startsWithPronoun(bt)) g = lastGender || lastActorGender || null;
+            const computed = computeGenderForText(bt);
+            if (computed) {
+              g = computed;
+              hadDirectMatch = true;
 
-            if (!g && lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
-              g = lastGender;
-              carryLeft--;
-            }
+              if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
+                lastActorGender = computed;
+                lastActorTTL = 2;
+              }
+            } else {
+              if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
+                g = lastGender;
+                carryLeft--;
+              }
 
-            if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
-              if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
-                g = lastActorGender;
-                lastActorTTL--;
+              if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
+                if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
+                  g = lastActorGender;
+                  lastActorTTL--;
+                }
               }
             }
           }
+
+          if (g) {
+            const dir = (g === "female") ? "toFemale" : "toMale";
+
+            let doFull = true;
+            if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
+
+            if (doFull) {
+              pronounEdits += replaceInTextNodes(b, (txt) => replacePronounsSmart(txt, dir));
+            }
+
+            if (usedMode !== "chapter" && hadDirectMatch) {
+              lastGender = g;
+              carryLeft = carryParagraphs;
+            }
+          }
         }
 
-        if (g) {
-          const dir = (g === "female") ? "toFemale" : "toMale";
+        // Prevent the "0 overwrite" problem:
+        // - If this run made edits: record + show them.
+        // - If this run made 0 edits: keep last non-zero changed for this chapter (likely a self-trigger rerun).
+        const st = loadChapterState();
+        const prev = getChapterLastChanged(st, chapterId);
 
-          let doFull = true;
-          if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
-
-          if (doFull) {
-            pronounEdits += replaceInTextNodes(b, (txt) => replacePronounsSmart(txt, dir));
-          }
-
-          if (usedMode !== "chapter" && hadDirectMatch) {
-            lastGender = g;
-            carryLeft = carryParagraphs;
-          }
+        if (pronounEdits > 0) {
+          setChapterLastChanged(st, chapterId, pronounEdits);
+          ui.setChanged(pronounEdits);
+        } else if (prev > 0) {
+          // keep previous
+          ui.setChanged(prev);
+        } else {
+          ui.setChanged(0);
         }
+
+        saveChapterState(st);
+
+      } finally {
+        running = false;
+        lastRunAt = Date.now();
       }
-
-      // Persist
-      const st2 = loadChapterState();
-      st2[compositeSig] = { changed: pronounEdits, ts: Date.now() };
-      saveChapterState(st2);
-
-      ui.setChanged(pronounEdits);
     }
 
-    // Initial run attempts
+    // Initial run
     run();
 
-    // Mobile boot: retry for the first ~8 seconds until content becomes ready
+    // Mobile boot retry window (helps avoid "needs refresh")
     const bootStart = Date.now();
     const bootTimer = setInterval(() => {
       if (processedOnce) { clearInterval(bootTimer); return; }
@@ -1195,21 +1226,21 @@
       run();
     }, 250);
 
-    // Mutation observer debounce
+    // Mutation observer debounce + self-cooldown handled inside run()
     let timer = null;
     const obs = new MutationObserver(() => {
       if (!ui.isEnabled()) return;
       if (timer) return;
       timer = setTimeout(() => { timer = null; run(); }, 220);
     });
-    obs.observe(document.body, { childList: true, subtree: true });
+    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
 
     // SPA navigation hooks
     installNavHooks(() => {
       localStorage.setItem(UI_KEY_MIN, "1");
       ui.setMinimized(true);
       lastSigForSkip = "";
-      processedOnce = true; // after nav, assume content exists soon; run via observer/boot
+      processedOnce = false; // allow boot logic after nav
       run();
     });
   })();
