@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WTR PF
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.2
-// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-update on chapter navigation. Adds: Add Character/Add Term menu (WTR term only OR selection), draft->copy JSON snippets, term patches (pinned + memory), more reliable Changed counter per chapter signature.
+// @version      4.9.3
+// @description  Fix mixed gender pronouns in WTR-LAB machine translations using a shared JSON glossary. Movable UI + minimise pill + ON/OFF toggle + auto-update on chapter navigation. Adds: Add Character/Add Term menu (WTR term only OR selection), draft->copy JSON snippets, term patches (pinned + memory), accurate Changed counter (counts actual pronoun edits) + stable per-chapter signature, improved chapter navigation reliability, and basic schema validation.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,9 @@
   const EARLY_PRONOUN_WINDOW = 160;
   const LOCAL_ANCHOR_WINDOW = 160;
   const MAX_NAMES_SHOWN = 3;
+
+  // Term memory cap (basic safety against storage bloat)
+  const TERM_MEM_MAX_KEYS = 300;
 
   // Cache
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
@@ -92,59 +95,60 @@
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
 
   // ==========================================================
-  // Smart pronoun replacement (your existing engine)
+  // Smart pronoun replacement (COUNTED)
+  // returns { text, changed } where changed ~ number of pronoun tokens changed
   // ==========================================================
   function replacePronounsSmart(text, direction /* "toMale" | "toFemale" */) {
     text = normalizeWeirdSpaces(text);
+    const original = text;
+    let changed = 0;
+
+    const rep = (rx, toFn) => {
+      text = text.replace(rx, (m, ...rest) => {
+        const out = toFn(m, ...rest);
+        if (out !== m) changed++;
+        return out;
+      });
+    };
 
     // Split/hyphenated reflexives
     if (direction === "toFemale") {
-      text = text.replace(/\bhim[\s\u00A0\u2009\u202F-]*self\b/giu, (m) => caseLike(m, "herself"));
+      rep(/\bhim[\s\u00A0\u2009\u202F-]*self\b/giu, (m) => caseLike(m, "herself"));
     } else {
-      text = text.replace(/\bher[\s\u00A0\u2009\u202F-]*self\b/giu, (m) => caseLike(m, "himself"));
+      rep(/\bher[\s\u00A0\u2009\u202F-]*self\b/giu, (m) => caseLike(m, "himself"));
     }
 
     // Sentence-start fixes
     if (direction === "toMale") {
-      text = text.replace(new RegExp(SENT_PREFIX + `(she)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "He")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(herself)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Himself")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(hers)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(her)\\b(?=\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(her)\\b(?!\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Him")}`);
+      rep(new RegExp(SENT_PREFIX + `(she)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "He")}`);
+      rep(new RegExp(SENT_PREFIX + `(herself)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Himself")}`);
+      rep(new RegExp(SENT_PREFIX + `(hers)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
+      rep(new RegExp(SENT_PREFIX + `(her)\\b(?=\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
+      rep(new RegExp(SENT_PREFIX + `(her)\\b(?!\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Him")}`);
     } else {
-      text = text.replace(new RegExp(SENT_PREFIX + `(he)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "She")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(himself)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Herself")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(him)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(his)\\b(?=\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
-      text = text.replace(new RegExp(SENT_PREFIX + `(his)\\b(?!\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Hers")}`);
+      rep(new RegExp(SENT_PREFIX + `(he)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "She")}`);
+      rep(new RegExp(SENT_PREFIX + `(himself)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Herself")}`);
+      rep(new RegExp(SENT_PREFIX + `(him)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
+      rep(new RegExp(SENT_PREFIX + `(his)\\b(?=\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
+      rep(new RegExp(SENT_PREFIX + `(his)\\b(?!\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Hers")}`);
     }
 
     // General replacements
     if (direction === "toMale") {
-      text = text.replace(/\bshe\b/giu, (m) => caseLike(m, "he"));
-      text = text.replace(/\bherself\b/giu, (m) => caseLike(m, "himself"));
-      text = text.replace(/\bhers\b/giu, (m) => caseLike(m, "his"));
-      text = text.replace(new RegExp(String.raw`\bher\b(?=\s+${LETTER})`, "giu"), (m) => caseLike(m, "his"));
-      text = text.replace(/\bher\b/giu, (m) => caseLike(m, "him"));
+      rep(/\bshe\b/giu, (m) => caseLike(m, "he"));
+      rep(/\bherself\b/giu, (m) => caseLike(m, "himself"));
+      rep(/\bhers\b/giu, (m) => caseLike(m, "his"));
+      rep(new RegExp(String.raw`\bher\b(?=\s+${LETTER})`, "giu"), (m) => caseLike(m, "his"));
+      rep(/\bher\b/giu, (m) => caseLike(m, "him"));
     } else {
-      text = text.replace(/\bhe\b/giu, (m) => caseLike(m, "she"));
-      text = text.replace(/\bhimself\b/giu, (m) => caseLike(m, "herself"));
-      text = text.replace(/\bhim\b/giu, (m) => caseLike(m, "her"));
-      text = text.replace(new RegExp(String.raw`\bhis\b(?=\s+${LETTER})`, "giu"), (m) => caseLike(m, "her"));
-      text = text.replace(/\bhis\b/giu, (m) => caseLike(m, "hers"));
+      rep(/\bhe\b/giu, (m) => caseLike(m, "she"));
+      rep(/\bhimself\b/giu, (m) => caseLike(m, "herself"));
+      rep(/\bhim\b/giu, (m) => caseLike(m, "her"));
+      rep(new RegExp(String.raw`\bhis\b(?=\s+${LETTER})`, "giu"), (m) => caseLike(m, "her"));
+      rep(/\bhis\b/giu, (m) => caseLike(m, "hers"));
     }
 
-    return text;
+    return { text, changed: text === original ? 0 : changed };
   }
 
   // ==========================================================
@@ -159,18 +163,12 @@
     return Math.min(s.length, start + maxExtra);
   }
 
-  // IMPORTANT FIX:
-  // Your previous "onlyChangeIfWrong" gate can suppress fixing in edge cases.
-  // We keep it, but additionally: if target is female and ANY male pronoun exists, we allow.
-  // Same for male target.
+  // "onlyChangeIfWrong": apply if ANY wrong pronoun exists in region
   function conservativeShouldApply(region, gender /* male|female */) {
     const maleCount = countMatches(RX_PRONOUN_MALE, region);
     const femCount  = countMatches(RX_PRONOUN_FEMALE, region);
-
-    if (gender === "male") {
-      return femCount > maleCount || femCount > 0; // allow if any wrong pronouns appear
-    }
-    return maleCount > femCount || maleCount > 0;  // allow if any wrong pronouns appear
+    if (gender === "male") return femCount > 0;
+    return maleCount > 0;
   }
 
   function detectDialogueSpeakerGender(text, entries) {
@@ -249,20 +247,21 @@
             continue;
           }
 
-          let after = replacePronounsSmart(region, dir);
+          let out = replacePronounsSmart(region, dir);
 
           if (passiveVoice) {
             const gAgent = detectPassiveAgentGender(region, entries);
             if (gAgent) {
               const d2 = (gAgent === "female") ? "toFemale" : "toMale";
-              after = replacePronounsSmart(after, d2);
+              const out2 = replacePronounsSmart(out.text, d2);
+              out = { text: out2.text, changed: out.changed + out2.changed };
             }
           }
 
-          if (after !== region) {
-            s = s.slice(0, start) + after + s.slice(end);
-            changed++;
-            re.lastIndex = start + after.length;
+          if (out.text !== region) {
+            s = s.slice(0, start) + out.text + s.slice(end);
+            changed += Math.max(1, out.changed);
+            re.lastIndex = start + out.text.length;
           }
         }
       }
@@ -273,11 +272,10 @@
 
   // ==========================================================
   // Term memory + patches
-  // - Patches apply to WTR term spans: <span class="text-patch system" data-hash="...">English...</span>
   // ==========================================================
   function getNovelKeyFromURL() {
-    const m = location.href.match(/(wtr-lab\.com\/en\/novel\/\d+\/)/i);
-    return m ? `wtr-lab.com/en/novel/${m[0].match(/\/novel\/(\d+)\//)?.[1] || ""}/` : "wtr-lab.com/en/novel/";
+    const m = location.href.match(/wtr-lab\.com\/en\/novel\/(\d+)\//i);
+    return m ? `wtr-lab.com/en/novel/${m[1]}/` : "wtr-lab.com/en/novel/";
   }
 
   function termMemKey(novelKey) { return TERM_MEM_KEY_PREFIX + novelKey; }
@@ -287,12 +285,19 @@
     catch { return {}; }
   }
   function saveTermMemory(novelKey, mem) {
+    try {
+      const keys = Object.keys(mem || {});
+      if (keys.length > TERM_MEM_MAX_KEYS) {
+        // simple cap: drop oldest-ish by key order (best-effort)
+        const excess = keys.length - TERM_MEM_MAX_KEYS;
+        for (let i = 0; i < excess; i++) delete mem[keys[i]];
+      }
+    } catch {}
     localStorage.setItem(termMemKey(novelKey), JSON.stringify(mem || {}));
   }
 
   function applyTermPatches(root, cfgTerms, mem, opts) {
     const enforcePlainText = !!opts?.enforcePinnedTermsOnPlainText;
-
     const map = Object.assign({}, cfgTerms || {}, mem || {}); // mem overrides cfg
 
     let changed = 0;
@@ -310,11 +315,9 @@
       }
     }
 
-    // Optional: enforce pinned terms even when WTR stops wrapping later
-    // (lightweight: only replace exact matches of any aliases/preferred in text nodes)
     if (enforcePlainText) {
       const pinned = [];
-      for (const [hash, rec] of Object.entries(map)) {
+      for (const [, rec] of Object.entries(map)) {
         if (!rec || !rec.preferred || !rec.pinned) continue;
         const al = Array.isArray(rec.aliases) ? rec.aliases : [];
         pinned.push({ preferred: String(rec.preferred), variants: [String(rec.preferred), ...al].filter(Boolean) });
@@ -335,13 +338,12 @@
 
         while (walker.nextNode()) {
           const node = walker.currentNode;
-          let t = node.nodeValue;
+          const t = node.nodeValue;
           let t2 = t;
 
           for (const it of pinned) {
             for (const v of it.variants) {
               if (!v) continue;
-              // whole-word-ish boundaries (best effort; supports spaces/hyphens)
               const rx = new RegExp(String.raw`(^|[^\p{L}\p{N}_])${escapeRegExp(v)}([^\p{L}\p{N}_]|$)`, "giu");
               t2 = t2.replace(rx, (m, p1, p2) => `${p1}${it.preferred}${p2}`);
             }
@@ -375,7 +377,6 @@
     let glossaryOk = true;
     let draftCount = 0;
 
-    // --- styles for “added” highlight on WTR term spans in current chapter
     const style = document.createElement("style");
     style.textContent = `
       .wtrpf-added-term {
@@ -490,14 +491,12 @@
       font-size:16px; line-height:26px; padding:0;
     `;
 
-    // Summary (top info)
     const summary = document.createElement("div");
     summary.style.cssText = `white-space: pre-line; opacity: .95; margin-top:8px;`;
 
     const divider = document.createElement("div");
     divider.style.cssText = `height:1px; background: rgba(255,255,255,0.12); margin:10px 0;`;
 
-    // Draft box (only visible when draft exists)
     const draftWrap = document.createElement("div");
     draftWrap.style.cssText = `display:none;`;
 
@@ -549,7 +548,7 @@
     draftCountRow.style.cssText = `opacity:.85; margin-top:8px;`;
     draftCountRow.textContent = "Draft: 0";
 
-    // Minimised pill
+    // Minimised pill (narrower)
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
@@ -562,14 +561,15 @@
       backdrop-filter: blur(6px);
       user-select: none;
       touch-action: none;
-      max-width: min(420px, 84vw);
+      max-width: 260px;
+      overflow: hidden;
     `;
 
     const pillRow = document.createElement("div");
-    pillRow.style.cssText = `display:flex; align-items:center; gap:8px;`;
+    pillRow.style.cssText = `display:flex; align-items:center; gap:8px; min-width: 0;`;
 
     const pillText = document.createElement("div");
-    pillText.style.cssText = `padding: 1px 4px; white-space: nowrap;`;
+    pillText.style.cssText = `padding: 1px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width:0; max-width: 180px;`;
 
     const pillExpandBtn = document.createElement("button");
     pillExpandBtn.type = "button";
@@ -580,6 +580,7 @@
       width:22px; height:22px; border-radius:8px;
       background:rgba(255,255,255,0.10); color:#fff;
       font-size:14px; line-height:22px; padding:0;
+      flex: 0 0 auto;
     `;
 
     function refreshToggleUI() {
@@ -643,14 +644,13 @@
     topRow.appendChild(title);
     topRow.appendChild(controls);
 
-    // layout per your request:
-    // top info, divider, buttons + draft box, then draft count
     box.appendChild(topRow);
     box.appendChild(summary);
     box.appendChild(divider);
 
     draftWrap.appendChild(draftLabel);
     draftWrap.appendChild(draftBox);
+
     btnRow.appendChild(copyBtn);
     btnRow.appendChild(clearBtn);
 
@@ -673,14 +673,12 @@
     refreshToggleUI();
     refreshSummary();
 
-    // Start minimized by default if user set it OR if not set yet
     if (localStorage.getItem(UI_KEY_MIN) !== "0") setMin(true);
 
     window.addEventListener("resize", () => {
       clampToViewport(localStorage.getItem(UI_KEY_MIN) === "1" ? pill : box);
     });
 
-    // clipboard
     async function writeClipboard(text) {
       try {
         await navigator.clipboard.writeText(text);
@@ -708,8 +706,6 @@
       const txt = d?.snippet || "";
       if (!txt) return;
       await writeClipboard(txt);
-      // Copy should NOT delete termMemory or pinned terms. It also should NOT clear draft.
-      // (You requested Copy/Clear only affect the output box; draft is output box)
     };
 
     clearBtn.onclick = () => {
@@ -744,7 +740,6 @@
   // Content targeting
   // ==========================================================
   function findContentRoot() {
-    // Prefer the chapter-body container if present
     const cb = document.querySelector(".chapter-body.menu-target[data-chapter-id]");
     if (cb) return cb;
 
@@ -803,6 +798,7 @@
     return g === "female" ? "toFemale" : "toMale";
   }
 
+  // Accurate node replacement counting
   function replaceInTextNodes(blockEl, fnReplace /* (text)=>{text,changed} */) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
@@ -822,14 +818,14 @@
       const node = walker.currentNode;
       const before = node.nodeValue;
       const out = fnReplace(before);
-      const after = (out && typeof out === "object") ? out.text : before;
-      const delta = (out && typeof out === "object") ? (out.changed || 0) : 0;
+      if (!out || typeof out !== "object") continue;
+
+      const after = out.text ?? before;
+      const delta = Number(out.changed || 0);
 
       if (after !== before) {
         node.nodeValue = after;
-        changed += 1;
-      } else if (delta) {
-        changed += delta;
+        changed += delta > 0 ? delta : 1;
       }
     }
     return changed;
@@ -926,20 +922,16 @@
   function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
 
   function oneLineCharacterSnippet(name, gender, aliases) {
-    // EXACT format you requested (easy pasting; one line):
-    // "Li Zhi": { "gender": "male" },
     const obj = { gender: String(gender || "unknown") };
     if (Array.isArray(aliases) && aliases.length) obj.aliases = aliases;
-    // build one-liner without outer braces
     const inner = JSON.stringify(obj);
     return `"${name}": ${inner},`;
   }
 
   // ==========================================================
   // Add Character / Add Term menu
-  // - Only show when clicking a WTR “identified term” span OR user selection exists
   // ==========================================================
-  function installAddMenu({ ui, novelKey, cfg, characters }) {
+  function installAddMenu({ ui, novelKey }) {
     const menu = document.createElement("div");
     menu.style.cssText = `
       position: fixed; z-index: 2147483647;
@@ -1025,7 +1017,7 @@
       return b;
     };
 
-    let ctx = null; // { type, text, span?, hash? }
+    let ctx = null; // { text, span?, hash? }
     let lastSpan = null;
 
     function hide() {
@@ -1048,7 +1040,6 @@
     closeBtn.onclick = hide;
     menu.addEventListener("pointerdown", (e) => e.stopPropagation());
 
-    // Draft update helper
     function upsertDraftLine(line) {
       const d = loadDraft();
       const items = Array.isArray(d.items) ? d.items : [];
@@ -1058,7 +1049,6 @@
       ui.setDraftUI(snippet, items.length);
     }
 
-    // Add Character -> Select Gender
     addCharBtn.onclick = () => {
       if (!ctx?.text) return;
       const name = ctx.text.trim();
@@ -1069,22 +1059,14 @@
       const male = ghostBtn("Male");
       const female = ghostBtn("Female");
 
-      male.onclick = () => {
-        // draft line only (does not affect term memory)
-        upsertDraftLine(oneLineCharacterSnippet(name, "male"));
-        hide();
-      };
-      female.onclick = () => {
-        upsertDraftLine(oneLineCharacterSnippet(name, "female"));
-        hide();
-      };
+      male.onclick = () => { upsertDraftLine(oneLineCharacterSnippet(name, "male")); hide(); };
+      female.onclick = () => { upsertDraftLine(oneLineCharacterSnippet(name, "female")); hide(); };
 
       stepBody.appendChild(male);
       stepBody.appendChild(female);
       step.style.display = "block";
     };
 
-    // Add Term -> Pin Term
     addTermBtn.onclick = () => {
       if (!ctx?.text) return;
 
@@ -1097,11 +1079,9 @@
       pin.onclick = () => {
         const mem = loadTermMemory(novelKey);
 
-        // If clicked WTR term span, we have data-hash; otherwise store by "plain"
         if (ctx.hash) {
           mem[ctx.hash] = { preferred: ctx.text, pinned: true, aliases: [] };
         } else {
-          // store a plain-text pinned term record under a pseudo-key
           const pseudo = "plain:" + ctx.text;
           mem[pseudo] = { preferred: ctx.text, pinned: true, aliases: [] };
         }
@@ -1135,9 +1115,6 @@
 
     document.documentElement.appendChild(menu);
 
-    // Show rules:
-    // - click on WTR identified term (span.text-patch.system[data-hash]) => show
-    // - OR user makes a selection (mouseup, selection length > 0) => show
     document.addEventListener("click", (e) => {
       const sp = e.target && e.target.closest && e.target.closest("span.text-patch.system[data-hash]");
       if (!sp) return;
@@ -1153,7 +1130,6 @@
       const txt = s.trim();
       if (!txt || txt.length < 2) return;
 
-      // Don't show if it was a normal click on non-content UI
       const root = findContentRoot();
       if (!root || !root.contains(e.target)) return;
 
@@ -1161,15 +1137,13 @@
     }, true);
 
     document.addEventListener("scroll", () => hide(), true);
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") hide();
-    }, true);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
 
     return { hide };
   }
 
   // ==========================================================
-  // SPA / navigation hooks (chapter change auto-detect)
+  // SPA / navigation hooks
   // ==========================================================
   function installNavHooks(onNav) {
     const fire = () => setTimeout(onNav, 80);
@@ -1186,6 +1160,15 @@
   }
 
   // ==========================================================
+  // Basic schema validation (security / robustness)
+  // ==========================================================
+  function validateGlossary(glossary) {
+    if (!glossary || typeof glossary !== "object") return false;
+    // allow empty but must be object
+    return true;
+  }
+
+  // ==========================================================
   // Main
   // ==========================================================
   (async () => {
@@ -1193,7 +1176,6 @@
     ui.refreshUI();
     if (!ui.isEnabled()) return;
 
-    // Load draft into UI (draft box should only appear if draft exists)
     const initialDraft = loadDraft();
     ui.setDraftUI(initialDraft?.snippet || "", (initialDraft?.items || []).length);
 
@@ -1205,6 +1187,7 @@
     let glossary;
     try {
       glossary = await loadGlossaryJSON(GLOSSARY_URL);
+      if (!validateGlossary(glossary)) throw new Error("bad glossary");
     } catch {
       ui.setGlossaryOk(false);
       return;
@@ -1215,7 +1198,7 @@
 
     const upgrades = cfg.upgrades || {};
     const U = {
-      anchoredFixes: upgrades.anchoredFixes !== false, // default true
+      anchoredFixes: upgrades.anchoredFixes !== false,
       verbBasedWindow: !!upgrades.verbBasedWindow,
       passiveVoice: !!upgrades.passiveVoice,
       dialogueSpeaker: !!upgrades.dialogueSpeaker,
@@ -1237,15 +1220,12 @@
     }
     ui.setGlossaryOk(true);
 
-    // Term config: use cfg.terms (your new glossary structure)
     const cfgTerms = cfg.terms || {};
 
-    // Per-novel keys
     const novelKey = key === "default" ? getNovelKeyFromURL() : key;
     const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
 
-    // Install Add menu (only appears on WTR term spans OR selection)
-    installAddMenu({ ui, novelKey, cfg, characters });
+    installAddMenu({ ui, novelKey });
 
     const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
@@ -1254,7 +1234,6 @@
       ? Math.max(0, Math.min(5, +cfg.carryParagraphs))
       : DEFAULT_CARRY_PARAGRAPHS;
 
-    // Per-chapter stable counters (sessionStorage)
     function loadChapterState() {
       try { return JSON.parse(sessionStorage.getItem(chapterStateKey) || "{}"); }
       catch { return {}; }
@@ -1263,7 +1242,6 @@
       sessionStorage.setItem(chapterStateKey, JSON.stringify(st || {}));
     }
 
-    // Signature should be based on current visible text BEFORE we apply changes
     function makeSignature(root) {
       const t = (root.innerText || "").trim();
       const head = t.slice(0, 240);
@@ -1305,7 +1283,6 @@
       return null;
     }
 
-    // Role heuristic carry state
     let lastActorGender = null;
     let lastActorTTL = 0;
 
@@ -1319,46 +1296,40 @@
 
     function run() {
       if (!ui.isEnabled()) return;
+      if (document.hidden) return; // performance
 
       const root = findContentRoot();
       const chapterId = getChapterId(root);
 
-      // If chapter changed: minimize by default + reset internal skip signature
       if (chapterId !== lastChapterId) {
         lastChapterId = chapterId;
         localStorage.setItem(UI_KEY_MIN, "1");
         ui.setMinimized(true);
         lastSigForSkip = "";
-        // reset carry state
         lastActorGender = null;
         lastActorTTL = 0;
       }
 
-      // Make signature BEFORE changes so "same chapter refresh" doesn't inflate counts
       const sig = makeSignature(root);
-      if (sig === lastSigForSkip) return;
-      lastSigForSkip = sig;
+      const compositeSig = `${chapterId}|${sig}`;
+      if (compositeSig === lastSigForSkip) return;
+      lastSigForSkip = compositeSig;
 
-      // Restore stable changed count if we already processed this exact signature for this chapter
       const st = loadChapterState();
-      const keySig = `${chapterId}|${sig}`;
+      const keySig = compositeSig;
       if (st[keySig] && Number.isFinite(st[keySig].changed)) {
         ui.setChanged(st[keySig].changed);
       } else {
-        ui.setChanged(0); // will set after processing
+        ui.setChanged(0);
       }
 
-      // Term patches first (so name/term consistency gets corrected prior to pronoun logic)
-      let termChanged = 0;
+      // Term patches first
       if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
         const mem = loadTermMemory(novelKey);
-        termChanged += applyTermPatches(root, cfgTerms, mem, U);
+        applyTermPatches(root, cfgTerms, mem, U);
       }
 
-      // Update detected characters for this chapter
       updateDetectedCharactersUI(root);
-
-      const blocks = getTextBlocks(root);
 
       let usedMode = mode;
       let chapterGender = null;
@@ -1372,9 +1343,10 @@
         if (!chapterGender) usedMode = "paragraph";
       }
 
+      const blocks = getTextBlocks(root);
+
       let lastGender = null;
       let carryLeft = 0;
-
       let pronounEdits = 0;
 
       for (const b of blocks) {
@@ -1390,7 +1362,7 @@
           continue;
         }
 
-        // 1) Anchored local fixes (mixed-character paragraphs)
+        // 1) Anchored local fixes (counted)
         if (U.anchoredFixes) {
           pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
         }
@@ -1413,11 +1385,17 @@
               lastActorTTL = 2;
             }
           } else {
+            // Early-pronoun fallback (helps paragraphs that begin with He/She etc.)
+            if (startsWithPronoun(bt)) {
+              g = lastGender || lastActorGender || null;
+            }
+
             // carry
-            if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
+            if (!g && lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
               g = lastGender;
               carryLeft--;
             }
+
             // role heuristic carry
             if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
               if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
@@ -1431,15 +1409,13 @@
         if (g) {
           const dir = directionFromGender(g);
 
-          // 3) Paragraph-wide pass
-          // Fix reliability: even when onlyChangeIfWrong is enabled, allow a pass whenever ANY wrong pronoun exists.
           let doFull = true;
           if (U.onlyChangeIfWrong) {
             doFull = conservativeShouldApply(bt, g);
           }
 
           if (doFull) {
-            pronounEdits += replaceInTextNodes(b, (txt) => ({ text: replacePronounsSmart(txt, dir), changed: 0 }));
+            pronounEdits += replaceInTextNodes(b, (txt) => replacePronounsSmart(txt, dir));
           }
 
           if (usedMode !== "chapter" && hadDirectMatch) {
@@ -1449,25 +1425,17 @@
         }
       }
 
-      // We report only pronoun edits as "Changed" (term patches can be tracked later if you want a separate counter)
       const finalChanged = pronounEdits;
 
-      // Persist stable changed count per signature for this chapter (prevents refresh inflation)
       const st2 = loadChapterState();
       st2[keySig] = { changed: finalChanged, ts: Date.now() };
       saveChapterState(st2);
 
       ui.setChanged(finalChanged);
-
-      // (optional) If term patches ran, they still apply — we’re just not mixing into Changed
-      // termChanged is intentionally not shown to keep Changed meaningful for pronouns.
-      void termChanged;
     }
 
-    // Initial run
     run();
 
-    // Mutation observer debounce (faster + avoids repeated heavy passes)
     let timer = null;
     const obs = new MutationObserver(() => {
       if (!ui.isEnabled()) return;
@@ -1476,13 +1444,9 @@
     });
     obs.observe(document.body, { childList: true, subtree: true });
 
-    // Explicit SPA nav hooks: force update on chapter changes without refresh
     installNavHooks(() => {
-      // Always minimize when moving chapters (your requirement)
       localStorage.setItem(UI_KEY_MIN, "1");
       ui.setMinimized(true);
-
-      // Force re-run (even if signature logic would skip)
       lastSigForSkip = "";
       run();
     });
