@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         WTR PF
+// @name         WTR PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
 // @version      4.9.6
 // @description  WTR-LAB Pronouns Fix — keeps v4.9.4 stable base + adds: URL chapter fallback, safe Next-button hook + post-nav sweep (no refresh), smaller closable add popup, onboarding ?, New Character (JSON) toggle.
