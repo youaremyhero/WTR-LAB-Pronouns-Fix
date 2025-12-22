@@ -45,6 +45,9 @@
 
   const NAV_SWEEP_MS = 9000;
   const NAV_POLL_MS  = 250;
+  const CHAPTER_MONITOR_MS = 700;      // watchdog interval
+  const CHAPTER_MONITOR_WARMUP_MS = 12000; // optional: run more often right after load/nav
+
 
   const LONGPRESS_MS = 420;
 
@@ -1698,6 +1701,38 @@
       }
     }
 
+          function startChapterMonitor() {
+        let startedAt = Date.now();
+      
+        setInterval(() => {
+          if (!ui.isEnabled()) return;
+          if (document.hidden) return;
+          if (running) return;
+      
+          const root = findContentRoot();
+          if (!contentReady(root)) return;
+      
+          const cid = getChapterId(root);
+          const sigNow = chapterSignature(root);
+          if (!cid || !sigNow) return;
+      
+          const applied = getAppliedSig(novelKey, cid);
+      
+          // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
+          if (!applied || sigNow !== applied) {
+            run({ forceFull: true });
+            return;
+          }
+      
+          // Optional: during the first few seconds after load/nav, also do a light pass
+          // to catch late paragraph insertions that don't change signature enough.
+          if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
+            run({ forceFull: false });
+          }
+        }, CHAPTER_MONITOR_MS);
+      }
+
+
     // ==========================================================
     // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
     // ==========================================================
@@ -1773,6 +1808,9 @@
 
     // Initial run
     run({ forceFull: true });
+
+    // Start watchdog
+    startChapterMonitor();
 
     // Light observer for late paragraph insertions on the initial root only (debounced)
     const root0 = findContentRoot();
