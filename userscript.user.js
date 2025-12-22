@@ -50,6 +50,10 @@
 
   const CHAPTER_OBS_DEBOUNCE_MS = 180;
 
+  // Post-render resilience (React re-render overwrite protection)
+  const POST_SWEEP_DELAYS = [150, 450, 900, 1600, 2600];
+  const APPLIED_SIG_KEY_PREFIX = "wtrpf_applied_sig_v1:"; // per novelKey
+
   // ==========================================================
   // Utilities
   // ==========================================================
@@ -118,6 +122,27 @@
     const tail = txt.slice(-220);
     return `${cid}|len:${txt.length}|h:${head}|t:${tail}`;
   }
+
+    function appliedSigKey(novelKey) {
+    return APPLIED_SIG_KEY_PREFIX + novelKey;
+  }
+  function loadAppliedSigMap(novelKey) {
+    try { return JSON.parse(sessionStorage.getItem(appliedSigKey(novelKey)) || "{}"); }
+    catch { return {}; }
+  }
+  function saveAppliedSigMap(novelKey, map) {
+    sessionStorage.setItem(appliedSigKey(novelKey), JSON.stringify(map || {}));
+  }
+  function getAppliedSig(novelKey, chapterId) {
+    const m = loadAppliedSigMap(novelKey);
+    return String(m?.[chapterId] || "");
+  }
+  function setAppliedSig(novelKey, chapterId, sig) {
+    const m = loadAppliedSigMap(novelKey);
+    m[chapterId] = String(sig || "");
+    saveAppliedSigMap(novelKey, m);
+  }
+
 
   // ==========================================================
   // Pronoun replacement
@@ -1267,32 +1292,43 @@
     document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
   }
 
-  function installChapterBodyObserver(scheduleSweep) {
-    let lastCb = null;
-    let debounce = null;
+      function installChapterBodyObserver(scheduleSweep) {
+        let lastCb = null;
+        let debounce = null;
+        let mo = null;
+      
+        function attach(cb) {
+          if (!cb || cb === lastCb) return;
+      
+          // Disconnect previous observer to avoid buildup
+          if (mo) {
+            try { mo.disconnect(); } catch {}
+            mo = null;
+          }
+      
+          lastCb = cb;
+      
+          mo = new MutationObserver(() => {
+            if (debounce) return;
+            debounce = setTimeout(() => {
+              debounce = null;
+              scheduleSweep("chapter-body-mutation");
+            }, CHAPTER_OBS_DEBOUNCE_MS);
+          });
+      
+          mo.observe(cb, { childList: true, subtree: true });
+        }
+      
+        const t = setInterval(() => {
+          const cb = document.querySelector(".chapter-body");
+          if (cb && cb !== lastCb) attach(cb);
+        }, 800);
+      
+        setTimeout(() => {
+          clearInterval(t);
+        }, 15000);
+      }
 
-    function attach(cb) {
-      if (!cb || cb === lastCb) return;
-      lastCb = cb;
-
-      const mo = new MutationObserver(() => {
-        if (debounce) return;
-        debounce = setTimeout(() => {
-          debounce = null;
-          scheduleSweep("chapter-body-mutation");
-        }, CHAPTER_OBS_DEBOUNCE_MS);
-      });
-
-      mo.observe(cb, { childList: true, subtree: true, characterData: true });
-    }
-
-    const t = setInterval(() => {
-      const cb = document.querySelector(".chapter-body");
-      if (cb && cb !== lastCb) attach(cb);
-    }, 800);
-
-    setTimeout(() => clearInterval(t), 15000);
-  }
 
   // ==========================================================
   // Main
@@ -1353,6 +1389,27 @@
       ? Math.max(0, Math.min(5, +cfg.carryParagraphs))
       : DEFAULT_CARRY_PARAGRAPHS;
 
+    function installChapterBodyReplaceWatcher(onNav) {
+      const mo = new MutationObserver((muts) => {
+        for (const m of muts) {
+          if (!m.addedNodes || !m.addedNodes.length) continue;
+          for (const n of m.addedNodes) {
+            if (!(n instanceof Element)) continue;
+    
+            // If the new subtree contains chapter-body, trigger a sweep.
+            if (n.matches?.(".chapter-body") || n.querySelector?.(".chapter-body")) {
+              onNav("chapter-body-replaced");
+              return;
+            }
+          }
+        }
+      });
+    
+      // Observe only direct structural changes; NOT characterData.
+      mo.observe(document.body, { childList: true, subtree: true });
+    }
+
+    
     function loadChapterState() {
       try { return JSON.parse(sessionStorage.getItem(chapterStateKey) || "{}"); }
       catch { return {}; }
@@ -1457,6 +1514,17 @@
           ui.setMinimized(true);
           lastActorGender = null;
           lastActorTTL = 0;
+
+          // If React reuses DOM nodes between chapters, clear old patch markers
+          // If React reuses DOM nodes between chapters, clear old patch markers
+            try {
+              if (root?.dataset) delete root.dataset.wtrpfPatchedChapter;
+              root?.querySelectorAll?.("[data-wtrpf-patched], [data-wtrpf-patched-chapter]").forEach(el => {
+                delete el.dataset.wtrpfPatched;
+                delete el.dataset.wtrpfPatchedChapter;
+              });
+            } catch {}
+
         }
 
         const st0 = loadChapterState();
@@ -1572,9 +1640,18 @@
           ui.setChanged(0);
         }
 
-        saveChapterState(st);
-        lastSig = sig;
-
+        // Record what the chapter looks like AFTER we apply changes.
+        // If React overwrites later, signature will diverge and we can re-apply.
+                 const sigAfter = chapterSignature(root);
+          if (sigAfter) {
+            setAppliedSig(novelKey, chapterId, sigAfter);
+            lastSig = sigAfter; // keep in sync with the DOM AFTER edits
+          } else {
+            lastSig = sig;
+          }
+          
+          saveChapterState(st);
+        
       } finally {
         running = false;
         lastRunAt = Date.now();
@@ -1584,52 +1661,65 @@
     // ==========================================================
     // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
     // ==========================================================
-    let navSweepTimer = null;
-
-    function stopNavSweep() {
-      if (navSweepTimer) clearInterval(navSweepTimer);
-      navSweepTimer = null;
-    }
-
-    function startNavSweep(reason = "nav") {
-      stopNavSweep();
-
-      const startAt = Date.now();
-      const baselineSig = lastSig;
-
-      let stableSig = "";
-      let stableCount = 0;
-      let forcedOnce = false;
-
-      navSweepTimer = setInterval(() => {
-        if (Date.now() - startAt > NAV_SWEEP_MS) {
+        let navSweepTimer = null;
+        
+        function stopNavSweep() {
+          if (navSweepTimer) clearInterval(navSweepTimer);
+          navSweepTimer = null;
+        }
+        
+        function startNavSweep(reason = "nav") {
           stopNavSweep();
-          return;
+        
+          const startAt = Date.now();
+          let firedSeries = false;
+        
+          navSweepTimer = setInterval(() => {
+            if (Date.now() - startAt > NAV_SWEEP_MS) {
+              stopNavSweep();
+              return;
+            }
+        
+            const root = findContentRoot();
+            if (!contentReady(root)) return;
+        
+            const chapterId = getChapterId(root);
+            const currentSig = chapterSignature(root);
+            if (!chapterId || !currentSig) return;
+        
+            // Kick off a post-render series ONCE when we first see ready content
+            if (!firedSeries) {
+              firedSeries = true;
+        
+              // Always minimise on nav
+              localStorage.setItem(UI_KEY_MIN, "1");
+              ui.setMinimized(true);
+        
+              // Run a staged sequence to survive late React overwrites
+                POST_SWEEP_DELAYS.forEach((ms, idx) => {
+                  setTimeout(() => {
+                    const r = findContentRoot();
+                    if (!contentReady(r)) return;
+                
+                    if (idx === 0) {
+                      run({ forceFull: true });
+                    } else {
+                      const cid = getChapterId(r);
+                      const sigNow = chapterSignature(r);
+                      const applied = getAppliedSig(novelKey, cid);
+                
+                      if (!applied || (sigNow && sigNow !== applied)) run({ forceFull: true });
+                      else run({ forceFull: false });
+                    }
+                
+                    if (idx === POST_SWEEP_DELAYS.length - 1) stopNavSweep();
+                  }, ms);
+                });
+
+            }
+          }, NAV_POLL_MS);
         }
 
-        const root = findContentRoot();
-        if (!contentReady(root)) return;
-
-        const sig = chapterSignature(root);
-        if (!sig) return;
-        if (sig === baselineSig) return;
-
-        if (sig === stableSig) stableCount++;
-        else { stableSig = sig; stableCount = 1; }
-
-        if (stableCount < 2) return;
-
-        if (!forcedOnce) {
-          forcedOnce = true;
-          localStorage.setItem(UI_KEY_MIN, "1");
-          ui.setMinimized(true);
-          run({ forceFull: true });   // ✅ cannot be skipped now
-        } else {
-          run({ forceFull: false });
-          stopNavSweep();
-        }
-      }, NAV_POLL_MS);
-    }
 
     // ==========================================================
     // Hooks (B)
@@ -1643,6 +1733,8 @@
     installNextButtonHook(onNav);
     installHistoryHooks(onNav);
     installChapterBodyObserver(onNav);
+    installChapterBodyReplaceWatcher(onNav);
+
 
     // Initial run
     run({ forceFull: true });
@@ -1659,7 +1751,8 @@
           run({ forceFull: false });
         }, 260);
       });
-      mo.observe(root0, { childList: true, subtree: true, characterData: true });
+      mo.observe(root0, { childList: true, subtree: true });
+
     }
   })();
 })();
