@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         WTR-LAB Pronouns Fix (WTR PF) — v4.9.8
+// @name         WTR-LAB Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
 // @version      4.9.8
 // @description  Stable v4.9.4 base + working Add popup (small + X + Male/Female only) + onboarding (?) + New Character (JSON) section + reliability upgrades A+B (ready-sweep + Next click hook) for Firefox Android Next navigation (no manual refresh). Avoids heavy/global observers that can hang page load.
