@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WTR-LAB Test
+// @name         WTR-LAB Load Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.8
-// @description  Stable v4.9.4 base + working Add popup (small + X + Male/Female only) + onboarding (?) + New Character (JSON) section + reliability upgrades A+B (ready-sweep + Next click hook) for Firefox Android Next navigation (no manual refresh). Avoids heavy/global observers that can hang page load.
+// @version      4.9.9
+// @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -27,33 +27,27 @@
   const LOCAL_ANCHOR_WINDOW = 160;
   const MAX_NAMES_SHOWN = 3;
 
-  // Term memory cap (basic storage safety)
   const TERM_MEM_MAX_KEYS = 300;
 
-  // Cache
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
   const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v1";
   const GLOSSARY_CACHE_TTL_MS = 10 * 60 * 1000;
 
-  // Persistent UI state
   const UI_KEY_MIN = "wtrpf_ui_min_v1";
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
   const UI_KEY_ON  = "wtrpf_enabled_v1";
 
-  // Draft + term memory
   const DRAFT_KEY = "wtrpf_draft_v1";
   const TERM_MEM_KEY_PREFIX = "wtrpf_term_mem_v1:";
   const CHAPTER_STATE_KEY_PREFIX = "wtrpf_chapter_state_v1:";
 
-  // Prevent "Changed" being overwritten by self-triggered reruns
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
-  // Navigation reliability (Firefox Android / Next button)
-  const NAV_SWEEP_MS = 9000;        // how long to keep checking after "Next"
+  const NAV_SWEEP_MS = 9000;
   const NAV_POLL_MS  = 250;
-  const LONGPRESS_MS = 420;         // long-press to open Add popup on WTR span
 
-  // Targeted observer debounce (chapter-body only)
+  const LONGPRESS_MS = 420;
+
   const CHAPTER_OBS_DEBOUNCE_MS = 180;
 
   // ==========================================================
@@ -110,19 +104,23 @@
     return m ? `chapter-${m[1]}` : "unknown";
   }
 
-  // Lightweight stable-ish signature of the current chapter content
+  function getChapterId(root) {
+    const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
+    const id = el?.getAttribute?.("data-chapter-id");
+    return id || getChapterFromURL();
+  }
+
   function chapterSignature(root) {
     if (!root) return "";
     const cid = getChapterId(root);
     const txt = normalizeWeirdSpaces((root.innerText || "").trim());
-    // take a small slice to detect content swaps
     const head = txt.slice(0, 220);
     const tail = txt.slice(-220);
     return `${cid}|len:${txt.length}|h:${head}|t:${tail}`;
   }
 
   // ==========================================================
-  // Smart pronoun replacement (COUNTED)
+  // Pronoun replacement
   // ==========================================================
   function replacePronounsSmart(text, direction) {
     text = normalizeWeirdSpaces(text);
@@ -182,7 +180,7 @@
   }
 
   // ==========================================================
-  // Anchored fixes
+  // Anchored fixes (kept from your base)
   // ==========================================================
   function getSentenceEndIndex(s, start, maxExtra = 320) {
     const limit = Math.min(s.length, start + maxExtra);
@@ -282,7 +280,7 @@
   }
 
   // ==========================================================
-  // Term memory + patches
+  // Term memory + patches (unchanged)
   // ==========================================================
   function getNovelKeyFromURL() {
     const m = location.href.match(/wtr-lab\.com\/en\/novel\/(\d+)\//i);
@@ -371,7 +369,201 @@
   }
 
   // ==========================================================
-  // UI
+  // Draft helpers
+  // ==========================================================
+  function loadDraft() {
+    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
+    catch { return { items: [], snippet: "" }; }
+  }
+  function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
+
+  function oneLineCharacterSnippet(name, gender, aliases) {
+    const obj = { gender: String(gender) };
+    if (Array.isArray(aliases) && aliases.length) obj.aliases = aliases;
+    const inner = JSON.stringify(obj);
+    return `"${name}": ${inner},`;
+  }
+
+  // ==========================================================
+  // Content targeting
+  // ==========================================================
+  function findContentRoot() {
+    const cb = document.querySelector(".chapter-body");
+    if (cb) return cb;
+
+    const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
+    if (likely) return likely;
+
+    const candidates = Array.from(document.querySelectorAll("article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"));
+    let best = null, bestScore = 0;
+    for (const el of candidates) {
+      const pCount = el.querySelectorAll("p").length;
+      const textLen = (el.innerText || "").trim().length;
+      const score = (pCount * 1200) + textLen;
+      if (score > bestScore && textLen > 300) { bestScore = score; best = el; }
+    }
+    return best || document.body;
+  }
+
+  const SKIP_CLOSEST = [
+    "header","nav","footer","aside","form",
+    "button","input","textarea","select",
+    "[role='navigation']",
+    ".breadcrumbs",".breadcrumb",".toolbar",".tools",".tool",
+    ".pagination",".pager",".share",".social",
+    ".menu",".navbar",".nav",".btn",".button"
+  ].join(",");
+
+  function isSkippable(el) {
+    return !!(el && el.closest && el.closest(SKIP_CLOSEST));
+  }
+
+  function getTextBlocks(root) {
+    const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
+    return blocks.filter(b => {
+      if (isSkippable(b)) return false;
+      const t = (b.innerText || "").trim();
+      return t.length >= 20;
+    });
+  }
+
+  function contentReady(root) {
+    if (!root) return false;
+    const blocks = getTextBlocks(root);
+    const textLen = (root.innerText || "").trim().length;
+    return (blocks.length >= 2 && textLen >= 200);
+  }
+
+  // ==========================================================
+  // Character detection
+  // ==========================================================
+  function detectCharactersOnPage(root, entries) {
+    const hay = (root?.innerText || "").toLowerCase();
+    const detected = [];
+    for (const [name, info] of entries) {
+      const nameLower = String(name || "").toLowerCase();
+      if (nameLower && hay.includes(nameLower)) { detected.push([name, info]); continue; }
+      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+      for (const a of aliases) {
+        const aLower = String(a || "").toLowerCase();
+        if (aLower && hay.includes(aLower)) { detected.push([name, info]); break; }
+      }
+    }
+    return detected;
+  }
+
+  // ==========================================================
+  // Glossary helpers
+  // ==========================================================
+  function pickKey(glossary) {
+    const url = location.href;
+    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
+    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
+    return matches[0] || "default";
+  }
+
+  // ==========================================================
+  // Reliable glossary loader (+ cache)
+  // ==========================================================
+  function loadGlossaryJSON(url) {
+    return new Promise((resolve, reject) => {
+      const cached = localStorage.getItem(GLOSSARY_CACHE_KEY);
+      const cachedTs = Number(localStorage.getItem(GLOSSARY_CACHE_TS) || "0");
+      const cacheFresh = cached && cachedTs && (Date.now() - cachedTs) <= GLOSSARY_CACHE_TTL_MS;
+
+      const useCache = () => {
+        if (!cached) return reject(new Error("Glossary error"));
+        try { resolve(JSON.parse(cached)); }
+        catch { reject(new Error("Glossary error")); }
+      };
+
+      if (cacheFresh) return useCache();
+
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          headers: { "Cache-Control": "no-cache" },
+          onload: (r) => {
+            try {
+              if (r.status < 200 || r.status >= 300) {
+                if (cached) return useCache();
+                return reject(new Error("Glossary error"));
+              }
+              localStorage.setItem(GLOSSARY_CACHE_KEY, r.responseText);
+              localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
+              resolve(JSON.parse(r.responseText));
+            } catch {
+              if (cached) return useCache();
+              reject(new Error("Glossary error"));
+            }
+          },
+          onerror: () => {
+            if (cached) return useCache();
+            reject(new Error("Glossary error"));
+          }
+        });
+        return;
+      }
+
+      fetch(url, { cache: "no-store" })
+        .then(async (res) => {
+          const txt = await res.text();
+          if (!res.ok) throw new Error("Glossary error");
+          localStorage.setItem(GLOSSARY_CACHE_KEY, txt);
+          localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
+          return JSON.parse(txt);
+        })
+        .then(resolve)
+        .catch(() => {
+          if (cached) return useCache();
+          reject(new Error("Glossary error"));
+        });
+    });
+  }
+
+  // ==========================================================
+  // Node replacement counting
+  // ==========================================================
+  function replaceInTextNodes(blockEl, fnReplace) {
+    const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentNode;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        const tag = parent.nodeName;
+        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return NodeFilter.FILTER_REJECT;
+        const el = parent.nodeType === 1 ? parent : parent.parentElement;
+        if (el && el.closest && el.closest("a, button, input, textarea, select")) return NodeFilter.FILTER_REJECT;
+        if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let changed = 0;
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const before = node.nodeValue;
+      const out = fnReplace(before);
+      if (!out || typeof out !== "object") continue;
+
+      const after = out.text ?? before;
+      let delta = Number(out.changed || 0);
+
+      if (after !== before) {
+        if (delta <= 0) {
+          const b0 = countMatches(RX_PRONOUN_MALE, before) + countMatches(RX_PRONOUN_FEMALE, before);
+          const b1 = countMatches(RX_PRONOUN_MALE, after) + countMatches(RX_PRONOUN_FEMALE, after);
+          delta = Math.max(1, Math.abs(b0 - b1));
+        }
+        node.nodeValue = after;
+        changed += delta;
+      }
+    }
+    return changed;
+  }
+
+  // ==========================================================
+  // UI (same behavior as your requirements)
   // ==========================================================
   function makeUI() {
     const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
@@ -386,8 +578,7 @@
     let changedTotal = 0;
     let glossaryOk = true;
 
-    // onboarding (hidden unless ? toggled)
-    const ONBOARD_KEY = "wtrpf_onboard_seen_v1"; // once user toggles, we mark seen
+    const ONBOARD_KEY = "wtrpf_onboard_seen_v1";
     let showOnboard = false;
 
     const style = document.createElement("style");
@@ -402,7 +593,7 @@
     document.documentElement.appendChild(style);
 
     function applyPos(el) {
-      // Requirement: minimized pill top-left by default.
+      // minimized pill top-left by default
       if (savedPos.left != null) {
         el.style.left = savedPos.left + "px";
         el.style.right = "auto";
@@ -541,7 +732,6 @@
     const divider = document.createElement("div");
     divider.style.cssText = `height:1px; background: rgba(255,255,255,0.12); margin:10px 0;`;
 
-    // Section header: New Character (JSON)
     const sectionHeader = document.createElement("div");
     sectionHeader.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:8px;`;
 
@@ -560,7 +750,6 @@
       flex: 0 0 auto;
     `;
 
-    // Draft box (visible only when section open)
     let draftSectionOpen = false;
 
     const draftWrap = document.createElement("div");
@@ -614,7 +803,6 @@
     draftCountRow.style.cssText = `opacity:.85; margin-top:8px;`;
     draftCountRow.textContent = "Draft: 0";
 
-    // Minimised pill
     const pill = document.createElement("div");
     pill.style.cssText = `
       display:none; position: fixed; z-index: 2147483647;
@@ -670,22 +858,17 @@
       const draftCount = count || 0;
       draftCountRow.textContent = `Draft: ${draftCount}`;
 
-      // show draft area ONLY when section is open (copy/clear also only then)
       const show = draftSectionOpen;
       draftWrap.style.display = show ? "block" : "none";
 
       const hasDraft = draftCount > 0 && !!jsonSnippet;
       draftBox.value = show ? (hasDraft ? jsonSnippet : "") : "";
 
-      // disable buttons if empty, but keep them visible while open
       copyBtn.disabled = !hasDraft;
       clearBtn.disabled = !hasDraft;
       copyBtn.style.opacity = hasDraft ? "1" : "0.55";
       clearBtn.style.opacity = hasDraft ? "1" : "0.55";
-      copyBtn.style.cursor = hasDraft ? "pointer" : "not-allowed";
-      clearBtn.style.cursor = hasDraft ? "pointer" : "not-allowed";
 
-      // update toggle label
       sectionToggle.textContent = draftSectionOpen ? "Close" : "Open";
     }
 
@@ -754,16 +937,16 @@
 
     applyPos(box);
     applyPos(pill);
+
     enableDrag(box, true);
     enableDrag(pill, true);
 
     refreshToggleUI();
     refreshSummary();
 
-    // Minimised by default
+    // minimized by default
     setMin(true);
 
-    // Onboarding initially hidden unless user clicks ?
     if (localStorage.getItem(ONBOARD_KEY) === "1") {
       showOnboard = false;
       onboard.style.display = "none";
@@ -810,14 +993,12 @@
       setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshSummary(); },
       setCharacters: (detectedEntries) => {
         charactersCount = detectedEntries.length;
-
         const base = detectedEntries.length ? detectedEntries : [];
         const names = base.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
           const g = String(info.gender || "").toLowerCase();
           const label = (g === "female" || g === "male") ? g : "unknown";
           return `${name} (${label})`;
         });
-
         charactersList3 = names.join(", ") + (base.length > MAX_NAMES_SHOWN ? " …" : "");
         refreshSummary();
       },
@@ -835,210 +1016,8 @@
   }
 
   // ==========================================================
-  // Content targeting
-  // ==========================================================
-  function findContentRoot() {
-    // WTR: chapter body container
-    const cb = document.querySelector(".chapter-body");
-    if (cb) return cb;
-
-    const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
-    if (likely) return likely;
-
-    const candidates = Array.from(document.querySelectorAll("article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"));
-    let best = null, bestScore = 0;
-    for (const el of candidates) {
-      const pCount = el.querySelectorAll("p").length;
-      const textLen = (el.innerText || "").trim().length;
-      const score = (pCount * 1200) + textLen;
-      if (score > bestScore && textLen > 400) { bestScore = score; best = el; }
-    }
-    return best || document.body;
-  }
-
-  function getChapterId(root) {
-    const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
-    const id = el?.getAttribute?.("data-chapter-id");
-    return id || getChapterFromURL();
-  }
-
-  const SKIP_CLOSEST = [
-    "header","nav","footer","aside","form",
-    "button","input","textarea","select",
-    "[role='navigation']",
-    ".breadcrumbs",".breadcrumb",".toolbar",".tools",".tool",
-    ".pagination",".pager",".share",".social",
-    ".menu",".navbar",".nav",".btn",".button"
-  ].join(",");
-
-  function isSkippable(el) {
-    return !!(el && el.closest && el.closest(SKIP_CLOSEST));
-  }
-
-  function getTextBlocks(root) {
-    // WTR often uses p.pr-line-text / p.pr-line-array
-    const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
-    return blocks.filter(b => {
-      if (isSkippable(b)) return false;
-      const t = (b.innerText || "").trim();
-      return t.length >= 20;
-    });
-  }
-
-  // More forgiving readiness than v4.9.7 (some chapters are short)
-  function contentReady(root) {
-    if (!root) return false;
-    const blocks = getTextBlocks(root);
-    const textLen = (root.innerText || "").trim().length;
-    return (blocks.length >= 2 && textLen >= 220);
-  }
-
-  // ==========================================================
-  // Character detection
-  // ==========================================================
-  function detectCharactersOnPage(root, entries) {
-    const hay = (root?.innerText || "").toLowerCase();
-    const detected = [];
-    for (const [name, info] of entries) {
-      const nameLower = String(name || "").toLowerCase();
-      if (nameLower && hay.includes(nameLower)) { detected.push([name, info]); continue; }
-      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
-      for (const a of aliases) {
-        const aLower = String(a || "").toLowerCase();
-        if (aLower && hay.includes(aLower)) { detected.push([name, info]); break; }
-      }
-    }
-    return detected;
-  }
-
-  // ==========================================================
-  // Glossary helpers
-  // ==========================================================
-  function pickKey(glossary) {
-    const url = location.href;
-    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
-    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
-    return matches[0] || "default";
-  }
-
-  // ==========================================================
-  // Reliable glossary loader (+ cache)
-  // ==========================================================
-  function loadGlossaryJSON(url) {
-    return new Promise((resolve, reject) => {
-      const cached = localStorage.getItem(GLOSSARY_CACHE_KEY);
-      const cachedTs = Number(localStorage.getItem(GLOSSARY_CACHE_TS) || "0");
-      const cacheFresh = cached && cachedTs && (Date.now() - cachedTs) <= GLOSSARY_CACHE_TTL_MS;
-
-      const useCache = () => {
-        if (!cached) return reject(new Error("Glossary error"));
-        try { resolve(JSON.parse(cached)); }
-        catch { reject(new Error("Glossary error")); }
-      };
-
-      if (cacheFresh) return useCache();
-
-      if (typeof GM_xmlhttpRequest === "function") {
-        GM_xmlhttpRequest({
-          method: "GET",
-          url,
-          headers: { "Cache-Control": "no-cache" },
-          onload: (r) => {
-            try {
-              if (r.status < 200 || r.status >= 300) {
-                if (cached) return useCache();
-                return reject(new Error("Glossary error"));
-              }
-              localStorage.setItem(GLOSSARY_CACHE_KEY, r.responseText);
-              localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
-              resolve(JSON.parse(r.responseText));
-            } catch {
-              if (cached) return useCache();
-              reject(new Error("Glossary error"));
-            }
-          },
-          onerror: () => {
-            if (cached) return useCache();
-            reject(new Error("Glossary error"));
-          }
-        });
-        return;
-      }
-
-      fetch(url, { cache: "no-store" })
-        .then(async (res) => {
-          const txt = await res.text();
-          if (!res.ok) throw new Error("Glossary error");
-          localStorage.setItem(GLOSSARY_CACHE_KEY, txt);
-          localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
-          return JSON.parse(txt);
-        })
-        .then(resolve)
-        .catch(() => {
-          if (cached) return useCache();
-          reject(new Error("Glossary error"));
-        });
-    });
-  }
-
-  // ==========================================================
-  // Draft helpers
-  // ==========================================================
-  function loadDraft() {
-    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
-    catch { return { items: [], snippet: "" }; }
-  }
-  function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
-
-  function oneLineCharacterSnippet(name, gender, aliases) {
-    const obj = { gender: String(gender) };
-    if (Array.isArray(aliases) && aliases.length) obj.aliases = aliases;
-    const inner = JSON.stringify(obj);
-    return `"${name}": ${inner},`;
-  }
-
-  // ==========================================================
-  // Node replacement counting (robust)
-  // ==========================================================
-  function replaceInTextNodes(blockEl, fnReplace) {
-    const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const parent = node.parentNode;
-        if (!parent) return NodeFilter.FILTER_REJECT;
-        const tag = parent.nodeName;
-        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return NodeFilter.FILTER_REJECT;
-        const el = parent.nodeType === 1 ? parent : parent.parentElement;
-        if (el && el.closest && el.closest("a, button, input, textarea, select")) return NodeFilter.FILTER_REJECT;
-        if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
-    let changed = 0;
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const before = node.nodeValue;
-      const out = fnReplace(before);
-      if (!out || typeof out !== "object") continue;
-
-      const after = out.text ?? before;
-      let delta = Number(out.changed || 0);
-
-      if (after !== before) {
-        if (delta <= 0) {
-          const b0 = countMatches(RX_PRONOUN_MALE, before) + countMatches(RX_PRONOUN_FEMALE, before);
-          const b1 = countMatches(RX_PRONOUN_MALE, after) + countMatches(RX_PRONOUN_FEMALE, after);
-          delta = Math.max(1, Math.abs(b0 - b1));
-        }
-        node.nodeValue = after;
-        changed += delta;
-      }
-    }
-    return changed;
-  }
-
-  // ==========================================================
-  // Add popup (smaller + X, Male/Female only) — long press on WTR span OR text selection
+  // Add popup (small + X + Male/Female only)
+  // - FIX: add touch long-press fallback (Firefox Android)
   // ==========================================================
   function installAddPopup({ ui }) {
     const popup = document.createElement("div");
@@ -1156,30 +1135,34 @@
       hide();
     };
 
-    // Long-press on WTR term spans (does NOT change WTR native tap behavior)
+    // ----- LONG PRESS target: WTR term spans
+    function findTermSpanFromTarget(target) {
+      return target?.closest?.("span.text-patch.system[data-hash]") || null;
+    }
+
+    // Pointer-based (desktop/most browsers)
     let lpTimer = null;
-    let lpTarget = null;
+    let lpSpan = null;
     let lpStartX = 0;
     let lpStartY = 0;
 
     function clearLP() {
       if (lpTimer) clearTimeout(lpTimer);
       lpTimer = null;
-      lpTarget = null;
+      lpSpan = null;
     }
 
     document.addEventListener("pointerdown", (e) => {
-      const sp = e.target?.closest?.("span.text-patch.system[data-hash]");
+      const sp = findTermSpanFromTarget(e.target);
       if (!sp) return;
 
-      // clear previous first, THEN set target (fixes v4.9.7 bug)
       clearLP();
-      lpTarget = sp;
+      lpSpan = sp;
       lpStartX = e.clientX;
       lpStartY = e.clientY;
 
       lpTimer = setTimeout(() => {
-        const txt = (lpTarget?.textContent || "").trim();
+        const txt = (lpSpan?.textContent || "").trim();
         if (!txt) return;
         showAt(lpStartX + 6, lpStartY + 6, txt);
       }, LONGPRESS_MS);
@@ -1194,7 +1177,49 @@
       if (dx + dy > 10) clearLP();
     }, true);
 
-    // Selection (mouseup) — optional (kept lightweight)
+    // Touch fallback (Firefox Android)
+    let tTimer = null;
+    let tSpan = null;
+    let tStartX = 0;
+    let tStartY = 0;
+
+    function clearTouchLP() {
+      if (tTimer) clearTimeout(tTimer);
+      tTimer = null;
+      tSpan = null;
+    }
+
+    document.addEventListener("touchstart", (e) => {
+      const touch = e.touches && e.touches[0];
+      if (!touch) return;
+
+      const sp = findTermSpanFromTarget(e.target);
+      if (!sp) return;
+
+      clearTouchLP();
+      tSpan = sp;
+      tStartX = touch.clientX;
+      tStartY = touch.clientY;
+
+      tTimer = setTimeout(() => {
+        const txt = (tSpan?.textContent || "").trim();
+        if (!txt) return;
+        showAt(tStartX + 6, tStartY + 6, txt);
+      }, LONGPRESS_MS);
+    }, { capture: true, passive: true });
+
+    document.addEventListener("touchend", clearTouchLP, true);
+    document.addEventListener("touchcancel", clearTouchLP, true);
+    document.addEventListener("touchmove", (e) => {
+      if (!tTimer) return;
+      const touch = e.touches && e.touches[0];
+      if (!touch) return;
+      const dx = Math.abs(touch.clientX - tStartX);
+      const dy = Math.abs(touch.clientY - tStartY);
+      if (dx + dy > 12) clearTouchLP();
+    }, { capture: true, passive: true });
+
+    // Selection popup still allowed
     document.addEventListener("mouseup", (e) => {
       const sel = window.getSelection?.();
       const s = sel ? String(sel.toString() || "") : "";
@@ -1211,7 +1236,7 @@
   }
 
   // ==========================================================
-  // Navigation hooks (A+B) — safe, no global always-on run()
+  // Navigation hooks
   // ==========================================================
   function installNextButtonHook(onNav) {
     document.addEventListener("click", (e) => {
@@ -1222,39 +1247,26 @@
       if (!btn) return;
 
       const txt = normalizeWeirdSpaces(btn.textContent || "").trim().toLowerCase();
-      if (!txt) return;
-
-      // Your screenshot: button contains <span>Next</span> + chevron svg, inside tab panel/menu-wrap.
       const isNextText = txt === "next" || txt.startsWith("next ");
-      const inMenuWrap = !!btn.closest?.(".menu-wrap, .tab-content, [role='tabpanel']");
-      const hasChevron = !!btn.querySelector?.("use[href*='chevron_right'], use[*|href*='chevron_right'], svg");
+      if (!isNextText) return;
 
-      if (!(isNextText && (inMenuWrap || hasChevron))) return;
-
-      setTimeout(() => onNav("next-click"), 25);
+      setTimeout(() => onNav("next-click"), 20);
     }, true);
   }
 
   function installHistoryHooks(onNav) {
-    // These are cheap; no MutationObserver here.
     const fire = () => setTimeout(() => onNav("history"), 60);
-
     window.addEventListener("popstate", fire);
 
     const _push = history.pushState;
     const _rep  = history.replaceState;
-
     history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
     history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
 
-    // Some mobile browsers restore without popstate
     window.addEventListener("pageshow", fire, true);
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) fire();
-    }, true);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
   }
 
-  // Targeted observer: only watch chapter-body swaps, and only schedule a sweep (not run() per mutation)
   function installChapterBodyObserver(scheduleSweep) {
     let lastCb = null;
     let debounce = null;
@@ -1274,13 +1286,11 @@
       mo.observe(cb, { childList: true, subtree: true, characterData: true });
     }
 
-    // poll for chapter-body existence changes (very light)
     const t = setInterval(() => {
       const cb = document.querySelector(".chapter-body");
       if (cb && cb !== lastCb) attach(cb);
     }, 800);
 
-    // stop polling after a while; observer stays on latest body
     setTimeout(() => clearInterval(t), 15000);
   }
 
@@ -1291,7 +1301,6 @@
     const ui = makeUI();
     if (!ui.isEnabled()) return;
 
-    // Load initial draft
     ui.refreshDraftUI?.();
 
     if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
@@ -1335,7 +1344,6 @@
     const novelKey = key === "default" ? getNovelKeyFromURL() : key;
     const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
 
-    // Add popup (small + X + Male/Female only)
     installAddPopup({ ui });
 
     const mode = String(cfg.mode || "paragraph").toLowerCase();
@@ -1395,6 +1403,12 @@
       return null;
     }
 
+    function updateDetectedCharactersUI(root) {
+      const detected = detectCharactersOnPage(root, entries);
+      if (detected.length) ui.setCharacters(detected);
+      else ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
+    }
+
     let lastActorGender = null;
     let lastActorTTL = 0;
 
@@ -1403,7 +1417,6 @@
     let running = false;
     let lastRunAt = 0;
 
-    // Upgrade: per-chapter marker (prevents expensive reprocessing loops)
     function rootPatchedFor(root, chapterId) {
       return root?.dataset?.wtrpfPatchedChapter === String(chapterId);
     }
@@ -1412,7 +1425,6 @@
       root.dataset.wtrpfPatchedChapter = String(chapterId);
     }
 
-    // Upgrade: incremental blocks (only reprocess new blocks after the first full pass)
     function blockIsPatched(b) {
       return b?.dataset?.wtrpfPatched === "1";
     }
@@ -1421,33 +1433,24 @@
       b.dataset.wtrpfPatched = "1";
     }
 
-    function updateDetectedCharactersUI(root) {
-      const detected = detectCharactersOnPage(root, entries);
-      if (detected.length) ui.setCharacters(detected);
-      else ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
-    }
-
+    // ✅ KEY FIX: forceFull bypasses cooldown + signature skip
     function run({ forceFull = false } = {}) {
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
       if (running) return;
 
       const now = Date.now();
-      if (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS) return;
+      if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
 
       const root = findContentRoot();
       const chapterId = getChapterId(root);
-
-      // If not ready yet, bail (nav sweep will retry)
       if (!contentReady(root)) return;
 
       const sig = chapterSignature(root);
-      // If we already processed this exact content signature, don't thrash
       if (!forceFull && sig && sig === lastSig) return;
 
       running = true;
       try {
-        // Minimise whenever chapter changes
         if (chapterId !== lastChapterId) {
           lastChapterId = chapterId;
           localStorage.setItem(UI_KEY_MIN, "1");
@@ -1456,13 +1459,11 @@
           lastActorTTL = 0;
         }
 
-        // Restore last known changed for this chapter (prevents UI flashing to 0)
         const st0 = loadChapterState();
         const lastChanged = getChapterLastChanged(st0, chapterId);
         if (lastChanged > 0) ui.setChanged(lastChanged);
         else ui.setChanged(0);
 
-        // Term patches first
         if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
           const mem = loadTermMemory(novelKey);
           applyTermPatches(root, cfgTerms, mem, U);
@@ -1470,7 +1471,6 @@
 
         updateDetectedCharactersUI(root);
 
-        // Determine chapter mode
         let usedMode = mode;
         let chapterGender = null;
 
@@ -1483,13 +1483,11 @@
           if (!chapterGender) usedMode = "paragraph";
         }
 
-        // Decide whether to full-pass or incremental
         const alreadyPatched = rootPatchedFor(root, chapterId);
         const doFullPass = forceFull || !alreadyPatched;
 
         const blocksAll = getTextBlocks(root);
         const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
-
         if (!blocks.length) return;
 
         let lastGender = null;
@@ -1509,12 +1507,10 @@
             continue;
           }
 
-          // anchored fixes
           if (U.anchoredFixes) {
             pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
           }
 
-          // gender selection
           let g = null;
           let hadDirectMatch = false;
 
@@ -1548,14 +1544,11 @@
 
           if (g) {
             const dir = (g === "female") ? "toFemale" : "toMale";
-
             let doFull = true;
             if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
-
             if (doFull) {
               pronounEdits += replaceInTextNodes(b, (txt) => replacePronounsSmart(txt, dir));
             }
-
             if (usedMode !== "chapter" && hadDirectMatch) {
               lastGender = g;
               carryLeft = carryParagraphs;
@@ -1565,10 +1558,8 @@
           markBlockPatched(b);
         }
 
-        // Mark chapter patched after first full successful pass
         if (doFullPass) markRootPatched(root, chapterId);
 
-        // Prevent "0 overwrite" clobbering
         const st = loadChapterState();
         const prev = getChapterLastChanged(st, chapterId);
 
@@ -1582,8 +1573,6 @@
         }
 
         saveChapterState(st);
-
-        // remember signature we actually processed
         lastSig = sig;
 
       } finally {
@@ -1593,9 +1582,7 @@
     }
 
     // ==========================================================
-    // Reliability Upgrade A: Ready-sweep after navigation
-    // - Poll until chapter-body is ready AND content signature differs
-    // - Run a forced full pass once, then one more incremental pass
+    // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
     // ==========================================================
     let navSweepTimer = null;
 
@@ -1608,14 +1595,14 @@
       stopNavSweep();
 
       const startAt = Date.now();
-      const baselineSig = lastSig; // what we last processed
+      const baselineSig = lastSig;
+
       let stableSig = "";
       let stableCount = 0;
       let forcedOnce = false;
 
       navSweepTimer = setInterval(() => {
-        const elapsed = Date.now() - startAt;
-        if (elapsed > NAV_SWEEP_MS) {
+        if (Date.now() - startAt > NAV_SWEEP_MS) {
           stopNavSweep();
           return;
         }
@@ -1625,22 +1612,18 @@
 
         const sig = chapterSignature(root);
         if (!sig) return;
-
-        // Wait until signature changes vs baseline (fixes "C": content updated but we didn't re-run)
         if (sig === baselineSig) return;
 
-        // Also wait for it to be stable across 2 polls (avoids running mid-render)
         if (sig === stableSig) stableCount++;
         else { stableSig = sig; stableCount = 1; }
 
         if (stableCount < 2) return;
 
-        // Once stable, run
         if (!forcedOnce) {
           forcedOnce = true;
           localStorage.setItem(UI_KEY_MIN, "1");
           ui.setMinimized(true);
-          run({ forceFull: true });
+          run({ forceFull: true });   // ✅ cannot be skipped now
         } else {
           run({ forceFull: false });
           stopNavSweep();
@@ -1648,11 +1631,8 @@
       }, NAV_POLL_MS);
     }
 
-    // Initial run
-    run({ forceFull: true });
-
     // ==========================================================
-    // Reliability Upgrade B: Next-button click hook + history hooks
+    // Hooks (B)
     // ==========================================================
     const onNav = (why) => {
       localStorage.setItem(UI_KEY_MIN, "1");
@@ -1662,15 +1642,15 @@
 
     installNextButtonHook(onNav);
     installHistoryHooks(onNav);
-
-    // Targeted observer (chapter-body only): schedule sweep, not run() spam
     installChapterBodyObserver(onNav);
 
-    // Light in-chapter observer to catch late-added paragraphs (debounced incremental only)
-    // This is NOT a global MutationObserver and does not fire run() in a tight loop.
-    let incrTimer = null;
+    // Initial run
+    run({ forceFull: true });
+
+    // Light observer for late paragraph insertions on the initial root only (debounced)
     const root0 = findContentRoot();
     if (root0 && root0 !== document.body) {
+      let incrTimer = null;
       const mo = new MutationObserver(() => {
         if (!ui.isEnabled()) return;
         if (incrTimer) return;
