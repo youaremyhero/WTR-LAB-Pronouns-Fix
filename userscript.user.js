@@ -1263,21 +1263,49 @@
   // ==========================================================
   // Navigation hooks
   // ==========================================================
-  function installNextButtonHook(onNav) {
-    document.addEventListener("click", (e) => {
-      const t = e.target;
-      if (!t) return;
+      function installNextButtonHook(onNav) {
+        document.addEventListener("click", (e) => {
+          const t = e.target;
+          if (!t) return;
+      
+          // Accept button, link, or role=button containers
+          const el =
+            t.closest?.("button, a, [role='button']") ||
+            t.closest?.("[aria-label]") ||
+            null;
+      
+          if (!el) return;
+      
+          // Fast-path: rel=next
+          if (el.getAttribute?.("rel")?.toLowerCase() === "next") {
+            setTimeout(() => onNav("next-rel"), 20);
+            return;
+          }
+      
+          // Check aria-label/title
+          const aria = (el.getAttribute?.("aria-label") || "").toLowerCase();
+          const title = (el.getAttribute?.("title") || "").toLowerCase();
+          if (aria.includes("next") || title.includes("next")) {
+            setTimeout(() => onNav("next-aria"), 20);
+            return;
+          }
+      
+          // Check visible text
+          const txt = normalizeWeirdSpaces(el.textContent || "").trim().toLowerCase();
+          if (txt === "next" || txt.startsWith("next ")) {
+            setTimeout(() => onNav("next-text"), 20);
+            return;
+          }
+      
+          // Check href for chapter navigation
+          const href = el.getAttribute?.("href") || "";
+          if (/\/chapter-\d+/i.test(href)) {
+            setTimeout(() => onNav("next-href"), 20);
+            return;
+          }
+        }, true);
+      }
 
-      const btn = t.closest?.("button");
-      if (!btn) return;
-
-      const txt = normalizeWeirdSpaces(btn.textContent || "").trim().toLowerCase();
-      const isNextText = txt === "next" || txt.startsWith("next ");
-      if (!isNextText) return;
-
-      setTimeout(() => onNav("next-click"), 20);
-    }, true);
-  }
 
   function installHistoryHooks(onNav) {
     const fire = () => setTimeout(() => onNav("history"), 60);
@@ -1328,6 +1356,18 @@
           clearInterval(t);
         }, 15000);
       }
+
+      function installUrlChangeWatcher(onNav) {
+      let lastHref = location.href;
+    
+      setInterval(() => {
+        const href = location.href;
+        if (href !== lastHref) {
+          lastHref = href;
+          onNav("url-change");
+        }
+      }, 250);
+    }
 
 
   // ==========================================================
@@ -1661,8 +1701,8 @@
     // ==========================================================
     // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
     // ==========================================================
-        let navSweepTimer = null;
-        
+       let navSweepTimer = null;
+
         function stopNavSweep() {
           if (navSweepTimer) clearInterval(navSweepTimer);
           navSweepTimer = null;
@@ -1672,51 +1712,45 @@
           stopNavSweep();
         
           const startAt = Date.now();
-          let firedSeries = false;
+          let stableHits = 0;
+          let lastSeenChapterId = null;
         
           navSweepTimer = setInterval(() => {
+            // hard stop
             if (Date.now() - startAt > NAV_SWEEP_MS) {
               stopNavSweep();
               return;
             }
         
             const root = findContentRoot();
-            if (!contentReady(root)) return;
+            if (!contentReady(root)) return; // keep waiting
         
-            const chapterId = getChapterId(root);
-            const currentSig = chapterSignature(root);
-            if (!chapterId || !currentSig) return;
+            const cid = getChapterId(root);
+            const sigNow = chapterSignature(root);
+            if (!cid || !sigNow) return;
         
-            // Kick off a post-render series ONCE when we first see ready content
-            if (!firedSeries) {
-              firedSeries = true;
+            // if chapter changed during sweep, reset stability counter
+            if (cid !== lastSeenChapterId) {
+              lastSeenChapterId = cid;
+              stableHits = 0;
         
-              // Always minimise on nav
+              // minimise on nav (kept behavior)
               localStorage.setItem(UI_KEY_MIN, "1");
               ui.setMinimized(true);
-        
-              // Run a staged sequence to survive late React overwrites
-                POST_SWEEP_DELAYS.forEach((ms, idx) => {
-                  setTimeout(() => {
-                    const r = findContentRoot();
-                    if (!contentReady(r)) return;
-                
-                    if (idx === 0) {
-                      run({ forceFull: true });
-                    } else {
-                      const cid = getChapterId(r);
-                      const sigNow = chapterSignature(r);
-                      const applied = getAppliedSig(novelKey, cid);
-                
-                      if (!applied || (sigNow && sigNow !== applied)) run({ forceFull: true });
-                      else run({ forceFull: false });
-                    }
-                
-                    if (idx === POST_SWEEP_DELAYS.length - 1) stopNavSweep();
-                  }, ms);
-                });
-
             }
+        
+            const applied = getAppliedSig(novelKey, cid);
+        
+            // If not yet applied (or React overwrote), force re-apply now
+            if (!applied || sigNow !== applied) {
+              run({ forceFull: true });
+              stableHits = 0;
+              return;
+            }
+        
+            // Already applied; require a couple consecutive confirmations before stopping
+            stableHits++;
+            if (stableHits >= 2) stopNavSweep();
           }, NAV_POLL_MS);
         }
 
@@ -1734,6 +1768,7 @@
     installHistoryHooks(onNav);
     installChapterBodyObserver(onNav);
     installChapterBodyReplaceWatcher(onNav);
+    installUrlChangeWatcher(onNav);
 
 
     // Initial run
