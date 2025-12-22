@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WTR PF Test
+// @name         WTR-LAB Pronouns Fix (WTR PF) — v4.9.8
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.7
-// @description  WTR-LAB Pronouns Fix — stable v4.9.4 base + working Add popup (smaller + X + Male/Female only) + onboarding (?) + stronger Next-chapter reliability (ready-sweep + click hook) without conflicting with WTR native term selection.
+// @version      4.9.8
+// @description  Stable v4.9.4 base + working Add popup (small + X + Male/Female only) + onboarding (?) + New Character (JSON) section + reliability upgrades A+B (ready-sweep + Next click hook) for Firefox Android Next navigation (no manual refresh). Avoids heavy/global observers that can hang page load.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -49,9 +49,12 @@
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
   // Navigation reliability (Firefox Android / Next button)
-  const NAV_SWEEP_MS = 8000;        // how long to keep checking after "Next"
+  const NAV_SWEEP_MS = 9000;        // how long to keep checking after "Next"
   const NAV_POLL_MS  = 250;
   const LONGPRESS_MS = 420;         // long-press to open Add popup on WTR span
+
+  // Targeted observer debounce (chapter-body only)
+  const CHAPTER_OBS_DEBOUNCE_MS = 180;
 
   // ==========================================================
   // Utilities
@@ -105,6 +108,17 @@
   function getChapterFromURL() {
     const m = location.href.match(/\/chapter-(\d+)(?:\/|$|\?)/i);
     return m ? `chapter-${m[1]}` : "unknown";
+  }
+
+  // Lightweight stable-ish signature of the current chapter content
+  function chapterSignature(root) {
+    if (!root) return "";
+    const cid = getChapterId(root);
+    const txt = normalizeWeirdSpaces((root.innerText || "").trim());
+    // take a small slice to detect content swaps
+    const head = txt.slice(0, 220);
+    const tail = txt.slice(-220);
+    return `${cid}|len:${txt.length}|h:${head}|t:${tail}`;
   }
 
   // ==========================================================
@@ -388,12 +402,13 @@
     document.documentElement.appendChild(style);
 
     function applyPos(el) {
+      // Requirement: minimized pill top-left by default.
       if (savedPos.left != null) {
         el.style.left = savedPos.left + "px";
         el.style.right = "auto";
       } else {
-        el.style.right = "12px";
-        el.style.left = "auto";
+        el.style.left = "12px";
+        el.style.right = "auto";
       }
       el.style.top = (savedPos.top ?? 12) + "px";
     }
@@ -545,7 +560,7 @@
       flex: 0 0 auto;
     `;
 
-    // Draft box (only visible when section open AND draft exists)
+    // Draft box (visible only when section open)
     let draftSectionOpen = false;
 
     const draftWrap = document.createElement("div");
@@ -655,11 +670,20 @@
       const draftCount = count || 0;
       draftCountRow.textContent = `Draft: ${draftCount}`;
 
-      const hasDraft = draftCount > 0 && !!jsonSnippet;
-      const show = draftSectionOpen && hasDraft;
-
+      // show draft area ONLY when section is open (copy/clear also only then)
+      const show = draftSectionOpen;
       draftWrap.style.display = show ? "block" : "none";
-      draftBox.value = show ? jsonSnippet : "";
+
+      const hasDraft = draftCount > 0 && !!jsonSnippet;
+      draftBox.value = show ? (hasDraft ? jsonSnippet : "") : "";
+
+      // disable buttons if empty, but keep them visible while open
+      copyBtn.disabled = !hasDraft;
+      clearBtn.disabled = !hasDraft;
+      copyBtn.style.opacity = hasDraft ? "1" : "0.55";
+      clearBtn.style.opacity = hasDraft ? "1" : "0.55";
+      copyBtn.style.cursor = hasDraft ? "pointer" : "not-allowed";
+      clearBtn.style.cursor = hasDraft ? "pointer" : "not-allowed";
 
       // update toggle label
       sectionToggle.textContent = draftSectionOpen ? "Close" : "Open";
@@ -768,6 +792,7 @@
     }
 
     copyBtn.onclick = async () => {
+      if (copyBtn.disabled) return;
       const d = loadDraft();
       const txt = d?.snippet || "";
       if (!txt) return;
@@ -775,6 +800,7 @@
     };
 
     clearBtn.onclick = () => {
+      if (clearBtn.disabled) return;
       saveDraft({ items: [], snippet: "" });
       setDraftUI("", 0);
     };
@@ -857,6 +883,14 @@
       const t = (b.innerText || "").trim();
       return t.length >= 20;
     });
+  }
+
+  // More forgiving readiness than v4.9.7 (some chapters are short)
+  function contentReady(root) {
+    if (!root) return false;
+    const blocks = getTextBlocks(root);
+    const textLen = (root.innerText || "").trim().length;
+    return (blocks.length >= 2 && textLen >= 220);
   }
 
   // ==========================================================
@@ -1004,48 +1038,9 @@
   }
 
   // ==========================================================
-  // Navigation hooks + Next click hook
-  // ==========================================================
-  function installNavHooks(onNav) {
-    const fire = () => setTimeout(onNav, 80);
-    window.addEventListener("popstate", fire);
-
-    const _push = history.pushState;
-    const _rep  = history.replaceState;
-    history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
-    history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
-
-    const mo = new MutationObserver(() => fire());
-    mo.observe(document.body, { childList: true, subtree: true });
-  }
-
-  function installNextButtonHook(onNav) {
-    document.addEventListener("click", (e) => {
-      const t = e.target;
-      if (!t) return;
-      const el = t.closest?.("a, button");
-      if (!el) return;
-
-      // Heuristics: Next chapter controls
-      const txt = (el.textContent || "").trim().toLowerCase();
-      const rel = (el.getAttribute?.("rel") || "").toLowerCase();
-      const href = (el.getAttribute?.("href") || "");
-
-      const looksNext =
-        rel.includes("next") ||
-        txt === "next" || txt.includes("next chapter") || txt.includes("next »") || txt.includes("next›") ||
-        /\/chapter-\d+/i.test(href) && (txt.includes("next") || el.className.toLowerCase().includes("next"));
-
-      if (!looksNext) return;
-
-      setTimeout(onNav, 30);
-    }, true);
-  }
-
-  // ==========================================================
   // Add popup (smaller + X, Male/Female only) — long press on WTR span OR text selection
   // ==========================================================
-  function installAddPopup({ ui, novelKey }) {
+  function installAddPopup({ ui }) {
     const popup = document.createElement("div");
     popup.style.cssText = `
       position: fixed; z-index: 2147483647;
@@ -1164,6 +1159,8 @@
     // Long-press on WTR term spans (does NOT change WTR native tap behavior)
     let lpTimer = null;
     let lpTarget = null;
+    let lpStartX = 0;
+    let lpStartY = 0;
 
     function clearLP() {
       if (lpTimer) clearTimeout(lpTimer);
@@ -1175,25 +1172,29 @@
       const sp = e.target?.closest?.("span.text-patch.system[data-hash]");
       if (!sp) return;
 
-      // only primary touch/press
-      lpTarget = sp;
+      // clear previous first, THEN set target (fixes v4.9.7 bug)
       clearLP();
+      lpTarget = sp;
+      lpStartX = e.clientX;
+      lpStartY = e.clientY;
+
       lpTimer = setTimeout(() => {
         const txt = (lpTarget?.textContent || "").trim();
         if (!txt) return;
-        showAt(e.clientX + 6, e.clientY + 6, txt);
+        showAt(lpStartX + 6, lpStartY + 6, txt);
       }, LONGPRESS_MS);
     }, true);
 
     document.addEventListener("pointerup", clearLP, true);
     document.addEventListener("pointercancel", clearLP, true);
     document.addEventListener("pointermove", (e) => {
-      // cancel if finger drags too much
       if (!lpTimer) return;
-      if (Math.abs(e.movementX) + Math.abs(e.movementY) > 6) clearLP();
+      const dx = Math.abs(e.clientX - lpStartX);
+      const dy = Math.abs(e.clientY - lpStartY);
+      if (dx + dy > 10) clearLP();
     }, true);
 
-    // Selection (mouseup) — optional
+    // Selection (mouseup) — optional (kept lightweight)
     document.addEventListener("mouseup", (e) => {
       const sel = window.getSelection?.();
       const s = sel ? String(sel.toString() || "") : "";
@@ -1207,6 +1208,80 @@
     }, true);
 
     return { hide };
+  }
+
+  // ==========================================================
+  // Navigation hooks (A+B) — safe, no global always-on run()
+  // ==========================================================
+  function installNextButtonHook(onNav) {
+    document.addEventListener("click", (e) => {
+      const t = e.target;
+      if (!t) return;
+
+      const btn = t.closest?.("button");
+      if (!btn) return;
+
+      const txt = normalizeWeirdSpaces(btn.textContent || "").trim().toLowerCase();
+      if (!txt) return;
+
+      // Your screenshot: button contains <span>Next</span> + chevron svg, inside tab panel/menu-wrap.
+      const isNextText = txt === "next" || txt.startsWith("next ");
+      const inMenuWrap = !!btn.closest?.(".menu-wrap, .tab-content, [role='tabpanel']");
+      const hasChevron = !!btn.querySelector?.("use[href*='chevron_right'], use[*|href*='chevron_right'], svg");
+
+      if (!(isNextText && (inMenuWrap || hasChevron))) return;
+
+      setTimeout(() => onNav("next-click"), 25);
+    }, true);
+  }
+
+  function installHistoryHooks(onNav) {
+    // These are cheap; no MutationObserver here.
+    const fire = () => setTimeout(() => onNav("history"), 60);
+
+    window.addEventListener("popstate", fire);
+
+    const _push = history.pushState;
+    const _rep  = history.replaceState;
+
+    history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
+    history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
+
+    // Some mobile browsers restore without popstate
+    window.addEventListener("pageshow", fire, true);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) fire();
+    }, true);
+  }
+
+  // Targeted observer: only watch chapter-body swaps, and only schedule a sweep (not run() per mutation)
+  function installChapterBodyObserver(scheduleSweep) {
+    let lastCb = null;
+    let debounce = null;
+
+    function attach(cb) {
+      if (!cb || cb === lastCb) return;
+      lastCb = cb;
+
+      const mo = new MutationObserver(() => {
+        if (debounce) return;
+        debounce = setTimeout(() => {
+          debounce = null;
+          scheduleSweep("chapter-body-mutation");
+        }, CHAPTER_OBS_DEBOUNCE_MS);
+      });
+
+      mo.observe(cb, { childList: true, subtree: true, characterData: true });
+    }
+
+    // poll for chapter-body existence changes (very light)
+    const t = setInterval(() => {
+      const cb = document.querySelector(".chapter-body");
+      if (cb && cb !== lastCb) attach(cb);
+    }, 800);
+
+    // stop polling after a while; observer stays on latest body
+    setTimeout(() => clearInterval(t), 15000);
   }
 
   // ==========================================================
@@ -1261,7 +1336,7 @@
     const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
 
     // Add popup (small + X + Male/Female only)
-    installAddPopup({ ui, novelKey });
+    installAddPopup({ ui });
 
     const mode = String(cfg.mode || "paragraph").toLowerCase();
     const primaryCharacter = cfg.primaryCharacter || null;
@@ -1324,10 +1399,11 @@
     let lastActorTTL = 0;
 
     let lastChapterId = null;
+    let lastSig = "";
     let running = false;
     let lastRunAt = 0;
 
-    // Upgrade 1: per-chapter marker (prevents expensive reprocessing loops)
+    // Upgrade: per-chapter marker (prevents expensive reprocessing loops)
     function rootPatchedFor(root, chapterId) {
       return root?.dataset?.wtrpfPatchedChapter === String(chapterId);
     }
@@ -1336,20 +1412,13 @@
       root.dataset.wtrpfPatchedChapter = String(chapterId);
     }
 
-    // Upgrade 2: incremental blocks (only reprocess new blocks after the first full pass)
+    // Upgrade: incremental blocks (only reprocess new blocks after the first full pass)
     function blockIsPatched(b) {
       return b?.dataset?.wtrpfPatched === "1";
     }
     function markBlockPatched(b) {
       if (!b || !b.dataset) return;
       b.dataset.wtrpfPatched = "1";
-    }
-
-    function contentReady(root) {
-      if (!root) return false;
-      const blocks = getTextBlocks(root);
-      const textLen = (root.innerText || "").trim().length;
-      return blocks.length >= 6 && textLen >= 600;
     }
 
     function updateDetectedCharactersUI(root) {
@@ -1371,6 +1440,10 @@
 
       // If not ready yet, bail (nav sweep will retry)
       if (!contentReady(root)) return;
+
+      const sig = chapterSignature(root);
+      // If we already processed this exact content signature, don't thrash
+      if (!forceFull && sig && sig === lastSig) return;
 
       running = true;
       try {
@@ -1417,10 +1490,7 @@
         const blocksAll = getTextBlocks(root);
         const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
 
-        if (!blocks.length) {
-          // Nothing new; keep last changed count
-          return;
-        }
+        if (!blocks.length) return;
 
         let lastGender = null;
         let carryLeft = 0;
@@ -1513,44 +1583,67 @@
 
         saveChapterState(st);
 
+        // remember signature we actually processed
+        lastSig = sig;
+
       } finally {
         running = false;
         lastRunAt = Date.now();
       }
     }
 
-    // Nav sweep: keep retrying until content is truly ready (fixes “needs refresh”)
+    // ==========================================================
+    // Reliability Upgrade A: Ready-sweep after navigation
+    // - Poll until chapter-body is ready AND content signature differs
+    // - Run a forced full pass once, then one more incremental pass
+    // ==========================================================
     let navSweepTimer = null;
-    function startNavSweep() {
-      if (navSweepTimer) clearInterval(navSweepTimer);
 
-      const startHref = location.href;
+    function stopNavSweep() {
+      if (navSweepTimer) clearInterval(navSweepTimer);
+      navSweepTimer = null;
+    }
+
+    function startNavSweep(reason = "nav") {
+      stopNavSweep();
+
       const startAt = Date.now();
+      const baselineSig = lastSig; // what we last processed
+      let stableSig = "";
+      let stableCount = 0;
       let forcedOnce = false;
 
       navSweepTimer = setInterval(() => {
-        // If URL changed again mid-sweep, reset baseline
         const elapsed = Date.now() - startAt;
         if (elapsed > NAV_SWEEP_MS) {
-          clearInterval(navSweepTimer);
-          navSweepTimer = null;
+          stopNavSweep();
           return;
         }
 
         const root = findContentRoot();
-        const chap = getChapterId(root);
+        if (!contentReady(root)) return;
 
-        // If content is ready, do one forced full pass (then incremental later)
-        if (contentReady(root)) {
-          if (!forcedOnce) {
-            forcedOnce = true;
-            // Always minimize on nav
-            localStorage.setItem(UI_KEY_MIN, "1");
-            ui.setMinimized(true);
-            run({ forceFull: true });
-          } else {
-            run({ forceFull: false });
-          }
+        const sig = chapterSignature(root);
+        if (!sig) return;
+
+        // Wait until signature changes vs baseline (fixes "C": content updated but we didn't re-run)
+        if (sig === baselineSig) return;
+
+        // Also wait for it to be stable across 2 polls (avoids running mid-render)
+        if (sig === stableSig) stableCount++;
+        else { stableSig = sig; stableCount = 1; }
+
+        if (stableCount < 2) return;
+
+        // Once stable, run
+        if (!forcedOnce) {
+          forcedOnce = true;
+          localStorage.setItem(UI_KEY_MIN, "1");
+          ui.setMinimized(true);
+          run({ forceFull: true });
+        } else {
+          run({ forceFull: false });
+          stopNavSweep();
         }
       }, NAV_POLL_MS);
     }
@@ -1558,24 +1651,35 @@
     // Initial run
     run({ forceFull: true });
 
-    // Mutation observer debounce
-    let timer = null;
-    const obs = new MutationObserver(() => {
-      if (!ui.isEnabled()) return;
-      if (timer) return;
-      timer = setTimeout(() => { timer = null; run({ forceFull: false }); }, 220);
-    });
-    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
-
-    // SPA hooks + Next click hook
-    const onNav = () => {
+    // ==========================================================
+    // Reliability Upgrade B: Next-button click hook + history hooks
+    // ==========================================================
+    const onNav = (why) => {
       localStorage.setItem(UI_KEY_MIN, "1");
       ui.setMinimized(true);
-      startNavSweep();
+      startNavSweep(String(why || "nav"));
     };
 
-    installNavHooks(onNav);
     installNextButtonHook(onNav);
+    installHistoryHooks(onNav);
 
+    // Targeted observer (chapter-body only): schedule sweep, not run() spam
+    installChapterBodyObserver(onNav);
+
+    // Light in-chapter observer to catch late-added paragraphs (debounced incremental only)
+    // This is NOT a global MutationObserver and does not fire run() in a tight loop.
+    let incrTimer = null;
+    const root0 = findContentRoot();
+    if (root0 && root0 !== document.body) {
+      const mo = new MutationObserver(() => {
+        if (!ui.isEnabled()) return;
+        if (incrTimer) return;
+        incrTimer = setTimeout(() => {
+          incrTimer = null;
+          run({ forceFull: false });
+        }, 260);
+      });
+      mo.observe(root0, { childList: true, subtree: true, characterData: true });
+    }
   })();
 })();
