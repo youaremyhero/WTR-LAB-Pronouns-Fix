@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2.1
+// @version      1.2.2
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -1322,42 +1322,42 @@
   }
 
   // URL+DOM route observer” that cannot miss SPA transitions
-    function installRouteObserver(onNav) {
-    let lastHref = location.href;
-    let lastFire = 0;
+//    function installRouteObserver(onNav) {
+//    let lastHref = location.href;
+//    let lastFire = 0;
   
-    const fire = (why) => {
-      const now = Date.now();
-      if (now - lastFire < 250) return; // debounce
-      lastFire = now;
-      onNav(why);
-    };
+  //  const fire = (why) => {
+   //   const now = Date.now();
+   //   if (now - lastFire < 250) return; // debounce
+  //    lastFire = now;
+  //    onNav(why);
+  //  };
   
     // 1) MutationObserver on BODY subtree (SPA content swaps)
-    const mo = new MutationObserver(() => {
-      const href = location.href;
-      if (href !== lastHref) {
-        lastHref = href;
-        fire("mo-href-change");
-        return;
-      }
+//    const mo = new MutationObserver(() => {
+ //     const href = location.href;
+  //    if (href !== lastHref) {
+     //   lastHref = href;
+      //  fire("mo-href-change");
+     //   return;
+     // }
   
       // Even if href didn't change, reader content often re-renders
       // so still fire lightly (nav sweep will decide whether to run)
-      fire("mo-dom-change");
-    });
-    mo.observe(document.body, { childList: true, subtree: true });
+   //   fire("mo-dom-change");
+  //  });
+  //  mo.observe(document.body, { childList: true, subtree: true });
   
     // 2) Also patch history (some sites update URL without DOM mutations immediately)
-    const _push = history.pushState;
-    const _rep = history.replaceState;
-    history.pushState = function () { const r = _push.apply(this, arguments); fire("pushState"); return r; };
-    history.replaceState = function () { const r = _rep.apply(this, arguments); fire("replaceState"); return r; };
-    window.addEventListener("popstate", () => fire("popstate"), true);
+   // const _push = history.pushState;
+   // const _rep = history.replaceState;
+   // history.pushState = function () { const r = _push.apply(this, arguments); fire("pushState"); return r; };
+  //  history.replaceState = function () { const r = _rep.apply(this, arguments); fire("replaceState"); return r; };
+  //  window.addEventListener("popstate", () => fire("popstate"), true);
   
     // 3) Immediate invoke
-    fire("route-init");
-  }
+   // fire("route-init");
+//  }
 
 
   // ==========================================================
@@ -1414,16 +1414,16 @@
       }, true);
     }
 
-  function installHistoryHooks(onNav) {
-    const fire = () => setTimeout(() => onNav("history"), 60);
-    window.addEventListener("popstate", fire);
+ // function installHistoryHooks(onNav) {
+ //   const fire = () => setTimeout(() => onNav("history"), 60);
+  //  window.addEventListener("popstate", fire);
 
-    const _push = history.pushState;
-    const _rep = history.replaceState;
-    history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
-    history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
+ //   const _push = history.pushState;
+   // const _rep = history.replaceState;
+  //  history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
+  //  history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
 
-    window.addEventListener("pageshow", fire, true);
+  //  window.addEventListener("pageshow", fire, true);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
   }
 
@@ -1662,22 +1662,20 @@
     
       // During SPA nav, URL often changes before DOM.
       // Give DOM a short grace window to catch up; after that, fall back to URL.
+      // IMPORTANT: forceFull should bypass grace, because onNav relies on it.
       const DOM_GRACE_MS = 1200;
       run._domGraceStart = run._domGraceStart || 0;
-    
-      if (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) {
+      
+      const mismatch =
+        (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) ||
+        (urlCid !== "unknown" && domCid === "unknown");
+      
+      if (mismatch && !forceFull) {
         run._domGraceStart = run._domGraceStart || Date.now();
         if (Date.now() - run._domGraceStart < DOM_GRACE_MS) return;
       }
-    
-      if (urlCid !== "unknown" && domCid === "unknown") {
-        run._domGraceStart = run._domGraceStart || Date.now();
-        if (Date.now() - run._domGraceStart < DOM_GRACE_MS) return;
-      }
-    
-      // reset grace when things align
       run._domGraceStart = 0;
-    
+
       const chapterId = (domCid !== "unknown") ? domCid : urlCid;
     
       // MUST be function-scoped (used after try/finally)
@@ -1916,72 +1914,73 @@
       }, CHAPTER_MONITOR_MS);
     }
 
-
-
-    // ==========================================================
-    // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
-    // ==========================================================
-    let navSweepTimer = null;
-
-    function stopNavSweep() {
-      if (navSweepTimer) clearInterval(navSweepTimer);
-      navSweepTimer = null;
-    }
-
-    // at top of startNavSweep
-    // console.debug("[WTRPF] startNavSweep:", reason);
+    // Nav sweep (A)
     function startNavSweep(reason = "nav") {
       stopNavSweep();
-
+    
       const startAt = Date.now();
       let stableHits = 0;
       let lastSeenChapterId = null;
-
+    
       navSweepTimer = setInterval(() => {
         if (!ui.isEnabled() || document.hidden) {
           stopNavSweep();
           return;
         }
-
+    
         // hard stop
         if (Date.now() - startAt > NAV_SWEEP_MS) {
           stopNavSweep();
           return;
         }
-
+    
         const root = findContentRoot();
         if (!root || root === document.body) return;
         if (!contentReady(root)) return; // keep waiting
-
+    
+        // ✅ CRITICAL: URL/DOM mismatch guard (prevents stopping on old chapter)
+        const urlCid = getUrlChapterId();
+        const domCid = getDomChapterId(root);
+    
+        // If URL already moved but DOM hasn’t caught up yet, keep sweeping.
+        // Do NOT let stableHits reach the stop condition.
+        if (urlCid !== "unknown" && domCid !== "unknown" && urlCid !== domCid) {
+          stableHits = 0;
+          return;
+        }
+        if (urlCid !== "unknown" && domCid === "unknown") {
+          stableHits = 0;
+          return;
+        }
+    
         const cid = getChapterId(root);
         const sigNow = chapterSignature(root);
         if (!cid || !sigNow) return;
-
+    
         // if chapter changed during sweep, reset stability counter
         if (cid !== lastSeenChapterId) {
           lastSeenChapterId = cid;
           stableHits = 0;
-
+    
           // minimise on nav (kept behavior)
           localStorage.setItem(UI_KEY_MIN, "1");
           ui.setMinimized(true);
         }
-
+    
         const applied = getAppliedSig(novelKey, cid);
-
+    
         // If not yet applied (or React overwrote), force re-apply now
         if (!applied || sigNow !== applied) {
           run({ forceFull: true });
           stableHits = 0;
           return;
         }
-
+    
         // Already applied; require a couple consecutive confirmations before stopping
         stableHits++;
         if (stableHits >= 2) stopNavSweep();
       }, NAV_POLL_MS);
     }
-
 
     // ==========================================================
     // Hooks (B)
@@ -2004,8 +2003,6 @@
     installChapterBodyObserver(onNav);
     installChapterBodyReplaceWatcher(onNav);
     installUrlChangeWatcher(onNav, ui.isEnabled);
-    installRouteObserver(onNav);
-
 
     // Initial run
     run({ forceFull: true });
