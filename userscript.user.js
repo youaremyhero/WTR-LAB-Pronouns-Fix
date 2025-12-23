@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2.2
+// @version      1.2.3
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -1414,7 +1414,7 @@
       }, true);
     }
 
- // function installHistoryHooks(onNav) {
+// function installHistoryHooks(onNav) {
  //   const fire = () => setTimeout(() => onNav("history"), 60);
   //  window.addEventListener("popstate", fire);
 
@@ -1424,8 +1424,20 @@
   //  history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
 
   //  window.addEventListener("pageshow", fire, true);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
+  //  document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
+//  }
+
+    function installHistoryHooksLite(onNav) {
+    const fire = (why) => setTimeout(() => onNav(why || "history-lite"), 60);
+  
+    window.addEventListener("popstate", () => fire("popstate"), true);
+    window.addEventListener("pageshow", () => fire("pageshow"), true);
+  
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) fire("visibility");
+    }, true);
   }
+
 
   function installChapterBodyObserver(onNav) {
     let lastCb = null;
@@ -1670,9 +1682,35 @@
         (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) ||
         (urlCid !== "unknown" && domCid === "unknown");
       
-      if (mismatch && !forceFull) {
+      if (mismatch) {
         run._domGraceStart = run._domGraceStart || Date.now();
+      
+        // Short wait for DOM to catch URL
         if (Date.now() - run._domGraceStart < DOM_GRACE_MS) return;
+      
+        // After grace: allow fallback ONLY if content looks settled and "new enough".
+        // This avoids deadlock when DOM never exposes data-chapter-id.
+        if (contentReady(root)) {
+          const sigNow = chapterSignature(root);
+      
+          // If we already applied to the URL chapter and sig matches applied, no need to run.
+          const applied = getAppliedSig(novelKey, urlCid);
+          if (applied && sigNow && sigNow === applied) {
+            run._domGraceStart = 0;
+            return;
+          }
+      
+          // If signature differs from what we applied for the URL chapter, we SHOULD run.
+          // (React overwrite or new chapter content loaded.)
+          if (!applied || (sigNow && sigNow !== applied)) {
+            // proceed (do not return)
+          } else {
+            return;
+          }
+        } else {
+          // not ready yet; keep waiting
+          return;
+        }
       }
       run._domGraceStart = 0;
 
@@ -1985,24 +2023,36 @@
     // ==========================================================
     // Hooks (B)
     // ==========================================================
-    const onNav = (why) => {
-      localStorage.setItem(UI_KEY_MIN, "1");
-      ui.setMinimized(true);
-    
-      // Run a couple of forced attempts quickly (covers Firefox Android timing weirdness)
-      setTimeout(() => run({ forceFull: true }), 60);
-      setTimeout(() => run({ forceFull: true }), 260);
-      setTimeout(() => run({ forceFull: true }), 620);
-    
-      // Keep your sweep as a backstop
-      startNavSweep(String(why || "nav"));
-    };
+      const onNav = (why) => {
+        localStorage.setItem(UI_KEY_MIN, "1");
+        ui.setMinimized(true);
+      
+        setTimeout(() => run({ forceFull: true }), 60);
+        setTimeout(() => run({ forceFull: true }), 260);
+      
+        // third attempt only if still not applied (cheap check)
+        setTimeout(() => {
+          const root = findContentRoot();
+          if (!root || !contentReady(root)) return;
+          const cid = getChapterId(root);
+          const sigNow = chapterSignature(root);
+          const applied = getAppliedSig(novelKey, cid);
+          if (!applied || sigNow !== applied) run({ forceFull: true });
+        }, 620);
+      
+        startNavSweep(String(why || "nav"));
+      };
 
-    installNextButtonHook(onNav);
-    installHistoryHooks(onNav);
-    installChapterBodyObserver(onNav);
-    installChapterBodyReplaceWatcher(onNav);
-    installUrlChangeWatcher(onNav, ui.isEnabled);
+installNextButtonHook(onNav);
+installUrlChangeWatcher(onNav, ui.isEnabled);
+installChapterBodyReplaceWatcher(onNav);
+// Optional (lite only)
+installHistoryHooksLite(onNav);
+// Remove these:
+// installHistoryHooks(onNav);
+// installChapterBodyObserver(onNav);
+// installRouteObserver(onNav);
+
 
     // Initial run
     run({ forceFull: true });
