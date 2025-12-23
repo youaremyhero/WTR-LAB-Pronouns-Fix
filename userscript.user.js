@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.0.0
+// @version      1.0.1
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -45,7 +45,7 @@
 
   const NAV_SWEEP_MS = 9000;
   const NAV_POLL_MS  = 250;
-  const CHAPTER_MONITOR_MS = 700;      // watchdog interval
+  const CHAPTER_MONITOR_MS = 350;      // watchdog interval
   const CHAPTER_MONITOR_WARMUP_MS = 12000; // optional: run more often right after load/nav
 
 
@@ -106,32 +106,42 @@
 
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
 
-  function getChapterFromURL() {
+  function getUrlChapterId() {
     const m = location.href.match(/\/chapter-(\d+)(?:\/|$|\?)/i);
     return m ? `chapter-${m[1]}` : "unknown";
   }
 
-  function getChapterId(root) {
+  function getDomChapterId(root) {
     const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
     const id = el?.getAttribute?.("data-chapter-id");
-    return id || getChapterFromURL();
+    return id || "unknown";
+  }
+  // cheap 32-bit hash (fast enough for innerText)
+  function hash32(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) {
+      h = ((h << 5) + h) ^ str.charCodeAt(i);
+    }
+    return (h >>> 0).toString(16);
   }
 
   function chapterSignature(root) {
     if (!root) return "";
-    const cid = getChapterId(root);
+    domCid = getDomChapterId(root);
     const txt = normalizeWeirdSpaces((root.innerText || "").trim());
-    const head = txt.slice(0, 220);
-    const tail = txt.slice(-220);
-    return `${cid}|len:${txt.length}|h:${head}|t:${tail}`;
+    if (!txt) return `${domCid}|len:0|h:0`;
+    return `${domCid}|len:${txt.length}|h:${hash32(txt)}`;
   }
 
     function appliedSigKey(novelKey) {
     return APPLIED_SIG_KEY_PREFIX + novelKey;
   }
   function loadAppliedSigMap(novelKey) {
-    try { return JSON.parse(sessionStorage.getItem(appliedSigKey(novelKey)) || "{}"); }
-    catch { return {}; }
+    try {
+      return JSON.parse(sessionStorage.getItem(appliedSigKey(novelKey)) || "{}");
+    } catch {
+      return {};
+    }
   }
   function saveAppliedSigMap(novelKey, map) {
     sessionStorage.setItem(appliedSigKey(novelKey), JSON.stringify(map || {}));
@@ -202,7 +212,7 @@
 
   function conservativeShouldApply(region, gender) {
     const maleCount = countMatches(RX_PRONOUN_MALE, region);
-    const femCount  = countMatches(RX_PRONOUN_FEMALE, region);
+    const femCount = countMatches(RX_PRONOUN_FEMALE, region);
     if (gender === "male") return femCount > 0;
     return maleCount > 0;
   }
@@ -594,7 +604,9 @@
   // UI (same behavior as your requirements)
   // ==========================================================
   function makeUI() {
-    const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
+    let savedPos = {};
+    try { savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}"); }
+    catch { savedPos = {}; localStorage.removeItem(UI_KEY_POS); };
     const enabledInit = localStorage.getItem(UI_KEY_ON);
     if (enabledInit !== "0" && enabledInit !== "1") localStorage.setItem(UI_KEY_ON, "1");
 
@@ -1131,7 +1143,7 @@
       const w = 240;
       const h = 120;
       const left = clamp(x, 6, window.innerWidth - w);
-      const top  = clamp(y, 6, window.innerHeight - h);
+      const top = clamp(y, 6, window.innerHeight - h);
 
       popup.style.left = left + "px";
       popup.style.top  = top + "px";
@@ -1315,7 +1327,7 @@
     window.addEventListener("popstate", fire);
 
     const _push = history.pushState;
-    const _rep  = history.replaceState;
+    const _rep = history.replaceState;
     history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
     history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
 
@@ -1543,7 +1555,12 @@
       if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
 
       const root = findContentRoot();
-      const chapterId = getChapterId(root);
+      const urlCid = getUrlChapterId();
+      const domCid = getDomChapterId(root);
+      // During SPA nav, URL often changes before DOM. If URL has a real chapter, wait until DOM catches up.
+      if (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) return;
+      if (urlCid !== "unknown" && domCid === "unknown") return;
+      const chapterId = domCid !== "unknown" ? domCid : urlCid;
       if (!contentReady(root)) return;
 
       const sig = chapterSignature(root);
