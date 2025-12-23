@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2.4
+// @version      1.2.5
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -112,10 +112,37 @@
   }
 
   function getDomChapterId(root) {
+    // Preferred: tracker element (your screenshot confirms this exists)
+    const tracker =
+      document.querySelector(".chapter-tracker.active[data-chapter-no]") ||
+      root?.closest?.(".chapter-infinite-reader")?.querySelector?.(".chapter-tracker.active[data-chapter-no]") ||
+      null;
+  
+    const no = tracker?.getAttribute?.("data-chapter-no");
+    if (no && /^\d+$/.test(no)) return `chapter-${no}`;
+  
+    // Fallback: tracker id="tracker-776"
+    const tid = tracker?.id || "";
+    const m1 = tid.match(/tracker-(\d+)/i);
+    if (m1) return `chapter-${m1[1]}`;
+  
+    // Fallback: if they ever put chapter number on container ids like id="chapter-775"
+    const host =
+      root?.closest?.("[id^='chapter-']") ||
+      root?.querySelector?.("[id^='chapter-']") ||
+      null;
+    const hid = host?.id || "";
+    const m2 = hid.match(/chapter-(\d+)/i);
+    if (m2) return `chapter-${m2[1]}`;
+  
+    // Legacy fallback (your old approach) — keep last
     const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
     const id = el?.getAttribute?.("data-chapter-id");
-    return id || "unknown";
+    if (id) return id;
+  
+    return "unknown";
   }
+
   // cheap 32-bit hash (fast enough for innerText)
   function hash32(str) {
     let h = 5381;
@@ -1641,6 +1668,13 @@
     let running = false;
     let lastRunAt = 0;
 
+    let navSweepTimer = null;
+    function stopNavSweep() {
+      if (navSweepTimer) clearInterval(navSweepTimer);
+      navSweepTimer = null;
+    }
+
+
     function rootPatchedFor(root, chapterId) {
       return root?.dataset?.wtrpfPatchedChapter === String(chapterId);
     }
@@ -1659,6 +1693,8 @@
 
    // ✅ KEY FIX: forceFull bypasses cooldown + signature skip
     function run({ forceFull = false } = {}) {
+      console.log("[WTRPF] run() enter forceFull=", forceFull, "href=", location.href);
+
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
       if (running) return;
@@ -2028,7 +2064,9 @@
     // ==========================================================
     // Hooks (B)
     // ==========================================================
-      const onNav = (why) => {
+      
+    const onNav = (why) => {
+      console.log("[WTRPF] onNav fired:", why, "href=", location.href);
         localStorage.setItem(UI_KEY_MIN, "1");
         ui.setMinimized(true);
       
