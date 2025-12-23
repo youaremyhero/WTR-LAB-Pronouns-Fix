@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2.3
+// @version      1.2.4
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -1671,7 +1671,13 @@
     
       const urlCid = getUrlChapterId();
       const domCid = getDomChapterId(root);
-    
+
+      run._lastHref = run._lastHref || location.href;
+        if (location.href !== run._lastHref) {
+          run._lastHref = location.href;
+          run._domGraceStart = 0;
+        }
+
       // During SPA nav, URL often changes before DOM.
       // Give DOM a short grace window to catch up; after that, fall back to URL.
       // IMPORTANT: forceFull should bypass grace, because onNav relies on it.
@@ -1683,34 +1689,33 @@
         (urlCid !== "unknown" && domCid === "unknown");
       
       if (mismatch) {
-        run._domGraceStart = run._domGraceStart || Date.now();
+        // Start / maintain grace window
+        if (!run._domGraceStart) run._domGraceStart = Date.now();
       
-        // Short wait for DOM to catch URL
-        if (Date.now() - run._domGraceStart < DOM_GRACE_MS) return;
+        // If we're NOT forceFull, keep the old behavior: wait a bit for DOM to catch up.
+        if (!forceFull && (Date.now() - run._domGraceStart < DOM_GRACE_MS)) return;
       
-        // After grace: allow fallback ONLY if content looks settled and "new enough".
-        // This avoids deadlock when DOM never exposes data-chapter-id.
-        if (contentReady(root)) {
-          const sigNow = chapterSignature(root);
+        // If we ARE forceFull, we still must not patch old content.
+        // So only proceed if the reading content is "ready".
+        if (!contentReady(root)) return;
       
-          // If we already applied to the URL chapter and sig matches applied, no need to run.
-          const applied = getAppliedSig(novelKey, urlCid);
-          if (applied && sigNow && sigNow === applied) {
-            run._domGraceStart = 0;
-            return;
-          }
-      
-          // If signature differs from what we applied for the URL chapter, we SHOULD run.
-          // (React overwrite or new chapter content loaded.)
-          if (!applied || (sigNow && sigNow !== applied)) {
-            // proceed (do not return)
-          } else {
-            return;
-          }
-        } else {
-          // not ready yet; keep waiting
+        // Optional safety: if this content signature is identical to what we already applied
+        // for the URL chapter, don't thrash.
+        const sigNow = chapterSignature(root);
+        // If DOM still shows the previous chapter (domCid) and it already matches what we applied,
+        // don't waste a forceFull run patching old content again.
+        if (domCid !== "unknown" && urlCid !== "unknown" && domCid !== urlCid) {
+          const appliedDom = getAppliedSig(novelKey, domCid);
+          if (appliedDom && sigNow && sigNow === appliedDom) return;
+        }
+
+        const applied = getAppliedSig(novelKey, urlCid);
+        if (applied && sigNow && sigNow === applied) {
+          run._domGraceStart = 0;
           return;
         }
+      
+        // We can proceed now even if domCid is unknown/mismatched.
       }
       run._domGraceStart = 0;
 
