@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WTR-LAB Load Test
+// @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      4.9.10
-// @description  Stability fixes: guard corrupted UI position JSON, reset monitor warmup on navigation, remove duplicate chapter mismatch checks. No feature changes (UI/UX + New Character JSON + small popup + Male/Female only + force runs + Firefox Android long-press + Next reliability).
+// @version      1.0.0
+// @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
 // @grant        GM_xmlhttpRequest
@@ -30,12 +30,12 @@
   const TERM_MEM_MAX_KEYS = 300;
 
   const GLOSSARY_CACHE_KEY = "wtrpf_glossary_cache_v1";
-  const GLOSSARY_CACHE_TS = "wtrpf_glossary_cache_ts_v1";
+  const GLOSSARY_CACHE_TS  = "wtrpf_glossary_cache_ts_v1";
   const GLOSSARY_CACHE_TTL_MS = 10 * 60 * 1000;
 
   const UI_KEY_MIN = "wtrpf_ui_min_v1";
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
-  const UI_KEY_ON = "wtrpf_enabled_v1";
+  const UI_KEY_ON  = "wtrpf_enabled_v1";
 
   const DRAFT_KEY = "wtrpf_draft_v1";
   const TERM_MEM_KEY_PREFIX = "wtrpf_term_mem_v1:";
@@ -44,16 +44,17 @@
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
   const NAV_SWEEP_MS = 9000;
-  const NAV_POLL_MS = 250;
-  const CHAPTER_MONITOR_MS = 350; // watchdog interval
-  const CHAPTER_MONITOR_WARMUP_MS = 12000; // warm period after load/nav
+  const NAV_POLL_MS  = 250;
+  const CHAPTER_MONITOR_MS = 700;      // watchdog interval
+  const CHAPTER_MONITOR_WARMUP_MS = 12000; // optional: run more often right after load/nav
+
 
   const LONGPRESS_MS = 420;
 
   const CHAPTER_OBS_DEBOUNCE_MS = 180;
 
   // Post-render resilience (React re-render overwrite protection)
-  const POST_SWEEP_DELAYS = [150, 450, 900, 1600, 2600]; // kept (unused here, but no feature change)
+  const POST_SWEEP_DELAYS = [150, 450, 900, 1600, 2600];
   const APPLIED_SIG_KEY_PREFIX = "wtrpf_applied_sig_v1:"; // per novelKey
 
   // ==========================================================
@@ -65,8 +66,7 @@
   const RX_PRONOUN_MALE = /\b(he|him|his|himself)\b/gi;
   const RX_PRONOUN_FEMALE = /\b(she|her|hers|herself)\b/gi;
 
-  const RX_ATTACK_CUES =
-    /\b(knife|blade|sword|dagger|stab|stabs|stabbed|slash|slashed|strike|struck|hit|hits|punched|kicked|cut|pierce|pierced|neck|chest)\b/i;
+  const RX_ATTACK_CUES = /\b(knife|blade|sword|dagger|stab|stabs|stabbed|slash|slashed|strike|struck|hit|hits|punched|kicked|cut|pierce|pierced|neck|chest)\b/i;
 
   function caseLike(src, target) {
     if (!src) return target;
@@ -85,7 +85,7 @@
 
   function isSceneBreak(t) {
     const s = (t || "").trim();
-    return s === "***" || s === "— — —" || /^(\*{3,}|-{3,}|={3,}|_{3,})$/.test(s);
+    return (s === "***" || s === "— — —" || /^(\*{3,}|-{3,}|={3,}|_{3,})$/.test(s));
   }
 
   function startsWithPronoun(t) {
@@ -104,48 +104,34 @@
     return m ? m.length : 0;
   }
 
-  function clamp(n, lo, hi) {
-    return Math.min(hi, Math.max(lo, n));
-  }
+  function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
 
-  function getUrlChapterId() {
+  function getChapterFromURL() {
     const m = location.href.match(/\/chapter-(\d+)(?:\/|$|\?)/i);
     return m ? `chapter-${m[1]}` : "unknown";
   }
 
-  // IMPORTANT: DOM-only. Do NOT fall back to URL here.
-  function getDomChapterId(root) {
+  function getChapterId(root) {
     const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
     const id = el?.getAttribute?.("data-chapter-id");
-    return id || "unknown";
-  }
-
-  // cheap 32-bit hash (fast enough for innerText)
-  function hash32(str) {
-    let h = 5381;
-    for (let i = 0; i < str.length; i++) {
-      h = ((h << 5) + h) ^ str.charCodeAt(i);
-    }
-    return (h >>> 0).toString(16);
+    return id || getChapterFromURL();
   }
 
   function chapterSignature(root) {
     if (!root) return "";
-    const domCid = getDomChapterId(root);
+    const cid = getChapterId(root);
     const txt = normalizeWeirdSpaces((root.innerText || "").trim());
-    if (!txt) return `${domCid}|len:0|h:0`;
-    return `${domCid}|len:${txt.length}|h:${hash32(txt)}`;
+    const head = txt.slice(0, 220);
+    const tail = txt.slice(-220);
+    return `${cid}|len:${txt.length}|h:${head}|t:${tail}`;
   }
 
-  function appliedSigKey(novelKey) {
+    function appliedSigKey(novelKey) {
     return APPLIED_SIG_KEY_PREFIX + novelKey;
   }
   function loadAppliedSigMap(novelKey) {
-    try {
-      return JSON.parse(sessionStorage.getItem(appliedSigKey(novelKey)) || "{}");
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(sessionStorage.getItem(appliedSigKey(novelKey)) || "{}"); }
+    catch { return {}; }
   }
   function saveAppliedSigMap(novelKey, map) {
     sessionStorage.setItem(appliedSigKey(novelKey), JSON.stringify(map || {}));
@@ -159,6 +145,7 @@
     m[chapterId] = String(sig || "");
     saveAppliedSigMap(novelKey, m);
   }
+
 
   // ==========================================================
   // Pronoun replacement
@@ -184,34 +171,16 @@
 
     if (direction === "toMale") {
       rep(new RegExp(SENT_PREFIX + `(she)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "He")}`);
-      rep(
-        new RegExp(SENT_PREFIX + `(herself)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Himself")}`
-      );
+      rep(new RegExp(SENT_PREFIX + `(herself)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Himself")}`);
       rep(new RegExp(SENT_PREFIX + `(hers)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
-      rep(
-        new RegExp(SENT_PREFIX + `(her)\\b(?=\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`
-      );
-      rep(
-        new RegExp(SENT_PREFIX + `(her)\\b(?!\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Him")}`
-      );
+      rep(new RegExp(SENT_PREFIX + `(her)\\b(?=\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "His")}`);
+      rep(new RegExp(SENT_PREFIX + `(her)\\b(?!\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Him")}`);
     } else {
       rep(new RegExp(SENT_PREFIX + `(he)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "She")}`);
-      rep(
-        new RegExp(SENT_PREFIX + `(himself)\\b`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Herself")}`
-      );
+      rep(new RegExp(SENT_PREFIX + `(himself)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Herself")}`);
       rep(new RegExp(SENT_PREFIX + `(him)\\b`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
-      rep(
-        new RegExp(SENT_PREFIX + `(his)\\b(?=\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`
-      );
-      rep(
-        new RegExp(SENT_PREFIX + `(his)\\b(?!\\s+${LETTER})`, "giu"),
-        (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Hers")}`
-      );
+      rep(new RegExp(SENT_PREFIX + `(his)\\b(?=\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Her")}`);
+      rep(new RegExp(SENT_PREFIX + `(his)\\b(?!\\s+${LETTER})`, "giu"), (m, p1, p2, w) => `${p1}${p2 || ""}${caseLike(w, "Hers")}`);
     }
 
     if (direction === "toMale") {
@@ -233,13 +202,13 @@
 
   function conservativeShouldApply(region, gender) {
     const maleCount = countMatches(RX_PRONOUN_MALE, region);
-    const femCount = countMatches(RX_PRONOUN_FEMALE, region);
+    const femCount  = countMatches(RX_PRONOUN_FEMALE, region);
     if (gender === "male") return femCount > 0;
     return maleCount > 0;
   }
 
   // ==========================================================
-  // Anchored fixes
+  // Anchored fixes (kept from your base)
   // ==========================================================
   function getSentenceEndIndex(s, start, maxExtra = 320) {
     const limit = Math.min(s.length, start + maxExtra);
@@ -270,19 +239,13 @@
       if (g !== "male" && g !== "female") continue;
       const nEsc = escapeRegExp(name);
 
-      const rx1 = new RegExp(
-        String.raw`["“][^"”]{3,}["”]\s*(?:,?\s*)?(?:said|asked|shouted|whispered|replied|muttered|yelled)\s+${nEsc}\b`,
-        "i"
-      );
-      const rx2 = new RegExp(
-        String.raw`\b${nEsc}\b\s*(?:said|asked|shouted|whispered|replied|muttered|yelled)\s*(?:,?\s*)?["“]`,
-        "i"
-      );
+      const rx1 = new RegExp(String.raw`["“][^"”]{3,}["”]\s*(?:,?\s*)?(?:said|asked|shouted|whispered|replied|muttered|yelled)\s+${nEsc}\b`, "i");
+      const rx2 = new RegExp(String.raw`\b${nEsc}\b\s*(?:said|asked|shouted|whispered|replied|muttered|yelled)\s*(?:,?\s*)?["“]`, "i");
 
       if (rx1.test(s) || rx2.test(s)) found.push(g);
     }
     if (!found.length) return null;
-    return found.every((x) => x === found[0]) ? found[0] : null;
+    return found.every(x => x === found[0]) ? found[0] : null;
   }
 
   function applyAnchoredFixes(text, entries, opts) {
@@ -301,7 +264,7 @@
         .filter(Boolean)
         .sort((a, b) => String(b).length - String(a).length);
 
-      const dir = gender === "female" ? "toFemale" : "toMale";
+      const dir = (gender === "female") ? "toFemale" : "toMale";
 
       for (const n of allNames) {
         const nEsc = escapeRegExp(n);
@@ -311,7 +274,9 @@
         while ((m = re.exec(s)) !== null) {
           const start = m.index;
 
-          const baseEnd = verbBasedWindow ? getSentenceEndIndex(s, start + n.length, 360) : Math.min(s.length, start + n.length + LOCAL_ANCHOR_WINDOW);
+          const baseEnd = verbBasedWindow
+            ? getSentenceEndIndex(s, start + n.length, 360)
+            : Math.min(s.length, start + n.length + LOCAL_ANCHOR_WINDOW);
 
           let end = baseEnd;
           if (strictPossessive) end = Math.min(s.length, Math.max(end, start + n.length + 220));
@@ -324,7 +289,7 @@
           if (passiveVoice) {
             const gAgent = detectPassiveAgentGender(region, entries);
             if (gAgent) {
-              const d2 = gAgent === "female" ? "toFemale" : "toMale";
+              const d2 = (gAgent === "female") ? "toFemale" : "toMale";
               const out2 = replacePronounsSmart(out.text, d2);
               out = { text: out2.text, changed: out.changed + out2.changed };
             }
@@ -343,23 +308,18 @@
   }
 
   // ==========================================================
-  // Term memory + patches
+  // Term memory + patches (unchanged)
   // ==========================================================
   function getNovelKeyFromURL() {
     const m = location.href.match(/wtr-lab\.com\/en\/novel\/(\d+)\//i);
     return m ? `wtr-lab.com/en/novel/${m[1]}/` : "wtr-lab.com/en/novel/";
   }
 
-  function termMemKey(novelKey) {
-    return TERM_MEM_KEY_PREFIX + novelKey;
-  }
+  function termMemKey(novelKey) { return TERM_MEM_KEY_PREFIX + novelKey; }
 
   function loadTermMemory(novelKey) {
-    try {
-      return JSON.parse(localStorage.getItem(termMemKey(novelKey)) || "{}");
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(localStorage.getItem(termMemKey(novelKey)) || "{}"); }
+    catch { return {}; }
   }
   function saveTermMemory(novelKey, mem) {
     try {
@@ -409,7 +369,7 @@
             if (el && el.closest && el.closest("a, button, input, textarea, select")) return NodeFilter.FILTER_REJECT;
             if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
             return NodeFilter.FILTER_ACCEPT;
-          },
+          }
         });
 
         while (walker.nextNode()) {
@@ -440,15 +400,10 @@
   // Draft helpers
   // ==========================================================
   function loadDraft() {
-    try {
-      return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}');
-    } catch {
-      return { items: [], snippet: "" };
-    }
+    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
+    catch { return { items: [], snippet: "" }; }
   }
-  function saveDraft(d) {
-    localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" }));
-  }
+  function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
 
   function oneLineCharacterSnippet(name, gender, aliases) {
     const obj = { gender: String(gender) };
@@ -467,48 +422,24 @@
     const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
     if (likely) return likely;
 
-    const candidates = Array.from(
-      document.querySelectorAll("article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section")
-    );
-    let best = null,
-      bestScore = 0;
+    const candidates = Array.from(document.querySelectorAll("article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"));
+    let best = null, bestScore = 0;
     for (const el of candidates) {
       const pCount = el.querySelectorAll("p").length;
       const textLen = (el.innerText || "").trim().length;
-      const score = pCount * 1200 + textLen;
-      if (score > bestScore && textLen > 300) {
-        bestScore = score;
-        best = el;
-      }
+      const score = (pCount * 1200) + textLen;
+      if (score > bestScore && textLen > 300) { bestScore = score; best = el; }
     }
     return best || document.body;
   }
 
   const SKIP_CLOSEST = [
-    "header",
-    "nav",
-    "footer",
-    "aside",
-    "form",
-    "button",
-    "input",
-    "textarea",
-    "select",
+    "header","nav","footer","aside","form",
+    "button","input","textarea","select",
     "[role='navigation']",
-    ".breadcrumbs",
-    ".breadcrumb",
-    ".toolbar",
-    ".tools",
-    ".tool",
-    ".pagination",
-    ".pager",
-    ".share",
-    ".social",
-    ".menu",
-    ".navbar",
-    ".nav",
-    ".btn",
-    ".button",
+    ".breadcrumbs",".breadcrumb",".toolbar",".tools",".tool",
+    ".pagination",".pager",".share",".social",
+    ".menu",".navbar",".nav",".btn",".button"
   ].join(",");
 
   function isSkippable(el) {
@@ -517,7 +448,7 @@
 
   function getTextBlocks(root) {
     const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
-    return blocks.filter((b) => {
+    return blocks.filter(b => {
       if (isSkippable(b)) return false;
       const t = (b.innerText || "").trim();
       return t.length >= 20;
@@ -528,7 +459,7 @@
     if (!root) return false;
     const blocks = getTextBlocks(root);
     const textLen = (root.innerText || "").trim().length;
-    return blocks.length >= 2 && textLen >= 200;
+    return (blocks.length >= 2 && textLen >= 200);
   }
 
   // ==========================================================
@@ -539,17 +470,11 @@
     const detected = [];
     for (const [name, info] of entries) {
       const nameLower = String(name || "").toLowerCase();
-      if (nameLower && hay.includes(nameLower)) {
-        detected.push([name, info]);
-        continue;
-      }
+      if (nameLower && hay.includes(nameLower)) { detected.push([name, info]); continue; }
       const aliases = Array.isArray(info.aliases) ? info.aliases : [];
       for (const a of aliases) {
         const aLower = String(a || "").toLowerCase();
-        if (aLower && hay.includes(aLower)) {
-          detected.push([name, info]);
-          break;
-        }
+        if (aLower && hay.includes(aLower)) { detected.push([name, info]); break; }
       }
     }
     return detected;
@@ -560,8 +485,8 @@
   // ==========================================================
   function pickKey(glossary) {
     const url = location.href;
-    const keys = Object.keys(glossary || {}).filter((k) => k !== "default");
-    const matches = keys.filter((k) => url.includes(k)).sort((a, b) => b.length - a.length);
+    const keys = Object.keys(glossary || {}).filter(k => k !== "default");
+    const matches = keys.filter(k => url.includes(k)).sort((a, b) => b.length - a.length);
     return matches[0] || "default";
   }
 
@@ -572,15 +497,12 @@
     return new Promise((resolve, reject) => {
       const cached = localStorage.getItem(GLOSSARY_CACHE_KEY);
       const cachedTs = Number(localStorage.getItem(GLOSSARY_CACHE_TS) || "0");
-      const cacheFresh = cached && cachedTs && Date.now() - cachedTs <= GLOSSARY_CACHE_TTL_MS;
+      const cacheFresh = cached && cachedTs && (Date.now() - cachedTs) <= GLOSSARY_CACHE_TTL_MS;
 
       const useCache = () => {
         if (!cached) return reject(new Error("Glossary error"));
-        try {
-          resolve(JSON.parse(cached));
-        } catch {
-          reject(new Error("Glossary error"));
-        }
+        try { resolve(JSON.parse(cached)); }
+        catch { reject(new Error("Glossary error")); }
       };
 
       if (cacheFresh) return useCache();
@@ -607,7 +529,7 @@
           onerror: () => {
             if (cached) return useCache();
             reject(new Error("Glossary error"));
-          },
+          }
         });
         return;
       }
@@ -642,7 +564,7 @@
         if (el && el.closest && el.closest("a, button, input, textarea, select")) return NodeFilter.FILTER_REJECT;
         if (!node.nodeValue || node.nodeValue.trim().length < 2) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
-      },
+      }
     });
 
     let changed = 0;
@@ -672,26 +594,12 @@
   // UI (same behavior as your requirements)
   // ==========================================================
   function makeUI() {
-    // STABILITY FIX #1: Guard corrupted JSON in UI_KEY_POS (prevents total script failure)
-    let savedPos = {};
-    try {
-      savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
-    } catch {
-      savedPos = {};
-      try {
-        localStorage.removeItem(UI_KEY_POS);
-      } catch {}
-    }
-
+    const savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}");
     const enabledInit = localStorage.getItem(UI_KEY_ON);
     if (enabledInit !== "0" && enabledInit !== "1") localStorage.setItem(UI_KEY_ON, "1");
 
-    function enabled() {
-      return localStorage.getItem(UI_KEY_ON) !== "0";
-    }
-    function setEnabled(v) {
-      localStorage.setItem(UI_KEY_ON, v ? "1" : "0");
-    }
+    function enabled() { return localStorage.getItem(UI_KEY_ON) !== "0"; }
+    function setEnabled(v) { localStorage.setItem(UI_KEY_ON, v ? "1" : "0"); }
 
     let charactersCount = 0;
     let charactersList3 = "";
@@ -737,13 +645,9 @@
     }
 
     function enableDrag(el, allowButtonClicks = true) {
-      let startX = 0,
-        startY = 0,
-        startTop = 0,
-        startLeft = 0,
-        dragging = false;
+      let startX = 0, startY = 0, startTop = 0, startLeft = 0, dragging = false;
 
-      el.addEventListener("pointerdown", (e) => {
+      el.addEventListener("pointerdown", e => {
         if (allowButtonClicks && e.target && e.target.tagName === "BUTTON") return;
         dragging = true;
         startX = e.clientX;
@@ -754,12 +658,12 @@
         el.setPointerCapture(e.pointerId);
       });
 
-      el.addEventListener("pointermove", (e) => {
+      el.addEventListener("pointermove", e => {
         if (!dragging) return;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
-        el.style.top = startTop + dy + "px";
-        el.style.left = startLeft + dx + "px";
+        el.style.top = (startTop + dy) + "px";
+        el.style.left = (startLeft + dx) + "px";
         el.style.right = "auto";
       });
 
@@ -1114,16 +1018,13 @@
 
     return {
       isEnabled: () => enabled(),
-      setGlossaryOk: (ok) => {
-        glossaryOk = !!ok;
-        refreshSummary();
-      },
+      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshSummary(); },
       setCharacters: (detectedEntries) => {
         charactersCount = detectedEntries.length;
         const base = detectedEntries.length ? detectedEntries : [];
         const names = base.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
           const g = String(info.gender || "").toLowerCase();
-          const label = g === "female" || g === "male" ? g : "unknown";
+          const label = (g === "female" || g === "male") ? g : "unknown";
           return `${name} (${label})`;
         });
         charactersList3 = names.join(", ") + (base.length > MAX_NAMES_SHOWN ? " …" : "");
@@ -1138,13 +1039,13 @@
       refreshDraftUI: () => {
         const d = loadDraft();
         setDraftUI(d?.snippet || "", (d?.items || []).length);
-      },
+      }
     };
   }
 
   // ==========================================================
   // Add popup (small + X + Male/Female only)
-  // + touch long-press fallback (Firefox Android)
+  // - FIX: add touch long-press fallback (Firefox Android)
   // ==========================================================
   function installAddPopup({ ui }) {
     const popup = document.createElement("div");
@@ -1230,23 +1131,17 @@
       const w = 240;
       const h = 120;
       const left = clamp(x, 6, window.innerWidth - w);
-      const top = clamp(y, 6, window.innerHeight - h);
+      const top  = clamp(y, 6, window.innerHeight - h);
 
       popup.style.left = left + "px";
-      popup.style.top = top + "px";
+      popup.style.top  = top + "px";
       popup.style.display = "block";
     }
 
     xBtn.onclick = hide;
     popup.addEventListener("pointerdown", (e) => e.stopPropagation());
     document.addEventListener("scroll", hide, true);
-    document.addEventListener(
-      "keydown",
-      (e) => {
-        if (e.key === "Escape") hide();
-      },
-      true
-    );
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
 
     function upsertDraftLine(line) {
       const d = loadDraft();
@@ -1268,11 +1163,12 @@
       hide();
     };
 
+    // ----- LONG PRESS target: WTR term spans
     function findTermSpanFromTarget(target) {
       return target?.closest?.("span.text-patch.system[data-hash]") || null;
     }
 
-    // Pointer-based long press
+    // Pointer-based (desktop/most browsers)
     let lpTimer = null;
     let lpSpan = null;
     let lpStartX = 0;
@@ -1284,38 +1180,30 @@
       lpSpan = null;
     }
 
-    document.addEventListener(
-      "pointerdown",
-      (e) => {
-        const sp = findTermSpanFromTarget(e.target);
-        if (!sp) return;
+    document.addEventListener("pointerdown", (e) => {
+      const sp = findTermSpanFromTarget(e.target);
+      if (!sp) return;
 
-        clearLP();
-        lpSpan = sp;
-        lpStartX = e.clientX;
-        lpStartY = e.clientY;
+      clearLP();
+      lpSpan = sp;
+      lpStartX = e.clientX;
+      lpStartY = e.clientY;
 
-        lpTimer = setTimeout(() => {
-          const txt = (lpSpan?.textContent || "").trim();
-          if (!txt) return;
-          showAt(lpStartX + 6, lpStartY + 6, txt);
-        }, LONGPRESS_MS);
-      },
-      true
-    );
+      lpTimer = setTimeout(() => {
+        const txt = (lpSpan?.textContent || "").trim();
+        if (!txt) return;
+        showAt(lpStartX + 6, lpStartY + 6, txt);
+      }, LONGPRESS_MS);
+    }, true);
 
     document.addEventListener("pointerup", clearLP, true);
     document.addEventListener("pointercancel", clearLP, true);
-    document.addEventListener(
-      "pointermove",
-      (e) => {
-        if (!lpTimer) return;
-        const dx = Math.abs(e.clientX - lpStartX);
-        const dy = Math.abs(e.clientY - lpStartY);
-        if (dx + dy > 10) clearLP();
-      },
-      true
-    );
+    document.addEventListener("pointermove", (e) => {
+      if (!lpTimer) return;
+      const dx = Math.abs(e.clientX - lpStartX);
+      const dy = Math.abs(e.clientY - lpStartY);
+      if (dx + dy > 10) clearLP();
+    }, true);
 
     // Touch fallback (Firefox Android)
     let tTimer = null;
@@ -1329,60 +1217,48 @@
       tSpan = null;
     }
 
-    document.addEventListener(
-      "touchstart",
-      (e) => {
-        const touch = e.touches && e.touches[0];
-        if (!touch) return;
+    document.addEventListener("touchstart", (e) => {
+      const touch = e.touches && e.touches[0];
+      if (!touch) return;
 
-        const sp = findTermSpanFromTarget(e.target);
-        if (!sp) return;
+      const sp = findTermSpanFromTarget(e.target);
+      if (!sp) return;
 
-        clearTouchLP();
-        tSpan = sp;
-        tStartX = touch.clientX;
-        tStartY = touch.clientY;
+      clearTouchLP();
+      tSpan = sp;
+      tStartX = touch.clientX;
+      tStartY = touch.clientY;
 
-        tTimer = setTimeout(() => {
-          const txt = (tSpan?.textContent || "").trim();
-          if (!txt) return;
-          showAt(tStartX + 6, tStartY + 6, txt);
-        }, LONGPRESS_MS);
-      },
-      { capture: true, passive: true }
-    );
+      tTimer = setTimeout(() => {
+        const txt = (tSpan?.textContent || "").trim();
+        if (!txt) return;
+        showAt(tStartX + 6, tStartY + 6, txt);
+      }, LONGPRESS_MS);
+    }, { capture: true, passive: true });
 
     document.addEventListener("touchend", clearTouchLP, true);
     document.addEventListener("touchcancel", clearTouchLP, true);
-    document.addEventListener(
-      "touchmove",
-      (e) => {
-        if (!tTimer) return;
-        const touch = e.touches && e.touches[0];
-        if (!touch) return;
-        const dx = Math.abs(touch.clientX - tStartX);
-        const dy = Math.abs(touch.clientY - tStartY);
-        if (dx + dy > 12) clearTouchLP();
-      },
-      { capture: true, passive: true }
-    );
+    document.addEventListener("touchmove", (e) => {
+      if (!tTimer) return;
+      const touch = e.touches && e.touches[0];
+      if (!touch) return;
+      const dx = Math.abs(touch.clientX - tStartX);
+      const dy = Math.abs(touch.clientY - tStartY);
+      if (dx + dy > 12) clearTouchLP();
+    }, { capture: true, passive: true });
 
     // Selection popup still allowed
-    document.addEventListener(
-      "mouseup",
-      (e) => {
-        const sel = window.getSelection?.();
-        const s = sel ? String(sel.toString() || "") : "";
-        const txt = s.trim();
-        if (!txt || txt.length < 2) return;
+    document.addEventListener("mouseup", (e) => {
+      const sel = window.getSelection?.();
+      const s = sel ? String(sel.toString() || "") : "";
+      const txt = s.trim();
+      if (!txt || txt.length < 2) return;
 
-        const root = findContentRoot();
-        if (!root || !root.contains(e.target)) return;
+      const root = findContentRoot();
+      if (!root || !root.contains(e.target)) return;
 
-        showAt(e.clientX + 6, e.clientY + 6, txt);
-      },
-      true
-    );
+      showAt(e.clientX + 6, e.clientY + 6, txt);
+    }, true);
 
     return { hide };
   }
@@ -1390,120 +1266,112 @@
   // ==========================================================
   // Navigation hooks
   // ==========================================================
-  function installNextButtonHook(onNav) {
-    document.addEventListener(
-      "click",
-      (e) => {
-        const t = e.target;
-        if (!t) return;
+      function installNextButtonHook(onNav) {
+        document.addEventListener("click", (e) => {
+          const t = e.target;
+          if (!t) return;
+      
+          // Accept button, link, or role=button containers
+          const el =
+            t.closest?.("button, a, [role='button']") ||
+            t.closest?.("[aria-label]") ||
+            null;
+      
+          if (!el) return;
+      
+          // Fast-path: rel=next
+          if (el.getAttribute?.("rel")?.toLowerCase() === "next") {
+            setTimeout(() => onNav("next-rel"), 20);
+            return;
+          }
+      
+          // Check aria-label/title
+          const aria = (el.getAttribute?.("aria-label") || "").toLowerCase();
+          const title = (el.getAttribute?.("title") || "").toLowerCase();
+          if (aria.includes("next") || title.includes("next")) {
+            setTimeout(() => onNav("next-aria"), 20);
+            return;
+          }
+      
+          // Check visible text
+          const txt = normalizeWeirdSpaces(el.textContent || "").trim().toLowerCase();
+          if (txt === "next" || txt.startsWith("next ")) {
+            setTimeout(() => onNav("next-text"), 20);
+            return;
+          }
+      
+          // Check href for chapter navigation
+          const href = el.getAttribute?.("href") || "";
+          if (/\/chapter-\d+/i.test(href)) {
+            setTimeout(() => onNav("next-href"), 20);
+            return;
+          }
+        }, true);
+      }
 
-        const el = t.closest?.("button, a, [role='button']") || t.closest?.("[aria-label]") || null;
-        if (!el) return;
-
-        if (el.getAttribute?.("rel")?.toLowerCase() === "next") {
-          setTimeout(() => onNav("next-rel"), 20);
-          return;
-        }
-
-        const aria = (el.getAttribute?.("aria-label") || "").toLowerCase();
-        const title = (el.getAttribute?.("title") || "").toLowerCase();
-        if (aria.includes("next") || title.includes("next")) {
-          setTimeout(() => onNav("next-aria"), 20);
-          return;
-        }
-
-        const txt = normalizeWeirdSpaces(el.textContent || "").trim().toLowerCase();
-        if (txt === "next" || txt.startsWith("next ")) {
-          setTimeout(() => onNav("next-text"), 20);
-          return;
-        }
-
-        const href = el.getAttribute?.("href") || "";
-        if (/\/chapter-\d+/i.test(href)) {
-          setTimeout(() => onNav("next-href"), 20);
-          return;
-        }
-      },
-      true
-    );
-  }
 
   function installHistoryHooks(onNav) {
     const fire = () => setTimeout(() => onNav("history"), 60);
     window.addEventListener("popstate", fire);
 
     const _push = history.pushState;
-    const _rep = history.replaceState;
-    history.pushState = function () {
-      const r = _push.apply(this, arguments);
-      fire();
-      return r;
-    };
-    history.replaceState = function () {
-      const r = _rep.apply(this, arguments);
-      fire();
-      return r;
-    };
+    const _rep  = history.replaceState;
+    history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
+    history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
 
     window.addEventListener("pageshow", fire, true);
-    document.addEventListener(
-      "visibilitychange",
-      () => {
-        if (!document.hidden) fire();
-      },
-      true
-    );
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
   }
 
-  function installChapterBodyObserver(onNav) {
-    let lastCb = null;
-    let debounce = null;
-    let mo = null;
-
-    function attach(cb) {
-      if (!cb || cb === lastCb) return;
-
-      if (mo) {
-        try {
-          mo.disconnect();
-        } catch {}
-        mo = null;
+      function installChapterBodyObserver(scheduleSweep) {
+        let lastCb = null;
+        let debounce = null;
+        let mo = null;
+      
+        function attach(cb) {
+          if (!cb || cb === lastCb) return;
+      
+          // Disconnect previous observer to avoid buildup
+          if (mo) {
+            try { mo.disconnect(); } catch {}
+            mo = null;
+          }
+      
+          lastCb = cb;
+      
+          mo = new MutationObserver(() => {
+            if (debounce) return;
+            debounce = setTimeout(() => {
+              debounce = null;
+              scheduleSweep("chapter-body-mutation");
+            }, CHAPTER_OBS_DEBOUNCE_MS);
+          });
+      
+          mo.observe(cb, { childList: true, subtree: true });
+        }
+      
+        const t = setInterval(() => {
+          const cb = document.querySelector(".chapter-body");
+          if (cb && cb !== lastCb) attach(cb);
+        }, 800);
+      
+        setTimeout(() => {
+          clearInterval(t);
+        }, 15000);
       }
 
-      lastCb = cb;
-
-      mo = new MutationObserver(() => {
-        if (debounce) return;
-        debounce = setTimeout(() => {
-          debounce = null;
-          onNav("chapter-body-mutation");
-        }, CHAPTER_OBS_DEBOUNCE_MS);
-      });
-
-      mo.observe(cb, { childList: true, subtree: true });
+      function installUrlChangeWatcher(onNav) {
+      let lastHref = location.href;
+    
+      setInterval(() => {
+        const href = location.href;
+        if (href !== lastHref) {
+          lastHref = href;
+          onNav("url-change");
+        }
+      }, 250);
     }
 
-    const t = setInterval(() => {
-      const cb = document.querySelector(".chapter-body");
-      if (cb && cb !== lastCb) attach(cb);
-    }, 800);
-
-    setTimeout(() => {
-      clearInterval(t);
-    }, 15000);
-  }
-
-  function installUrlChangeWatcher(onNav) {
-    let lastHref = location.href;
-
-    setInterval(() => {
-      const href = location.href;
-      if (href !== lastHref) {
-        lastHref = href;
-        onNav("url-change");
-      }
-    }, 250);
-  }
 
   // ==========================================================
   // Main
@@ -1540,18 +1408,15 @@
       roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
       onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong,
       termMemoryAssist: !!upgrades.termMemoryAssist,
-      enforcePinnedTermsOnPlainText: !!upgrades.enforcePinnedTermsOnPlainText,
+      enforcePinnedTermsOnPlainText: !!upgrades.enforcePinnedTermsOnPlainText
     };
 
     const characters = {
       ...(glossary.default?.characters || {}),
-      ...(cfg.characters || {}),
+      ...(cfg.characters || {})
     };
     const entries = Object.entries(characters);
-    if (!entries.length) {
-      ui.setGlossaryOk(false);
-      return;
-    }
+    if (!entries.length) { ui.setGlossaryOk(false); return; }
     ui.setGlossaryOk(true);
 
     const cfgTerms = cfg.terms || {};
@@ -1573,6 +1438,8 @@
           if (!m.addedNodes || !m.addedNodes.length) continue;
           for (const n of m.addedNodes) {
             if (!(n instanceof Element)) continue;
+    
+            // If the new subtree contains chapter-body, trigger a sweep.
             if (n.matches?.(".chapter-body") || n.querySelector?.(".chapter-body")) {
               onNav("chapter-body-replaced");
               return;
@@ -1580,16 +1447,15 @@
           }
         }
       });
-
+    
+      // Observe only direct structural changes; NOT characterData.
       mo.observe(document.body, { childList: true, subtree: true });
     }
 
+    
     function loadChapterState() {
-      try {
-        return JSON.parse(sessionStorage.getItem(chapterStateKey) || "{}");
-      } catch {
-        return {};
-      }
+      try { return JSON.parse(sessionStorage.getItem(chapterStateKey) || "{}"); }
+      catch { return {}; }
     }
     function saveChapterState(st) {
       sessionStorage.setItem(chapterStateKey, JSON.stringify(st || {}));
@@ -1651,9 +1517,6 @@
     let running = false;
     let lastRunAt = 0;
 
-    // STABILITY FIX #2: warmup window should restart after navigation (not only initial page load)
-    let monitorWarmStart = Date.now();
-
     function rootPatchedFor(root, chapterId) {
       return root?.dataset?.wtrpfPatchedChapter === String(chapterId);
     }
@@ -1670,26 +1533,17 @@
       b.dataset.wtrpfPatched = "1";
     }
 
-    // forceFull bypasses cooldown + signature skip
+    // ✅ KEY FIX: forceFull bypasses cooldown + signature skip
     function run({ forceFull = false } = {}) {
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
       if (running) return;
 
       const now = Date.now();
-      if (!forceFull && now - lastRunAt < SELF_MUTATION_COOLDOWN_MS) return;
+      if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
 
       const root = findContentRoot();
-      const urlCid = getUrlChapterId();
-      const domCid = getDomChapterId(root);
-
-      // STABILITY FIX #3: keep ONE consistent mismatch gate (removed duplicate copies)
-      // During SPA nav, URL often changes before DOM. If URL has a real chapter, wait until DOM catches up.
-      if (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) return;
-      if (urlCid !== "unknown" && domCid === "unknown") return;
-
-      const chapterId = domCid !== "unknown" ? domCid : urlCid;
-
+      const chapterId = getChapterId(root);
       if (!contentReady(root)) return;
 
       const sig = chapterSignature(root);
@@ -1704,17 +1558,16 @@
           lastActorGender = null;
           lastActorTTL = 0;
 
-          try {
-            if (root?.dataset) {
-              delete root.dataset.wtrpfPatchedChapter;
-            }
-            root?.querySelectorAll?.("[data-wtrpf-patched], [data-wtrpf-patched-chapter]").forEach((el) => {
-              if (el?.dataset) {
+          // If React reuses DOM nodes between chapters, clear old patch markers
+          // If React reuses DOM nodes between chapters, clear old patch markers
+            try {
+              if (root?.dataset) delete root.dataset.wtrpfPatchedChapter;
+              root?.querySelectorAll?.("[data-wtrpf-patched], [data-wtrpf-patched-chapter]").forEach(el => {
                 delete el.dataset.wtrpfPatched;
                 delete el.dataset.wtrpfPatchedChapter;
-              }
-            });
-          } catch {}
+              });
+            } catch {}
+
         }
 
         const st0 = loadChapterState();
@@ -1745,7 +1598,7 @@
         const doFullPass = forceFull || !alreadyPatched;
 
         const blocksAll = getTextBlocks(root);
-        const blocks = doFullPass ? blocksAll : blocksAll.filter((b) => !blockIsPatched(b));
+        const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
         if (!blocks.length) return;
 
         let lastGender = null;
@@ -1754,10 +1607,7 @@
 
         for (const b of blocks) {
           const bt = (b.innerText || "").trim();
-          if (!bt) {
-            markBlockPatched(b);
-            continue;
-          }
+          if (!bt) { markBlockPatched(b); continue; }
 
           if (isSceneBreak(bt)) {
             lastGender = null;
@@ -1804,7 +1654,7 @@
           }
 
           if (g) {
-            const dir = g === "female" ? "toFemale" : "toMale";
+            const dir = (g === "female") ? "toFemale" : "toMale";
             let doFull = true;
             if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
             if (doFull) {
@@ -1834,116 +1684,116 @@
         }
 
         // Record what the chapter looks like AFTER we apply changes.
-        const sigAfter = chapterSignature(root);
-        if (sigAfter) {
-          setAppliedSig(novelKey, chapterId, sigAfter);
-          lastSig = sigAfter;
-        } else {
-          lastSig = sig;
-        }
-
-        saveChapterState(st);
+        // If React overwrites later, signature will diverge and we can re-apply.
+                 const sigAfter = chapterSignature(root);
+          if (sigAfter) {
+            setAppliedSig(novelKey, chapterId, sigAfter);
+            lastSig = sigAfter; // keep in sync with the DOM AFTER edits
+          } else {
+            lastSig = sig;
+          }
+          
+          saveChapterState(st);
+        
       } finally {
         running = false;
         lastRunAt = Date.now();
       }
     }
 
-    function startChapterMonitor() {
-      setInterval(() => {
-        if (!ui.isEnabled()) return;
-        if (document.hidden) return;
-        if (running) return;
+          function startChapterMonitor() {
+        let startedAt = Date.now();
+      
+        setInterval(() => {
+          if (!ui.isEnabled()) return;
+          if (document.hidden) return;
+          if (running) return;
+      
+          const root = findContentRoot();
+          if (!contentReady(root)) return;
+      
+          const cid = getChapterId(root);
+          const sigNow = chapterSignature(root);
+          if (!cid || !sigNow) return;
+      
+          const applied = getAppliedSig(novelKey, cid);
+      
+          // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
+          if (!applied || sigNow !== applied) {
+            run({ forceFull: true });
+            return;
+          }
+      
+          // Optional: during the first few seconds after load/nav, also do a light pass
+          // to catch late paragraph insertions that don't change signature enough.
+          if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
+            run({ forceFull: false });
+          }
+        }, CHAPTER_MONITOR_MS);
+      }
 
-        const root = findContentRoot();
-        if (!contentReady(root)) return;
-
-        const urlCid = getUrlChapterId();
-        const cid = getDomChapterId(root);
-
-        // wait until DOM catches up to URL chapter
-        if (urlCid !== "unknown" && cid !== "unknown" && cid !== urlCid) return;
-        if (urlCid !== "unknown" && cid === "unknown") return;
-
-        // never treat "unknown" as real chapter id
-        if (!cid || cid === "unknown") return;
-
-        const sigNow = chapterSignature(root);
-        if (!sigNow) return;
-
-        const applied = getAppliedSig(novelKey, cid);
-
-        // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
-        if (!applied || sigNow !== applied) {
-          run({ forceFull: true });
-          return;
-        }
-
-        // Warmup window after load/nav: do extra light passes to catch late insertions
-        if (Date.now() - monitorWarmStart < CHAPTER_MONITOR_WARMUP_MS) {
-          run({ forceFull: false });
-        }
-      }, CHAPTER_MONITOR_MS);
-    }
 
     // ==========================================================
-    // Nav sweep
+    // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
     // ==========================================================
-    let navSweepTimer = null;
+       let navSweepTimer = null;
 
-    function stopNavSweep() {
-      if (navSweepTimer) clearInterval(navSweepTimer);
-      navSweepTimer = null;
-    }
-
-    function startNavSweep(reason = "nav") {
-      stopNavSweep();
-
-      const startAt = Date.now();
-      let stableHits = 0;
-      let lastSeenChapterId = null;
-
-      navSweepTimer = setInterval(() => {
-        if (Date.now() - startAt > NAV_SWEEP_MS) {
+        function stopNavSweep() {
+          if (navSweepTimer) clearInterval(navSweepTimer);
+          navSweepTimer = null;
+        }
+        
+        function startNavSweep(reason = "nav") {
           stopNavSweep();
-          return;
+        
+          const startAt = Date.now();
+          let stableHits = 0;
+          let lastSeenChapterId = null;
+        
+          navSweepTimer = setInterval(() => {
+            // hard stop
+            if (Date.now() - startAt > NAV_SWEEP_MS) {
+              stopNavSweep();
+              return;
+            }
+        
+            const root = findContentRoot();
+            if (!contentReady(root)) return; // keep waiting
+        
+            const cid = getChapterId(root);
+            const sigNow = chapterSignature(root);
+            if (!cid || !sigNow) return;
+        
+            // if chapter changed during sweep, reset stability counter
+            if (cid !== lastSeenChapterId) {
+              lastSeenChapterId = cid;
+              stableHits = 0;
+        
+              // minimise on nav (kept behavior)
+              localStorage.setItem(UI_KEY_MIN, "1");
+              ui.setMinimized(true);
+            }
+        
+            const applied = getAppliedSig(novelKey, cid);
+        
+            // If not yet applied (or React overwrote), force re-apply now
+            if (!applied || sigNow !== applied) {
+              run({ forceFull: true });
+              stableHits = 0;
+              return;
+            }
+        
+            // Already applied; require a couple consecutive confirmations before stopping
+            stableHits++;
+            if (stableHits >= 2) stopNavSweep();
+          }, NAV_POLL_MS);
         }
 
-        const root = findContentRoot();
-        if (!contentReady(root)) return;
-
-        const cid = getDomChapterId(root);
-        const sigNow = chapterSignature(root);
-        if (!cid || cid === "unknown" || !sigNow) return;
-
-        if (cid !== lastSeenChapterId) {
-          lastSeenChapterId = cid;
-          stableHits = 0;
-
-          localStorage.setItem(UI_KEY_MIN, "1");
-          ui.setMinimized(true);
-        }
-
-        const applied = getAppliedSig(novelKey, cid);
-
-        if (!applied || sigNow !== applied) {
-          run({ forceFull: true });
-          stableHits = 0;
-          return;
-        }
-
-        stableHits++;
-        if (stableHits >= 2) stopNavSweep();
-      }, NAV_POLL_MS);
-    }
 
     // ==========================================================
-    // Hooks
+    // Hooks (B)
     // ==========================================================
     const onNav = (why) => {
-      // warmup reset on every nav trigger
-      monitorWarmStart = Date.now();
-
       localStorage.setItem(UI_KEY_MIN, "1");
       ui.setMinimized(true);
       startNavSweep(String(why || "nav"));
@@ -1955,8 +1805,11 @@
     installChapterBodyReplaceWatcher(onNav);
     installUrlChangeWatcher(onNav);
 
-    // Initial run + start monitor
+
+    // Initial run
     run({ forceFull: true });
+
+    // Start watchdog
     startChapterMonitor();
 
     // Light observer for late paragraph insertions on the initial root only (debounced)
@@ -1972,6 +1825,7 @@
         }, 260);
       });
       mo.observe(root0, { childList: true, subtree: true });
+
     }
   })();
 })();
