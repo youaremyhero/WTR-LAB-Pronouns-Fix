@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2
+// @version      1.2.1
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -1321,6 +1321,45 @@
     return { hide };
   }
 
+  // URL+DOM route observer” that cannot miss SPA transitions
+    function installRouteObserver(onNav) {
+    let lastHref = location.href;
+    let lastFire = 0;
+  
+    const fire = (why) => {
+      const now = Date.now();
+      if (now - lastFire < 250) return; // debounce
+      lastFire = now;
+      onNav(why);
+    };
+  
+    // 1) MutationObserver on BODY subtree (SPA content swaps)
+    const mo = new MutationObserver(() => {
+      const href = location.href;
+      if (href !== lastHref) {
+        lastHref = href;
+        fire("mo-href-change");
+        return;
+      }
+  
+      // Even if href didn't change, reader content often re-renders
+      // so still fire lightly (nav sweep will decide whether to run)
+      fire("mo-dom-change");
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  
+    // 2) Also patch history (some sites update URL without DOM mutations immediately)
+    const _push = history.pushState;
+    const _rep = history.replaceState;
+    history.pushState = function () { const r = _push.apply(this, arguments); fire("pushState"); return r; };
+    history.replaceState = function () { const r = _rep.apply(this, arguments); fire("replaceState"); return r; };
+    window.addEventListener("popstate", () => fire("popstate"), true);
+  
+    // 3) Immediate invoke
+    fire("route-init");
+  }
+
+
   // ==========================================================
   // Navigation hooks
   // ==========================================================
@@ -1950,6 +1989,13 @@
     const onNav = (why) => {
       localStorage.setItem(UI_KEY_MIN, "1");
       ui.setMinimized(true);
+    
+      // Run a couple of forced attempts quickly (covers Firefox Android timing weirdness)
+      setTimeout(() => run({ forceFull: true }), 60);
+      setTimeout(() => run({ forceFull: true }), 260);
+      setTimeout(() => run({ forceFull: true }), 620);
+    
+      // Keep your sweep as a backstop
       startNavSweep(String(why || "nav"));
     };
 
@@ -1958,6 +2004,8 @@
     installChapterBodyObserver(onNav);
     installChapterBodyReplaceWatcher(onNav);
     installUrlChangeWatcher(onNav, ui.isEnabled);
+    installRouteObserver(onNav);
+
 
     // Initial run
     run({ forceFull: true });
