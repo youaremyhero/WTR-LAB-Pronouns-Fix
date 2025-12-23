@@ -556,12 +556,14 @@
   
     function resolve() {
       const newRoot = findContentRoot();
-      if (!newRoot || newRoot === currentRoot) return;
-  
+      if (!newRoot) return false;
+      if (newRoot === currentRoot) return true;
+    
       observe(newRoot);
       onRootChange(newRoot);
+      return true;
     }
-  
+
     // Initial resolve
     resolve();
   
@@ -571,7 +573,15 @@
       disconnect
     };
   }
-  
+
+  // ==========================================================
+  // Root manager instance (ADD THIS)
+  // ==========================================================
+  const rootManager = createRootObserverManager((newRoot) => {
+    console.log("[WTRPF] Root changed:", newRoot);
+    // Do NOT auto-run here; nav sweep controls execution
+  });
+
   // ==========================================================
   // Character detection
   // ==========================================================
@@ -1385,7 +1395,7 @@
       const txt = s.trim();
       if (!txt || txt.length < 2) return;
     
-      const root = findContentRoot();
+      const root = rootManager?.getRoot() || findContentRoot();
       if (!root || !root.contains(e.target)) return;
     
       showAt(e.clientX + 6, e.clientY + 6, txt);
@@ -2153,19 +2163,19 @@
       startChapterMonitor();
       
       // Light observer for late paragraph insertions on the initial root only (debounced)
-      const root0 = findContentRoot();
-      if (root0 && root0 !== document.body) {
-        let incrTimer = null;
-        const mo = new MutationObserver(() => {
-          if (!ui.isEnabled()) return;
-          if (incrTimer) return;
-          incrTimer = setTimeout(() => {
-            incrTimer = null;
-            run({ forceFull: false });
-          }, 260);
-        });
-        mo.observe(root0, { childList: true, subtree: true });
-      }
+     // const root0 = findContentRoot();
+  //    if (root0 && root0 !== document.body) {
+      //  let incrTimer = null;
+       // const mo = new MutationObserver(() => {
+       //   if (!ui.isEnabled()) return;
+        //  if (incrTimer) return;
+      //    incrTimer = setTimeout(() => {
+       //     incrTimer = null;
+       //     run({ forceFull: false });
+       //   }, 260);
+       // });
+     //   mo.observe(root0, { childList: true, subtree: true });
+   //   }
 
   })();
 })();
