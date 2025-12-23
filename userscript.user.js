@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2.5
+// @version      1.2.6
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -1993,130 +1993,126 @@
       }, CHAPTER_MONITOR_MS);
     }
 
-    // Nav sweep (A)
-    function startNavSweep(reason = "nav") {
-      stopNavSweep();
-    
-      const startAt = Date.now();
-      let stableHits = 0;
-      let lastSeenChapterId = null;
-    
-      navSweepTimer = setInterval(() => {
-        if (!ui.isEnabled() || document.hidden) {
-          stopNavSweep();
-          return;
-        }
-    
-        // hard stop
-        if (Date.now() - startAt > NAV_SWEEP_MS) {
-          stopNavSweep();
-          return;
-        }
-    
-        const root = findContentRoot();
-        if (!root || root === document.body) return;
-        if (!contentReady(root)) return; // keep waiting
-    
-        // ✅ CRITICAL: URL/DOM mismatch guard (prevents stopping on old chapter)
-        const urlCid = getUrlChapterId();
-        const domCid = getDomChapterId(root);
-    
-        // If URL already moved but DOM hasn’t caught up yet, keep sweeping.
-        // Do NOT let stableHits reach the stop condition.
-        if (urlCid !== "unknown" && domCid !== "unknown" && urlCid !== domCid) {
-          stableHits = 0;
-          return;
-        }
-        if (urlCid !== "unknown" && domCid === "unknown") {
-          stableHits = 0;
-          return;
-        }
-    
-        const cid = getChapterId(root);
-        const sigNow = chapterSignature(root);
-        if (!cid || !sigNow) return;
-    
-        // if chapter changed during sweep, reset stability counter
-        if (cid !== lastSeenChapterId) {
-          lastSeenChapterId = cid;
-          stableHits = 0;
-    
-          // minimise on nav (kept behavior)
-          localStorage.setItem(UI_KEY_MIN, "1");
-          ui.setMinimized(true);
-        }
-    
-        const applied = getAppliedSig(novelKey, cid);
-    
-        // If not yet applied (or React overwrote), force re-apply now
-        if (!applied || sigNow !== applied) {
-          run({ forceFull: true });
-          stableHits = 0;
-          return;
-        }
-    
-        // Already applied; require a couple consecutive confirmations before stopping
-        stableHits++;
-        if (stableHits >= 2) stopNavSweep();
-      }, NAV_POLL_MS);
-    }
-
-    // ==========================================================
-    // Hooks (B)
-    // ==========================================================
+      // Nav sweep (A) — hardened so we ONLY apply once URL+DOM agree AND content is ready
+      function startNavSweep(reason = "nav") {
+        stopNavSweep();
       
-    const onNav = (why) => {
-      console.log("[WTRPF] onNav fired:", why, "href=", location.href);
+        const startAt = Date.now();
+        let stableHits = 0;
+        let lastSeenChapterId = null;
+      
+        navSweepTimer = setInterval(() => {
+          if (!ui.isEnabled() || document.hidden) {
+            stopNavSweep();
+            return;
+          }
+      
+          // hard stop
+          if (Date.now() - startAt > NAV_SWEEP_MS) {
+            stopNavSweep();
+            return;
+          }
+      
+          const root = findContentRoot();
+          if (!root || root === document.body) return;
+      
+          // Wait until chapter reading content is actually present
+          if (!contentReady(root)) {
+            stableHits = 0;
+            return;
+          }
+      
+          // ✅ STRICT: do not proceed until URL + DOM chapter ids match
+          const urlCid = getUrlChapterId();
+          const domCid = getDomChapterId(root);
+      
+          // If either is unknown, we still consider it transitional; keep sweeping.
+          if (urlCid === "unknown" || domCid === "unknown" || urlCid !== domCid) {
+            stableHits = 0;
+            return;
+          }
+      
+          // Now safe: we are on the new chapter and content is ready
+          const cid = urlCid; // urlCid === domCid
+      
+          // If chapter changed during sweep, reset stability counter + minimize UI (kept behavior)
+          if (cid !== lastSeenChapterId) {
+            lastSeenChapterId = cid;
+            stableHits = 0;
+      
+            localStorage.setItem(UI_KEY_MIN, "1");
+            ui.setMinimized(true);
+          }
+      
+          const sigNow = chapterSignature(root);
+          if (!sigNow) {
+            stableHits = 0;
+            return;
+          }
+      
+          const applied = getAppliedSig(novelKey, cid);
+      
+          // If not yet applied (or React overwrote), force re-apply now
+          if (!applied || sigNow !== applied) {
+            run({ forceFull: true });
+            stableHits = 0;
+            return;
+          }
+      
+          // Already applied; require a couple consecutive confirmations before stopping
+          stableHits++;
+          if (stableHits >= 2) stopNavSweep();
+        }, NAV_POLL_MS);
+      }
+      
+      // ==========================================================
+      // Hooks (B) — simplify: NO early forced runs; sweep decides when it's safe
+      // ==========================================================
+      const onNav = (why) => {
+        console.log("[WTRPF] onNav fired:", why, "href=", location.href);
+      
+        // keep behavior: minimize on nav
         localStorage.setItem(UI_KEY_MIN, "1");
         ui.setMinimized(true);
       
-        setTimeout(() => run({ forceFull: true }), 60);
-        setTimeout(() => run({ forceFull: true }), 260);
+        // IMPORTANT: reset session gates so we never think we're already done for the new chapter
+        lastSig = "";
+        lastChapterId = null;
       
-        // third attempt only if still not applied (cheap check)
-        setTimeout(() => {
-          const root = findContentRoot();
-          if (!root || !contentReady(root)) return;
-          const cid = getChapterId(root);
-          const sigNow = chapterSignature(root);
-          const applied = getAppliedSig(novelKey, cid);
-          if (!applied || sigNow !== applied) run({ forceFull: true });
-        }, 620);
-      
+        // Let sweep wait for URL+DOM+contentReady, then forceFull at the correct moment
         startNavSweep(String(why || "nav"));
       };
+      
+      installNextButtonHook(onNav);
+      installUrlChangeWatcher(onNav, ui.isEnabled);
+      installChapterBodyReplaceWatcher(onNav);
+      // Optional (lite only)
+      installHistoryHooksLite(onNav);
+      // Remove these:
+      // installHistoryHooks(onNav);
+      // installChapterBodyObserver(onNav);
+      // installRouteObserver(onNav);
+      
+      // Initial run
+      run({ forceFull: true });
+      
+      // Start watchdog
+      startChapterMonitor();
+      
+      // Light observer for late paragraph insertions on the initial root only (debounced)
+      const root0 = findContentRoot();
+      if (root0 && root0 !== document.body) {
+        let incrTimer = null;
+        const mo = new MutationObserver(() => {
+          if (!ui.isEnabled()) return;
+          if (incrTimer) return;
+          incrTimer = setTimeout(() => {
+            incrTimer = null;
+            run({ forceFull: false });
+          }, 260);
+        });
+        mo.observe(root0, { childList: true, subtree: true });
+      }
 
-installNextButtonHook(onNav);
-installUrlChangeWatcher(onNav, ui.isEnabled);
-installChapterBodyReplaceWatcher(onNav);
-// Optional (lite only)
-installHistoryHooksLite(onNav);
-// Remove these:
-// installHistoryHooks(onNav);
-// installChapterBodyObserver(onNav);
-// installRouteObserver(onNav);
-
-
-    // Initial run
-    run({ forceFull: true });
-
-    // Start watchdog
-    startChapterMonitor();
-
-    // Light observer for late paragraph insertions on the initial root only (debounced)
-    const root0 = findContentRoot();
-    if (root0 && root0 !== document.body) {
-      let incrTimer = null;
-      const mo = new MutationObserver(() => {
-        if (!ui.isEnabled()) return;
-        if (incrTimer) return;
-        incrTimer = setTimeout(() => {
-          incrTimer = null;
-          run({ forceFull: false });
-        }, 260);
-      });
-      mo.observe(root0, { childList: true, subtree: true });
-
-    }
   })();
 })();
