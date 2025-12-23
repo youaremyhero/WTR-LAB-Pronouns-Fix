@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.0.2
+// @version      1.2
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -125,13 +125,20 @@
     return (h >>> 0).toString(16);
   }
 
-  function chapterSignature(root) {
-    if (!root) return "";
-    const domCid = getDomChapterId(root);
-    const txt = normalizeWeirdSpaces((root.innerText || "").trim());
-    if (!txt) return `${domCid}|len:0|h:0`;
-    return `${domCid}|len:${txt.length}|h:${hash32(txt)}`;
-  }
+    function chapterSignature(root) {
+      if (!root) return "";
+      const domCid = getDomChapterId(root);
+    
+      // Only hash actual reading blocks to avoid reruns from injected UI bits.
+      const blocks = getTextBlocks(root);
+      const joined = blocks
+        .map(b => normalizeWeirdSpaces((b.textContent || "").trim()))
+        .filter(Boolean)
+        .join("\n");
+    
+      if (!joined) return `${domCid}|len:0|h:0`;
+      return `${domCid}|len:${joined.length}|h:${hash32(joined)}`;
+    }
 
     function appliedSigKey(novelKey) {
     return APPLIED_SIG_KEY_PREFIX + novelKey;
@@ -325,8 +332,15 @@
     return m ? `wtr-lab.com/en/novel/${m[1]}/` : "wtr-lab.com/en/novel/";
   }
   function getChapterId(root) {
-    return getDomChapterId(root) || getUrlChapterId();
-  }
+  const domCid = getDomChapterId(root);
+  if (domCid && domCid !== "unknown") return domCid;
+
+  const urlCid = getUrlChapterId();
+  if (urlCid && urlCid !== "unknown") return urlCid;
+
+  return "unknown";
+}
+
 
   function termMemKey(novelKey) { return TERM_MEM_KEY_PREFIX + novelKey; }
 
@@ -443,7 +457,7 @@
       const score = (pCount * 1200) + textLen;
       if (score > bestScore && textLen > 300) { bestScore = score; best = el; }
     }
-    return best || document.body;
+    return best || null;
   }
 
   const SKIP_CLOSEST = [
@@ -670,7 +684,7 @@
         const rect = el.getBoundingClientRect();
         startTop = rect.top;
         startLeft = rect.left;
-        el.setPointerCapture(e.pointerId);
+        try { el.setPointerCapture(e.pointerId); } catch {}
       });
 
       el.addEventListener("pointermove", e => {
@@ -1182,35 +1196,35 @@
     function findTermSpanFromTarget(target) {
       return target?.closest?.("span.text-patch.system[data-hash]") || null;
     }
-
+    
     // Pointer-based (desktop/most browsers)
     let lpTimer = null;
     let lpSpan = null;
     let lpStartX = 0;
     let lpStartY = 0;
-
+    
     function clearLP() {
       if (lpTimer) clearTimeout(lpTimer);
       lpTimer = null;
       lpSpan = null;
     }
-
+    
     document.addEventListener("pointerdown", (e) => {
       const sp = findTermSpanFromTarget(e.target);
       if (!sp) return;
-
+    
       clearLP();
       lpSpan = sp;
       lpStartX = e.clientX;
       lpStartY = e.clientY;
-
+    
       lpTimer = setTimeout(() => {
         const txt = (lpSpan?.textContent || "").trim();
         if (!txt) return;
         showAt(lpStartX + 6, lpStartY + 6, txt);
       }, LONGPRESS_MS);
     }, true);
-
+    
     document.addEventListener("pointerup", clearLP, true);
     document.addEventListener("pointercancel", clearLP, true);
     document.addEventListener("pointermove", (e) => {
@@ -1219,111 +1233,147 @@
       const dy = Math.abs(e.clientY - lpStartY);
       if (dx + dy > 10) clearLP();
     }, true);
-
-    // Touch fallback (Firefox Android)
+    
+    // Touch fallback (Firefox Android) — improved
     let tTimer = null;
     let tSpan = null;
     let tStartX = 0;
     let tStartY = 0;
-
+    let tTriggered = false;
+    
     function clearTouchLP() {
       if (tTimer) clearTimeout(tTimer);
       tTimer = null;
       tSpan = null;
+      tTriggered = false;
     }
-
+    
     document.addEventListener("touchstart", (e) => {
       const touch = e.touches && e.touches[0];
       if (!touch) return;
-
+    
       const sp = findTermSpanFromTarget(e.target);
       if (!sp) return;
-
+    
       clearTouchLP();
       tSpan = sp;
       tStartX = touch.clientX;
       tStartY = touch.clientY;
-
+    
+      // Important: passive:false so we *can* preventDefault when the long-press triggers
       tTimer = setTimeout(() => {
         const txt = (tSpan?.textContent || "").trim();
         if (!txt) return;
+    
+        // We are intentionally taking over the gesture now.
+        tTriggered = true;
+        try { e.preventDefault(); } catch {}
+        try { e.stopPropagation(); } catch {}
+    
         showAt(tStartX + 6, tStartY + 6, txt);
       }, LONGPRESS_MS);
-    }, { capture: true, passive: true });
-
-    document.addEventListener("touchend", clearTouchLP, true);
-    document.addEventListener("touchcancel", clearTouchLP, true);
+    }, { capture: true, passive: false });
+    
     document.addEventListener("touchmove", (e) => {
       if (!tTimer) return;
       const touch = e.touches && e.touches[0];
       if (!touch) return;
+    
       const dx = Math.abs(touch.clientX - tStartX);
       const dy = Math.abs(touch.clientY - tStartY);
       if (dx + dy > 12) clearTouchLP();
     }, { capture: true, passive: true });
-
+    
+    document.addEventListener("touchend", (e) => {
+      // If we triggered long-press, block the "ghost" click/select aftermath.
+      if (tTriggered) {
+        try { e.preventDefault(); } catch {}
+        try { e.stopPropagation(); } catch {}
+      }
+      clearTouchLP();
+    }, { capture: true, passive: false });
+    
+    document.addEventListener("touchcancel", clearTouchLP, { capture: true, passive: true });
+    
     // Selection popup still allowed
     document.addEventListener("mouseup", (e) => {
       const sel = window.getSelection?.();
       const s = sel ? String(sel.toString() || "") : "";
       const txt = s.trim();
       if (!txt || txt.length < 2) return;
-
+    
       const root = findContentRoot();
       if (!root || !root.contains(e.target)) return;
-
+    
       showAt(e.clientX + 6, e.clientY + 6, txt);
     }, true);
-
+    
+    function isClickInsidePopup(target) {
+      return popup.contains(target);
+    }
+    
+    document.addEventListener("pointerdown", (e) => {
+      if (popup.style.display !== "block") return;
+      if (isClickInsidePopup(e.target)) return;
+      hide();
+    }, true);
+    
     return { hide };
   }
 
   // ==========================================================
   // Navigation hooks
   // ==========================================================
-      function installNextButtonHook(onNav) {
-        document.addEventListener("click", (e) => {
-          const t = e.target;
-          if (!t) return;
-      
-          // Accept button, link, or role=button containers
-          const el =
-            t.closest?.("button, a, [role='button']") ||
-            t.closest?.("[aria-label]") ||
-            null;
-      
-          if (!el) return;
-      
-          // Fast-path: rel=next
-          if (el.getAttribute?.("rel")?.toLowerCase() === "next") {
-            setTimeout(() => onNav("next-rel"), 20);
-            return;
-          }
-      
-          // Check aria-label/title
-          const aria = (el.getAttribute?.("aria-label") || "").toLowerCase();
-          const title = (el.getAttribute?.("title") || "").toLowerCase();
-          if (aria.includes("next") || title.includes("next")) {
-            setTimeout(() => onNav("next-aria"), 20);
-            return;
-          }
-      
-          // Check visible text
-          const txt = normalizeWeirdSpaces(el.textContent || "").trim().toLowerCase();
-          if (txt === "next" || txt.startsWith("next ")) {
-            setTimeout(() => onNav("next-text"), 20);
-            return;
-          }
-      
-          // Check href for chapter navigation
-          const href = el.getAttribute?.("href") || "";
-          if (/\/chapter-\d+/i.test(href)) {
-            setTimeout(() => onNav("next-href"), 20);
-            return;
-          }
-        }, true);
-      }
-
+    function installNextButtonHook(onNav) {
+      document.addEventListener("click", (e) => {
+        const t = e.target;
+        if (!t) return;
+    
+        // Accept button, link, or role=button containers
+        const el =
+          t.closest?.("button, a, [role='button']") ||
+          t.closest?.("[aria-label]") ||
+          null;
+    
+        if (!el) return;
+    
+        // Fast-path: rel=next
+        if ((el.getAttribute?.("rel") || "").toLowerCase() === "next") {
+          setTimeout(() => onNav("next-rel"), 20);
+          return;
+        }
+    
+        // Check aria-label/title
+        const aria = (el.getAttribute?.("aria-label") || "").toLowerCase();
+        const title = (el.getAttribute?.("title") || "").toLowerCase();
+        if (aria.includes("next") || title.includes("next")) {
+          setTimeout(() => onNav("next-aria"), 20);
+          return;
+        }
+    
+        // Check visible text
+        const txt = normalizeWeirdSpaces(el.textContent || "").trim().toLowerCase();
+        if (txt === "next" || txt.startsWith("next ")) {
+          setTimeout(() => onNav("next-text"), 20);
+          return;
+        }
+    
+        // Restrict href-based detection to nav/pagination-ish areas OR chapter-looking links
+        const href = el.getAttribute?.("href") || "";
+        const looksLikeChapterLink = /\/chapter-\d+/i.test(href);
+    
+        const navish =
+          el.closest?.(".pagination, .pager, nav, header, [role='navigation'], .reader-nav, .chapter-nav") ||
+          el.matches?.("[rel='next'], [aria-label*='next' i], [title*='next' i]");
+    
+        if (!navish && !looksLikeChapterLink) return;
+    
+        if (looksLikeChapterLink) {
+          setTimeout(() => onNav("next-href"), 20);
+          return;
+        }
+      }, true);
+    }
 
   function installHistoryHooks(onNav) {
     const fire = () => setTimeout(() => onNav("history"), 60);
@@ -1338,7 +1388,7 @@
     document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
   }
 
-  function installChapterBodyObserver(scheduleSweep) {
+  function installChapterBodyObserver(onNav) {
     let lastCb = null;
     let debounce = null;
     let mo = null;
@@ -1358,7 +1408,7 @@
         if (debounce) return;
         debounce = setTimeout(() => {
           debounce = null;
-          scheduleSweep("chapter-body-mutation");
+          onNav("chapter-body-mutation");
         }, CHAPTER_OBS_DEBOUNCE_MS);
       });
 
@@ -1375,19 +1425,25 @@
     }, 15000);
   }
 
-  function installUrlChangeWatcher(onNav, isEnabled) {
-    let lastHref = location.href;
-
-    setInterval(() => {
-      if (!isEnabled() || document.hidden) return;
-      const href = location.href;
-      if (href !== lastHref) {
-        lastHref = href;
-        onNav("url-change");
+      function installUrlChangeWatcher(onNav, isEnabled) {
+        let lastHref = location.href;
+        let lastFireAt = 0;
+      
+        setInterval(() => {
+          if (!isEnabled() || document.hidden) return;
+      
+          const href = location.href;
+          if (href === lastHref) return;
+      
+          lastHref = href;
+      
+          const now = Date.now();
+          if (now - lastFireAt < 450) return; // throttle
+          lastFireAt = now;
+      
+          onNav("url-change");
+        }, 250);
       }
-    }, 250);
-  }
-
 
   // ==========================================================
   // Main
@@ -1480,6 +1536,7 @@
     function getChapterLastChanged(st, chapterId) {
       return Number(st?.lastByChapter?.[chapterId] || 0);
     }
+
     function setChapterLastChanged(st, chapterId, val) {
       if (!st.lastByChapter) st.lastByChapter = {};
       st.lastByChapter[chapterId] = val;
@@ -1549,87 +1606,140 @@
       b.dataset.wtrpfPatched = "1";
     }
 
-    // ✅ KEY FIX: forceFull bypasses cooldown + signature skip
+   // ✅ KEY FIX: forceFull bypasses cooldown + signature skip
     function run({ forceFull = false } = {}) {
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
       if (running) return;
-
+    
       const now = Date.now();
       if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
-
+    
       const root = findContentRoot();
+      if (!root) return;
+    
       const urlCid = getUrlChapterId();
       const domCid = getDomChapterId(root);
-      // During SPA nav, URL often changes before DOM. If URL has a real chapter, wait until DOM catches up.
-      if (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) return;
-      if (urlCid !== "unknown" && domCid === "unknown") return;
-      const chapterId = domCid !== "unknown" ? domCid : urlCid;
+    
+      // During SPA nav, URL often changes before DOM.
+      // Give DOM a short grace window to catch up; after that, fall back to URL.
+      const DOM_GRACE_MS = 1200;
+      run._domGraceStart = run._domGraceStart || 0;
+    
+      if (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) {
+        run._domGraceStart = run._domGraceStart || Date.now();
+        if (Date.now() - run._domGraceStart < DOM_GRACE_MS) return;
+      }
+    
+      if (urlCid !== "unknown" && domCid === "unknown") {
+        run._domGraceStart = run._domGraceStart || Date.now();
+        if (Date.now() - run._domGraceStart < DOM_GRACE_MS) return;
+      }
+    
+      // reset grace when things align
+      run._domGraceStart = 0;
+    
+      const chapterId = (domCid !== "unknown") ? domCid : urlCid;
+    
+      // MUST be function-scoped (used after try/finally)
+      let pronounEdits = 0;
+    
+      // Optional: on forceFull, clear per-node patch markers so we reprocess everything
+      if (forceFull && root?.querySelectorAll) {
+        try {
+          // You mark patched blocks via dataset.wtrpfPatched = "1"
+          // So clear those (not data-wtrpf-patched which you never set)
+          root.querySelectorAll("[data-wtrpf-patched], [data-wtrpf-patched-chapter], [data-wtrpf-patchedchapter], [data-wtrpf-patchedChapter]").forEach(el => {
+            if (el?.dataset) {
+              delete el.dataset.wtrpfPatched;
+              delete el.dataset.wtrpfPatchedChapter;
+            }
+          });
+      
+          // Most importantly: clear the markers you *do* set
+          root.querySelectorAll("[data-wtrpf-patched='1']").forEach(el => {
+            if (el?.dataset) delete el.dataset.wtrpfPatched;
+          });
+      
+          // Also clear root marker
+          if (root?.dataset) delete root.dataset.wtrpfPatchedChapter;
+        } catch {}
+      }
+
       if (!contentReady(root)) return;
-
-      const sig = chapterSignature(root);
-      if (!forceFull && sig && sig === lastSig) return;
-
+    
+      // Signature gate: only skip if same as last applied in this session (unless forceFull)
+      const sigBefore = chapterSignature(root);
+      if (!forceFull && sigBefore && sigBefore === lastSig) return;
+    
       running = true;
       try {
+        // New chapter boundary
         if (chapterId !== lastChapterId) {
           lastChapterId = chapterId;
           localStorage.setItem(UI_KEY_MIN, "1");
           ui.setMinimized(true);
+    
           lastActorGender = null;
           lastActorTTL = 0;
-
+    
           // If React reuses DOM nodes between chapters, clear old patch markers
-          // If React reuses DOM nodes between chapters, clear old patch markers
-            try {
-              if (root?.dataset) delete root.dataset.wtrpfPatchedChapter;
-              root?.querySelectorAll?.("[data-wtrpf-patched], [data-wtrpf-patched-chapter]").forEach(el => {
+          try {
+            if (root?.dataset) {
+              delete root.dataset.wtrpfPatched;
+              delete root.dataset.wtrpfPatchedChapter;
+            }
+            root?.querySelectorAll?.("[data-wtrpf-patched], [data-wtrpf-patched-chapter]").forEach(el => {
+              if (el?.dataset) {
                 delete el.dataset.wtrpfPatched;
                 delete el.dataset.wtrpfPatchedChapter;
-              });
-            } catch {}
-
+              }
+            });
+          } catch {}
         }
-
+    
+        // UI: show last known count for this chapter until we compute a new one
         const st0 = loadChapterState();
         const lastChanged = getChapterLastChanged(st0, chapterId);
-        if (lastChanged > 0) ui.setChanged(lastChanged);
-        else ui.setChanged(0);
-
+        ui.setChanged(lastChanged > 0 ? lastChanged : 0);
+    
+        // Apply term patches (if enabled)
         if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
           const mem = loadTermMemory(novelKey);
           applyTermPatches(root, cfgTerms, mem, U);
         }
-
+    
         updateDetectedCharactersUI(root);
-
+    
+        // Resolve mode
         let usedMode = mode;
         let chapterGender = null;
-
+    
         if (mode === "chapter") {
-          if (forceGender === "male" || forceGender === "female") chapterGender = forceGender;
-          else if (primaryCharacter && characters[primaryCharacter]) {
+          if (forceGender === "male" || forceGender === "female") {
+            chapterGender = forceGender;
+          } else if (primaryCharacter && characters[primaryCharacter]) {
             const g = String(characters[primaryCharacter].gender || "").toLowerCase();
             if (g === "female" || g === "male") chapterGender = g;
           }
           if (!chapterGender) usedMode = "paragraph";
         }
-
+    
+        // Decide which blocks to process
         const alreadyPatched = rootPatchedFor(root, chapterId);
         const doFullPass = forceFull || !alreadyPatched;
-
+    
         const blocksAll = getTextBlocks(root);
         const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
         if (!blocks.length) return;
-
+    
         let lastGender = null;
         let carryLeft = 0;
-        let pronounEdits = 0;
-
+    
         for (const b of blocks) {
           const bt = (b.innerText || "").trim();
           if (!bt) { markBlockPatched(b); continue; }
-
+    
           if (isSceneBreak(bt)) {
             lastGender = null;
             carryLeft = 0;
@@ -1638,14 +1748,15 @@
             markBlockPatched(b);
             continue;
           }
-
+    
+          // Anchored fixes first (local window after names)
           if (U.anchoredFixes) {
             pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
           }
-
+    
           let g = null;
           let hadDirectMatch = false;
-
+    
           if (usedMode === "chapter") {
             g = chapterGender;
             hadDirectMatch = true;
@@ -1654,7 +1765,7 @@
             if (computed) {
               g = computed;
               hadDirectMatch = true;
-
+    
               if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
                 lastActorGender = computed;
                 lastActorTTL = 2;
@@ -1664,7 +1775,7 @@
                 g = lastGender;
                 carryLeft--;
               }
-
+    
               if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
                 if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
                   g = lastActorGender;
@@ -1673,28 +1784,42 @@
               }
             }
           }
-
+    
+          // Global pass within this block
           if (g) {
             const dir = (g === "female") ? "toFemale" : "toMale";
+    
             let doFull = true;
             if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
+    
             if (doFull) {
               pronounEdits += replaceInTextNodes(b, (txt) => replacePronounsSmart(txt, dir));
             }
+    
             if (usedMode !== "chapter" && hadDirectMatch) {
               lastGender = g;
               carryLeft = carryParagraphs;
             }
           }
-
+    
           markBlockPatched(b);
         }
-
+    
         if (doFullPass) markRootPatched(root, chapterId);
 
+        // If DOM already equals the applied signature, treat as no-op to avoid inflating counts
+        if (pronounEdits > 0) {
+          const sigNow = chapterSignature(root);
+          const applied = getAppliedSig(novelKey, chapterId);
+          if (applied && sigNow === applied) {
+            pronounEdits = 0;
+          }
+        }
+
+        // Persist counts
         const st = loadChapterState();
         const prev = getChapterLastChanged(st, chapterId);
-
+    
         if (pronounEdits > 0) {
           setChapterLastChanged(st, chapterId, pronounEdits);
           ui.setChanged(pronounEdits);
@@ -1703,55 +1828,55 @@
         } else {
           ui.setChanged(0);
         }
-
+    
         // Record what the chapter looks like AFTER we apply changes.
         // If React overwrites later, signature will diverge and we can re-apply.
-                 const sigAfter = chapterSignature(root);
-          if (sigAfter) {
-            setAppliedSig(novelKey, chapterId, sigAfter);
-            lastSig = sigAfter; // keep in sync with the DOM AFTER edits
-          } else {
-            lastSig = sig;
-          }
-          
-          saveChapterState(st);
-        
+        const sigAfter = chapterSignature(root);
+        if (sigAfter) {
+          setAppliedSig(novelKey, chapterId, sigAfter);
+          lastSig = sigAfter; // session gate uses post-edit signature
+        } else {
+          lastSig = sigBefore;
+        }
+    
+        saveChapterState(st);
       } finally {
         running = false;
         lastRunAt = Date.now();
       }
+    
     }
-
+    
     function startChapterMonitor() {
       let startedAt = Date.now();
-
+    
       setInterval(() => {
         if (!ui.isEnabled()) return;
         if (document.hidden) return;
         if (running) return;
-
+    
         const root = findContentRoot();
         if (!contentReady(root)) return;
-
+    
         const cid = getChapterId(root);
         const sigNow = chapterSignature(root);
         if (!cid || !sigNow) return;
-
+    
         const applied = getAppliedSig(novelKey, cid);
-
+    
         // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
         if (!applied || sigNow !== applied) {
           run({ forceFull: true });
           return;
         }
-
-        // Optional: during the first few seconds after load/nav, also do a light pass
-        // to catch late paragraph insertions that don't change signature enough.
+    
+        // Optional warmup light passes right after load/nav
         if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
           run({ forceFull: false });
         }
       }, CHAPTER_MONITOR_MS);
     }
+
 
 
     // ==========================================================
@@ -1764,6 +1889,8 @@
       navSweepTimer = null;
     }
 
+    // at top of startNavSweep
+    // console.debug("[WTRPF] startNavSweep:", reason);
     function startNavSweep(reason = "nav") {
       stopNavSweep();
 
@@ -1784,6 +1911,7 @@
         }
 
         const root = findContentRoot();
+        if (!root || root === document.body) return;
         if (!contentReady(root)) return; // keep waiting
 
         const cid = getChapterId(root);
@@ -1829,8 +1957,7 @@
     installHistoryHooks(onNav);
     installChapterBodyObserver(onNav);
     installChapterBodyReplaceWatcher(onNav);
-    installUrlChangeWatcher(onNav, () => ui.isEnabled());
-
+    installUrlChangeWatcher(onNav, ui.isEnabled);
 
     // Initial run
     run({ forceFull: true });
