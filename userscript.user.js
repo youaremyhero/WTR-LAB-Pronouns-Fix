@@ -127,7 +127,7 @@
 
   function chapterSignature(root) {
     if (!root) return "";
-    domCid = getDomChapterId(root);
+    const domCid = getDomChapterId(root);
     const txt = normalizeWeirdSpaces((root.innerText || "").trim());
     if (!txt) return `${domCid}|len:0|h:0`;
     return `${domCid}|len:${txt.length}|h:${hash32(txt)}`;
@@ -323,6 +323,9 @@
   function getNovelKeyFromURL() {
     const m = location.href.match(/wtr-lab\.com\/en\/novel\/(\d+)\//i);
     return m ? `wtr-lab.com/en/novel/${m[1]}/` : "wtr-lab.com/en/novel/";
+  }
+  function getChapterId(root) {
+    return getDomChapterId(root) || getUrlChapterId();
   }
 
   function termMemKey(novelKey) { return TERM_MEM_KEY_PREFIX + novelKey; }
@@ -1335,54 +1338,55 @@
     document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
   }
 
-      function installChapterBodyObserver(scheduleSweep) {
-        let lastCb = null;
-        let debounce = null;
-        let mo = null;
-      
-        function attach(cb) {
-          if (!cb || cb === lastCb) return;
-      
-          // Disconnect previous observer to avoid buildup
-          if (mo) {
-            try { mo.disconnect(); } catch {}
-            mo = null;
-          }
-      
-          lastCb = cb;
-      
-          mo = new MutationObserver(() => {
-            if (debounce) return;
-            debounce = setTimeout(() => {
-              debounce = null;
-              scheduleSweep("chapter-body-mutation");
-            }, CHAPTER_OBS_DEBOUNCE_MS);
-          });
-      
-          mo.observe(cb, { childList: true, subtree: true });
-        }
-      
-        const t = setInterval(() => {
-          const cb = document.querySelector(".chapter-body");
-          if (cb && cb !== lastCb) attach(cb);
-        }, 800);
-      
-        setTimeout(() => {
-          clearInterval(t);
-        }, 15000);
+  function installChapterBodyObserver(scheduleSweep) {
+    let lastCb = null;
+    let debounce = null;
+    let mo = null;
+
+    function attach(cb) {
+      if (!cb || cb === lastCb) return;
+
+      // Disconnect previous observer to avoid buildup
+      if (mo) {
+        try { mo.disconnect(); } catch {}
+        mo = null;
       }
 
-      function installUrlChangeWatcher(onNav) {
-      let lastHref = location.href;
-    
-      setInterval(() => {
-        const href = location.href;
-        if (href !== lastHref) {
-          lastHref = href;
-          onNav("url-change");
-        }
-      }, 250);
+      lastCb = cb;
+
+      mo = new MutationObserver(() => {
+        if (debounce) return;
+        debounce = setTimeout(() => {
+          debounce = null;
+          scheduleSweep("chapter-body-mutation");
+        }, CHAPTER_OBS_DEBOUNCE_MS);
+      });
+
+      mo.observe(cb, { childList: true, subtree: true });
     }
+
+    const t = setInterval(() => {
+      const cb = document.querySelector(".chapter-body");
+      if (cb && cb !== lastCb) attach(cb);
+    }, 800);
+
+    setTimeout(() => {
+      clearInterval(t);
+    }, 15000);
+  }
+
+  function installUrlChangeWatcher(onNav, isEnabled) {
+    let lastHref = location.href;
+
+    setInterval(() => {
+      if (!isEnabled() || document.hidden) return;
+      const href = location.href;
+      if (href !== lastHref) {
+        lastHref = href;
+        onNav("url-change");
+      }
+    }, 250);
+  }
 
 
   // ==========================================================
@@ -1718,93 +1722,98 @@
       }
     }
 
-          function startChapterMonitor() {
-        let startedAt = Date.now();
-      
-        setInterval(() => {
-          if (!ui.isEnabled()) return;
-          if (document.hidden) return;
-          if (running) return;
-      
-          const root = findContentRoot();
-          if (!contentReady(root)) return;
-      
-          const cid = getChapterId(root);
-          const sigNow = chapterSignature(root);
-          if (!cid || !sigNow) return;
-      
-          const applied = getAppliedSig(novelKey, cid);
-      
-          // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
-          if (!applied || sigNow !== applied) {
-            run({ forceFull: true });
-            return;
-          }
-      
-          // Optional: during the first few seconds after load/nav, also do a light pass
-          // to catch late paragraph insertions that don't change signature enough.
-          if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
-            run({ forceFull: false });
-          }
-        }, CHAPTER_MONITOR_MS);
-      }
+    function startChapterMonitor() {
+      let startedAt = Date.now();
+
+      setInterval(() => {
+        if (!ui.isEnabled()) return;
+        if (document.hidden) return;
+        if (running) return;
+
+        const root = findContentRoot();
+        if (!contentReady(root)) return;
+
+        const cid = getChapterId(root);
+        const sigNow = chapterSignature(root);
+        if (!cid || !sigNow) return;
+
+        const applied = getAppliedSig(novelKey, cid);
+
+        // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
+        if (!applied || sigNow !== applied) {
+          run({ forceFull: true });
+          return;
+        }
+
+        // Optional: during the first few seconds after load/nav, also do a light pass
+        // to catch late paragraph insertions that don't change signature enough.
+        if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
+          run({ forceFull: false });
+        }
+      }, CHAPTER_MONITOR_MS);
+    }
 
 
     // ==========================================================
     // Nav sweep (A) — now guaranteed to run (forceFull bypasses cooldown)
     // ==========================================================
-       let navSweepTimer = null;
+    let navSweepTimer = null;
 
-        function stopNavSweep() {
-          if (navSweepTimer) clearInterval(navSweepTimer);
-          navSweepTimer = null;
-        }
-        
-        function startNavSweep(reason = "nav") {
+    function stopNavSweep() {
+      if (navSweepTimer) clearInterval(navSweepTimer);
+      navSweepTimer = null;
+    }
+
+    function startNavSweep(reason = "nav") {
+      stopNavSweep();
+
+      const startAt = Date.now();
+      let stableHits = 0;
+      let lastSeenChapterId = null;
+
+      navSweepTimer = setInterval(() => {
+        if (!ui.isEnabled() || document.hidden) {
           stopNavSweep();
-        
-          const startAt = Date.now();
-          let stableHits = 0;
-          let lastSeenChapterId = null;
-        
-          navSweepTimer = setInterval(() => {
-            // hard stop
-            if (Date.now() - startAt > NAV_SWEEP_MS) {
-              stopNavSweep();
-              return;
-            }
-        
-            const root = findContentRoot();
-            if (!contentReady(root)) return; // keep waiting
-        
-            const cid = getChapterId(root);
-            const sigNow = chapterSignature(root);
-            if (!cid || !sigNow) return;
-        
-            // if chapter changed during sweep, reset stability counter
-            if (cid !== lastSeenChapterId) {
-              lastSeenChapterId = cid;
-              stableHits = 0;
-        
-              // minimise on nav (kept behavior)
-              localStorage.setItem(UI_KEY_MIN, "1");
-              ui.setMinimized(true);
-            }
-        
-            const applied = getAppliedSig(novelKey, cid);
-        
-            // If not yet applied (or React overwrote), force re-apply now
-            if (!applied || sigNow !== applied) {
-              run({ forceFull: true });
-              stableHits = 0;
-              return;
-            }
-        
-            // Already applied; require a couple consecutive confirmations before stopping
-            stableHits++;
-            if (stableHits >= 2) stopNavSweep();
-          }, NAV_POLL_MS);
+          return;
         }
+
+        // hard stop
+        if (Date.now() - startAt > NAV_SWEEP_MS) {
+          stopNavSweep();
+          return;
+        }
+
+        const root = findContentRoot();
+        if (!contentReady(root)) return; // keep waiting
+
+        const cid = getChapterId(root);
+        const sigNow = chapterSignature(root);
+        if (!cid || !sigNow) return;
+
+        // if chapter changed during sweep, reset stability counter
+        if (cid !== lastSeenChapterId) {
+          lastSeenChapterId = cid;
+          stableHits = 0;
+
+          // minimise on nav (kept behavior)
+          localStorage.setItem(UI_KEY_MIN, "1");
+          ui.setMinimized(true);
+        }
+
+        const applied = getAppliedSig(novelKey, cid);
+
+        // If not yet applied (or React overwrote), force re-apply now
+        if (!applied || sigNow !== applied) {
+          run({ forceFull: true });
+          stableHits = 0;
+          return;
+        }
+
+        // Already applied; require a couple consecutive confirmations before stopping
+        stableHits++;
+        if (stableHits >= 2) stopNavSweep();
+      }, NAV_POLL_MS);
+    }
 
 
     // ==========================================================
@@ -1820,7 +1829,7 @@
     installHistoryHooks(onNav);
     installChapterBodyObserver(onNav);
     installChapterBodyReplaceWatcher(onNav);
-    installUrlChangeWatcher(onNav);
+    installUrlChangeWatcher(onNav, () => ui.isEnabled());
 
 
     // Initial run
