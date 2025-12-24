@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.0
+// @version      1.3.1
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
