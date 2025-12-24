@@ -164,7 +164,7 @@
         .join("\n");
     
       if (!joined) return `${domCid}|len:0|h:0`;
-      return `${domCid}|len:${joined.length}|h:${hash32(joined)}`;
+      return `len:${joined.length}|h:${hash32(joined)}`;
     }
 
     function appliedSigKey(novelKey) {
@@ -2060,87 +2060,103 @@
     }
 
       // Nav sweep (A) — hardened so we ONLY apply once URL+DOM agree AND content is ready
-        function startNavSweep(reason = "nav") {
-          stopNavSweep();
-        
-          const startAt = Date.now();
-          let stableHits = 0;
-          let lastSeenChapterId = null;
-        
-          // after this, if DOM cid is still unknown/mismatched, we fall back to URL cid
-          const FALLBACK_AFTER_MS = 1600;
-        
-          navSweepTimer = setInterval(() => {
-            if (!ui.isEnabled() || document.hidden) { stopNavSweep(); return; }
-            if (Date.now() - startAt > NAV_SWEEP_MS) { stopNavSweep(); return; }
-        
-            const root = findContentRoot();
-            if (!root || root === document.body) return;
-            if (!contentReady(root)) { stableHits = 0; return; }
-        
-            const urlCid = getUrlChapterId();
-            const domCid = getDomChapterId(root);
-        
-            const now = Date.now();
-            const canFallback = (now - startAt) >= FALLBACK_AFTER_MS;
-        
-            // Decide "effective chapter id" safely
-            let cid = null;
-        
-            if (urlCid !== "unknown" && domCid !== "unknown" && urlCid === domCid) {
-              cid = urlCid; // best case: perfect match
-            } else if (canFallback && urlCid !== "unknown") {
-              // ✅ Firefox Android: tracker sometimes lags/never becomes active.
-              // Fallback to URL, BUT still require content to look "new" vs what we applied.
-              cid = urlCid;
+      function startNavSweep(reason = "nav", epoch = navEpoch) {
+        stopNavSweep();
+      
+        const startAt = Date.now();
+        let stableHits = 0;
+        let lastSeenChapterId = null;
+        let sawNewContent = false;
+      
+        const FALLBACK_AFTER_MS = 1600;
+      
+        navSweepTimer = setInterval(() => {
+          if (epoch !== navEpoch) { stopNavSweep(); return; } // newer nav happened
+          if (!ui.isEnabled() || document.hidden) { stopNavSweep(); return; }
+          if (Date.now() - startAt > NAV_SWEEP_MS) { stopNavSweep(); return; }
+      
+          const root = findContentRoot();
+          if (!root || root === document.body) return;
+          if (!contentReady(root)) { stableHits = 0; return; }
+      
+          const urlCid = getUrlChapterId();
+          const domCid = getDomChapterId(root);
+      
+          const now = Date.now();
+          const canFallback = (now - startAt) >= FALLBACK_AFTER_MS;
+      
+          let cid = null;
+          if (urlCid !== "unknown" && domCid !== "unknown" && urlCid === domCid) {
+            cid = urlCid;
+          } else if (canFallback && urlCid !== "unknown") {
+            cid = urlCid;
+          } else if (domCid !== "unknown" && canFallback) {
+            // IMPORTANT: allow DOM-only progress when URL doesn't change
+            cid = domCid;
+          } else {
+            stableHits = 0;
+            return;
+          }
+      
+          const sigNow = chapterSignature(root);
+          if (!sigNow) { stableHits = 0; return; }
+      
+          // Don't "stabilize" on the old chapter before React swaps.
+          if (!sawNewContent) {
+            if (sigNow !== preNavSig || cid !== preNavCid) {
+              sawNewContent = true;
             } else {
               stableHits = 0;
               return;
             }
-        
-            const sigNow = chapterSignature(root);
-            if (!sigNow) { stableHits = 0; return; }
-        
-            // If chapter changed during sweep, reset stability counter + minimize UI
-            if (cid !== lastSeenChapterId) {
-              lastSeenChapterId = cid;
-              stableHits = 0;
-              localStorage.setItem(UI_KEY_MIN, "1");
-              ui.setMinimized(true);
-            }
-        
-            const applied = getAppliedSig(novelKey, cid);
-        
-            // If not yet applied (or React overwrote), force re-apply now
-            if (!applied || sigNow !== applied) {
-              run({ forceFull: true });
-              stableHits = 0;
-              return;
-            }
-        
-            stableHits++;
-            if (stableHits >= 2) stopNavSweep();
-          }, NAV_POLL_MS);
-        }
+          }
+      
+          if (cid !== lastSeenChapterId) {
+            lastSeenChapterId = cid;
+            stableHits = 0;
+            localStorage.setItem(UI_KEY_MIN, "1");
+            ui.setMinimized(true);
+          }
+      
+          const applied = getAppliedSig(novelKey, cid);
+      
+          if (!applied || sigNow !== applied) {
+            run({ forceFull: true });
+            stableHits = 0;
+            return;
+          }
+      
+          stableHits++;
+          if (stableHits >= 2) stopNavSweep();
+        }, NAV_POLL_MS);
+      }
 
       // ==========================================================
       // Hooks (B) — simplify: NO early forced runs; sweep decides when it's safe
       // ==========================================================
-        const onNav = (why) => {
-          console.log("[WTRPF] onNav fired:", why, "href=", location.href);
-        
-          localStorage.setItem(UI_KEY_MIN, "1");
-          ui.setMinimized(true);
-        
-          // Reset session gates
-          lastSig = "";
-          lastChapterId = null;
-        
-          // Force root re-evaluation before sweeping
-          rootManager.resolve();
-        
-          startNavSweep(String(why || "nav"));
-        };
+       let preNavSig = "";
+      let preNavCid = "";
+      let navEpoch = 0;
+   
+      const onNav = (why) => {
+        console.log("[WTRPF] onNav fired:", why, "href=", location.href);
+      
+        localStorage.setItem(UI_KEY_MIN, "1");
+        ui.setMinimized(true);
+      
+        // Reset session gates
+        lastSig = "";
+        lastChapterId = null;
+      
+        // Capture "before nav" identity so sweep won't 'stabilize' on old chapter
+        const root0 = findContentRoot();
+        preNavCid = root0 ? getChapterId(root0) : "";
+        preNavSig = root0 ? chapterSignature(root0) : "";
+        navEpoch++;
+      
+        rootManager.resolve();
+        startNavSweep(String(why || "nav"), navEpoch);
+      };
 
       // Firefox Android: DOM often mounts slightly later than URL change
         setTimeout(() => startNavSweep("nav-nudge"), 900);
