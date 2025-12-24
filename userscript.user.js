@@ -469,23 +469,69 @@
   // ==========================================================
   // Content targeting
   // ==========================================================
-  function findContentRoot() {
-    const cb = document.querySelector(".chapter-body");
-    if (cb) return cb;
-
-    const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
-    if (likely) return likely;
-
-    const candidates = Array.from(document.querySelectorAll("article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"));
-    let best = null, bestScore = 0;
-    for (const el of candidates) {
-      const pCount = el.querySelectorAll("p").length;
-      const textLen = (el.innerText || "").trim().length;
-      const score = (pCount * 1200) + textLen;
-      if (score > bestScore && textLen > 300) { bestScore = score; best = el; }
+    function findContentRoot() {
+      // 1) Prefer ACTIVE chapter in infinite reader mode (or when tracker exists)
+      const activeTracker = document.querySelector(".chapter-tracker.active[data-chapter-no]");
+      const no = activeTracker?.getAttribute?.("data-chapter-no");
+    
+      if (no && /^\d+$/.test(no)) {
+        // Common patterns observed on WTR-like readers
+        const idCandidates = [
+          `#chapter-${no}`,
+          `#tracker-${no}`,
+          `[data-chapter-no="${no}"]`,
+          `[data-chapter-id="chapter-${no}"]`,
+        ];
+    
+        for (const sel of idCandidates) {
+          const host = document.querySelector(sel);
+          if (!host) continue;
+    
+          // Try to find the text container inside this chapter host
+          const cb =
+            host.querySelector?.(".chapter-body") ||
+            host.closest?.(".chapter-body") ||
+            host.querySelector?.("article, main, section") ||
+            host;
+    
+          if (cb && (cb.innerText || "").trim().length > 200) return cb;
+        }
+    
+        // Fallback: pick the chapter-body closest to the active tracker
+        const near =
+          activeTracker.closest?.(".chapter-infinite-reader, .chapter, article, main, section") ||
+          activeTracker.parentElement;
+        const cbNear = near?.querySelector?.(".chapter-body");
+        if (cbNear && (cbNear.innerText || "").trim().length > 200) return cbNear;
+      }
+    
+      // 2) Infinite mode fallback: choose the LAST chapter-body in the infinite container
+      const inf = document.querySelector(".chapter-infinite-reader");
+      if (inf) {
+        const bodies = Array.from(inf.querySelectorAll(".chapter-body"));
+        const lastGood = bodies.reverse().find(el => (el.innerText || "").trim().length > 200);
+        if (lastGood) return lastGood;
+      }
+    
+      // 3) Single chapter fallback (original behavior)
+      const cb = document.querySelector(".chapter-body");
+      if (cb) return cb;
+    
+      const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
+      if (likely) return likely;
+    
+      const candidates = Array.from(document.querySelectorAll(
+        "article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"
+      ));
+      let best = null, bestScore = 0;
+      for (const el of candidates) {
+        const pCount = el.querySelectorAll("p").length;
+        const textLen = (el.innerText || "").trim().length;
+        const score = (pCount * 1200) + textLen;
+        if (score > bestScore && textLen > 300) { bestScore = score; best = el; }
+      }
+      return best || null;
     }
-    return best || null;
-  }
 
   const SKIP_CLOSEST = [
     "header","nav","footer","aside","form",
@@ -1644,6 +1690,44 @@
       setTimeout(arm, 1200);
     }
 
+      function installActiveContentObserver(getRoot, onDirty, isEnabled) {
+      let mo = null;
+      let lastRoot = null;
+      let t = null;
+    
+      const arm = () => {
+        if (!isEnabled() || document.hidden) return;
+    
+        const root = getRoot();
+        if (!root || root === lastRoot) return;
+    
+        // swap observer to new root
+        if (mo) { try { mo.disconnect(); } catch {} }
+        lastRoot = root;
+    
+        mo = new MutationObserver(() => {
+          if (!isEnabled() || document.hidden) return;
+          if (t) return;
+          t = setTimeout(() => { t = null; onDirty("active-root-mutation"); }, 220);
+        });
+    
+        // React tends to replace nodes (childList) and also text (characterData)
+        mo.observe(root, { subtree: true, childList: true, characterData: true });
+      };
+    
+      // re-arm periodically (root can change without being removed cleanly)
+      const tick = setInterval(arm, 600);
+      setTimeout(() => clearInterval(tick), 25000);
+    
+      // also arm immediately
+      arm();
+    
+      return {
+        rearm: arm,
+        disconnect: () => { if (mo) { try { mo.disconnect(); } catch {} mo = null; } }
+      };
+    }
+
   // ==========================================================
   // Main
   // ==========================================================
@@ -1823,7 +1907,7 @@
       const now = Date.now();
       if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
     
-      const root = findContentRoot();
+      const root = rootManager?.getRoot?.() || findContentRoot();
       if (!root) return;
     
       const urlCid = getUrlChapterId();
@@ -2219,9 +2303,28 @@
       installNextButtonHook(onNav);
       installUrlChangeWatcher(onNav, ui.isEnabled);
       installHistoryHooksLite(onNav);
-      
-      // ✅ add this
       installChapterTrackerObserver(onNav, ui.isEnabled);
+    
+    // React overwrite catcher: if the active chapter root mutates after we applied,
+      // rerun full pass (debounced). This is the missing piece for single-chapter Next.
+      installActiveContentObserver(
+        () => (rootManager?.getRoot?.() || findContentRoot()),
+        (why) => {
+          // Only re-run if the current DOM diverges from what we recorded as applied
+          const root = rootManager?.getRoot?.() || findContentRoot();
+          if (!root || !contentReady(root)) return;
+      
+          const cid = getChapterId(root);
+          const sigNow = chapterSignature(root);
+          if (!cid || !sigNow) return;
+      
+          const applied = getAppliedSig(novelKey, cid);
+          if (!applied || sigNow !== applied) {
+            run({ forceFull: true });
+          }
+        },
+        ui.isEnabled
+      );
 
       // Initial run
       run({ forceFull: true });
