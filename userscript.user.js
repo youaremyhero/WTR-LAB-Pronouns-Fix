@@ -2144,7 +2144,6 @@
 
       // Firefox Android: DOM often mounts slightly later than URL change
         setTimeout(() => startNavSweep("nav-nudge"), 900);
-      };
       
       installNextButtonHook(onNav);
       installUrlChangeWatcher(onNav, ui.isEnabled);
