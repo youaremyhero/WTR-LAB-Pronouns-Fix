@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.1
+// @version      1.3.2
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -505,10 +505,19 @@
         if (cbNear && (cbNear.innerText || "").trim().length > 200) return cbNear;
       }
     
-      // 2) Infinite mode fallback: choose the LAST chapter-body in the infinite container
+
+      // 2) Infinite mode fallback: newest chapter-body that isn't patched yet
       const inf = document.querySelector(".chapter-infinite-reader");
       if (inf) {
         const bodies = Array.from(inf.querySelectorAll(".chapter-body"));
+        const newestUnpatched = bodies.reverse().find(el => {
+          const ok = (el.innerText || "").trim().length > 200;
+          const already = el.dataset?.wtrpfPatchedChapter; // your root marker
+          return ok && !already;
+        });
+        if (newestUnpatched) return newestUnpatched;
+      
+        // fallback to last good if all patched
         const lastGood = bodies.reverse().find(el => (el.innerText || "").trim().length > 200);
         if (lastGood) return lastGood;
       }
@@ -1698,7 +1707,7 @@
       const arm = () => {
         if (!isEnabled() || document.hidden) return;
     
-        const root = getRoot();
+        const root = rootManager?.getRoot() || findContentRoot();
         if (!root || root === lastRoot) return;
     
         // swap observer to new root
@@ -1728,6 +1737,41 @@
       };
     }
 
+      function installInfiniteReaderAppendObserver(onNav, isEnabled) {
+      let mo = null;
+    
+      function arm() {
+        const host = document.querySelector(".chapter-infinite-reader");
+        if (!host) return false;
+    
+        if (mo) { try { mo.disconnect(); } catch {} }
+    
+        mo = new MutationObserver((muts) => {
+          if (!isEnabled() || document.hidden) return;
+    
+          for (const m of muts) {
+            for (const n of (m.addedNodes || [])) {
+              if (!(n instanceof Element)) continue;
+    
+              // new chapter content arrived
+              if (n.matches?.(".chapter-body") || n.querySelector?.(".chapter-body")) {
+                onNav("infinite-append");
+                return;
+              }
+            }
+          }
+        });
+    
+        mo.observe(host, { childList: true, subtree: true });
+        return true;
+      }
+    
+      // try now, and retry once if the reader mounts later
+      if (!arm()) setTimeout(arm, 1200);
+    
+      return { disconnect: () => { if (mo) { try { mo.disconnect(); } catch {} } } };
+    }
+  
   // ==========================================================
   // Main
   // ==========================================================
@@ -2176,7 +2220,7 @@
         if (document.hidden) return;
         if (running) return;
     
-        const root = findContentRoot();
+        const root = rootManager?.getRoot() || findContentRoot();
         if (!contentReady(root)) return;
     
         const cid = getChapterId(root);
@@ -2214,7 +2258,7 @@
           if (!ui.isEnabled() || document.hidden) { stopNavSweep(); return; }
           if (Date.now() - startAt > NAV_SWEEP_MS) { stopNavSweep(); return; }
       
-          const root = findContentRoot();
+          const root = rootManager?.getRoot() || findContentRoot();
           if (!root || root === document.body) return;
           if (!contentReady(root)) { stableHits = 0; return; }
       
@@ -2288,7 +2332,7 @@
         lastChapterId = null;
       
         // Capture "before nav" identity so sweep won't 'stabilize' on old chapter
-        const root0 = findContentRoot();
+        const root0 = rootManager?.getRoot?.() || findContentRoot();
         preNavCid = root0 ? getChapterId(root0) : "";
         preNavSig = root0 ? chapterSignature(root0) : "";
         navEpoch++;
@@ -2304,7 +2348,8 @@
       installUrlChangeWatcher(onNav, ui.isEnabled);
       installHistoryHooksLite(onNav);
       installChapterTrackerObserver(onNav, ui.isEnabled);
-    
+      installInfiniteReaderAppendObserver(onNav, ui.isEnabled);
+
     // React overwrite catcher: if the active chapter root mutates after we applied,
       // rerun full pass (debounced). This is the missing piece for single-chapter Next.
       installActiveContentObserver(
