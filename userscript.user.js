@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.4
+// @version      1.3.5
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -152,18 +152,49 @@
     return (h >>> 0).toString(16);
   }
 
+      /* =========================
+       A) NEW: Fast sampled text + signature
+       ========================= */
+    
+    function getSampledText(root, { head = 6, tail = 2 } = {}) {
+      if (!root) return "";
+      const blocks = getTextBlocks(root);
+      if (!blocks.length) return "";
+    
+      const pick = [];
+      const n = blocks.length;
+    
+      const h = Math.min(head, n);
+      for (let i = 0; i < h; i++) pick.push(blocks[i]);
+    
+      const t = Math.min(tail, Math.max(0, n - h));
+      for (let i = n - t; i < n; i++) if (i >= 0) pick.push(blocks[i]);
+    
+      return pick
+        .map(b => normalizeWeirdSpaces((b.textContent || "").trim()))
+        .filter(Boolean)
+        .join("\n");
+    }
+    
+    function approxChapterMetrics(root) {
+      const blocks = getTextBlocks(root);
+      let totalLen = 0;
+      // cheap-ish length sum
+      for (const b of blocks) totalLen += ((b.innerText || "").length || 0);
+      return { blocksCount: blocks.length, totalLen };
+    }
+
+    // REPLACED chapterSignature(root) with this cheaper version
     function chapterSignature(root) {
       if (!root) return "";
       const cid = getChapterId(root) || getDomChapterId(root) || "unknown";
     
-      const blocks = getTextBlocks(root);
-      const joined = blocks
-        .map(b => normalizeWeirdSpaces((b.textContent || "").trim()))
-        .filter(Boolean)
-        .join("\n");
+      const { blocksCount, totalLen } = approxChapterMetrics(root);
+      const sampled = getSampledText(root, { head: 6, tail: 2 });
     
-      if (!joined) return `${cid}|len:0|h:0`;
-      return `${cid}|len:${joined.length}|h:${hash32(joined)}`;
+      // signature is stable enough to detect re-render/DOM swaps without hashing whole chapter
+      const h = sampled ? hash32(sampled) : "0";
+      return `${cid}|b:${blocksCount}|len:${totalLen}|h:${h}`;
     }
 
     function appliedSigKey(novelKey) {
@@ -606,7 +637,8 @@
   
     return "unknown";
   }
-  
+
+  // SWEEPER HELPERS 
   // Mark bodies we’ve already fully handled (separate from your per-block markers)
   function bodyIsSwept(body) {
     return body?.dataset?.wtrpfSwept === "1";
@@ -614,6 +646,18 @@
   function markBodySwept(body) {
     if (body?.dataset) body.dataset.wtrpfSwept = "1";
   }
+
+    // Mark bodies we have queued for a run (prevents re-queue spam)
+  function bodyIsQueued(body) {
+    return body?.dataset?.wtrpfQueued === "1";
+  }
+  function markBodyQueued(body) {
+    if (body?.dataset) body.dataset.wtrpfQueued = "1";
+  }
+  function clearBodyQueued(body) {
+    if (body?.dataset) delete body.dataset.wtrpfQueued;
+  }
+
 
   // ==========================================================
   // Root Observer Manager (NEW)
@@ -812,489 +856,640 @@
   // ==========================================================
   // UI (same behavior as your requirements)
   // ==========================================================
-  function makeUI() {
-    let savedPos = {};
-    try { savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}"); }
-    catch { savedPos = {}; localStorage.removeItem(UI_KEY_POS); };
-    const enabledInit = localStorage.getItem(UI_KEY_ON);
-    if (enabledInit !== "0" && enabledInit !== "1") localStorage.setItem(UI_KEY_ON, "1");
-
-    function enabled() { return localStorage.getItem(UI_KEY_ON) !== "0"; }
-    function setEnabled(v) { localStorage.setItem(UI_KEY_ON, v ? "1" : "0"); }
-
-    let charactersCount = 0;
-    let charactersList3 = "";
-    let changedTotal = 0;
-    let glossaryOk = true;
-
-    const ONBOARD_KEY = "wtrpf_onboard_seen_v1";
-    let showOnboard = false;
-
-    const style = document.createElement("style");
-    style.textContent = `
-      .wtrpf-added-term {
-        text-shadow: 0 0 10px rgba(255,255,255,0.25);
-        outline: 1px solid rgba(255,255,255,0.18);
-        border-radius: 4px;
-        padding: 0 2px;
-      }
-    `;
-    document.documentElement.appendChild(style);
-
-    function applyPos(el) {
-      // minimized pill top-left by default
-      if (savedPos.left != null) {
-        el.style.left = savedPos.left + "px";
-        el.style.right = "auto";
-      } else {
-        el.style.left = "12px";
-        el.style.right = "auto";
-      }
-      el.style.top = (savedPos.top ?? 12) + "px";
-    }
-
-    function clampToViewport(el) {
-      const rect = el.getBoundingClientRect();
-      const maxLeft = Math.max(6, window.innerWidth - rect.width - 6);
-      const maxTop = Math.max(6, window.innerHeight - rect.height - 6);
-      const left = Math.min(Math.max(6, rect.left), maxLeft);
-      const top = Math.min(Math.max(6, rect.top), maxTop);
-      el.style.left = left + "px";
-      el.style.top = top + "px";
-      el.style.right = "auto";
-      localStorage.setItem(UI_KEY_POS, JSON.stringify({ left: Math.round(left), top: Math.round(top) }));
-    }
-
-    function enableDrag(el, allowButtonClicks = true) {
-      let startX = 0, startY = 0, startTop = 0, startLeft = 0, dragging = false;
-
-      el.addEventListener("pointerdown", e => {
-        if (allowButtonClicks && e.target && e.target.tagName === "BUTTON") return;
-        dragging = true;
-        startX = e.clientX;
-        startY = e.clientY;
-        const rect = el.getBoundingClientRect();
-        startTop = rect.top;
-        startLeft = rect.left;
-        try { el.setPointerCapture(e.pointerId); } catch {}
-      });
-
-      el.addEventListener("pointermove", e => {
-        if (!dragging) return;
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-        el.style.top = (startTop + dy) + "px";
-        el.style.left = (startLeft + dx) + "px";
-        el.style.right = "auto";
-      });
-
-      const end = () => {
-        if (!dragging) return;
-        dragging = false;
-        clampToViewport(el);
-      };
-
-      el.addEventListener("pointerup", end);
-      el.addEventListener("pointercancel", end);
-    }
-
-    const isMobile = window.innerWidth <= 480;
-
-    const box = document.createElement("div");
-    box.style.cssText = `
-      position: fixed; z-index: 2147483647;
-      background: rgba(0,0,0,0.50);
-      color: #fff;
-      border-radius: 12px;
-      padding: 10px 12px;
-      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      box-shadow: 0 10px 28px rgba(0,0,0,.25);
-      max-width: ${isMobile ? "60vw" : "min(520px, 58vw)"};
-      width: ${isMobile ? "60vw" : "auto"};
-      height: auto;
-      backdrop-filter: blur(6px);
-      user-select: none;
-      touch-action: none;
-    `;
-
-    const topRow = document.createElement("div");
-    topRow.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px;`;
-
-    const title = document.createElement("div");
-    title.textContent = "PronounsFix";
-    title.style.cssText = `font-weight: 600;`;
-
-    const controls = document.createElement("div");
-    controls.style.cssText = `display:flex; gap:8px; align-items:center;`;
-
-    const toggleBtn = document.createElement("button");
-    toggleBtn.type = "button";
-    toggleBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 999px;
-      background: rgba(255,255,255,0.12); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const helpBtn = document.createElement("button");
-    helpBtn.type = "button";
-    helpBtn.textContent = "?";
-    helpBtn.title = "Help";
-    helpBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:26px; height:26px; border-radius:9px;
-      background:rgba(255,255,255,0.10); color:#fff;
-      font-size:14px; line-height:26px; padding:0;
-    `;
-
-    const minBtn = document.createElement("button");
-    minBtn.type = "button";
-    minBtn.textContent = "—";
-    minBtn.title = "Minimise";
-    minBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:26px; height:26px; border-radius:9px;
-      background:rgba(255,255,255,0.12); color:#fff;
-      font-size:16px; line-height:26px; padding:0;
-    `;
-
-    const disclaimer = document.createElement("div");
-    disclaimer.textContent = "Works best on single page reader type";
-    disclaimer.style.cssText = `
-      margin-top: 4px;
-      font-size: 11px;
-      font-style: italic;
-      opacity: .78;
-      user-select: none;
-    `;
-
-    const summary = document.createElement("div");
-    summary.style.cssText = `white-space: pre-line; opacity: .95; margin-top:8px;`;
-
-    const onboard = document.createElement("div");
-    onboard.style.cssText = `
-      display:none;
-      margin-top:10px;
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: rgba(255,255,255,0.08);
-      border: 1px solid rgba(255,255,255,0.12);
-      opacity: .95;
-    `;
-    
-    const tipsTitle = document.createElement("div");
-    tipsTitle.textContent = "Tips:";
-    tipsTitle.style.cssText = `font-weight: 600; margin-bottom: 6px;`;
-    
-    const tipsList = document.createElement("ul");
-    tipsList.style.cssText = `
-      margin: 0;
-      padding-left: 18px;
-      white-space: normal;
-    `;
-    const tipItems = [
-      "Long-press a WTR term (span) to open the character menu.",
-      "Choose Male/Female to add a one-line JSON snippet to Draft.",
-      "Draft persists; Copy JSON copies the snippet.",
-      "Pronoun fixes rerun automatically when you go Next."
-    ];
-    for (const t of tipItems) {
-      const li = document.createElement("li");
-      li.textContent = t;
-      li.style.cssText = `margin: 4px 0;`;
-      tipsList.appendChild(li);
-    }
-    
-    onboard.appendChild(tipsTitle);
-    onboard.appendChild(tipsList);
-
-
-    const divider = document.createElement("div");
-    divider.style.cssText = `height:1px; background: rgba(255,255,255,0.12); margin:10px 0;`;
-
-    const sectionHeader = document.createElement("div");
-    sectionHeader.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:8px;`;
-
-    const sectionTitle = document.createElement("div");
-    sectionTitle.textContent = "New Character (JSON)";
-    sectionTitle.style.cssText = `font-weight: 700; opacity:.95;`;
-
-    const sectionToggle = document.createElement("button");
-    sectionToggle.type = "button";
-    sectionToggle.textContent = "Open";
-    sectionToggle.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.12); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      flex: 0 0 auto;
-    `;
-
-    let draftSectionOpen = false;
-
-    const draftWrap = document.createElement("div");
-    draftWrap.style.cssText = `display:none; margin-top:10px;`;
-
-    const draftLabel = document.createElement("div");
-    draftLabel.textContent = "Draft (copy into glossary.json)";
-    draftLabel.style.cssText = `font-weight:600; opacity:.9; margin-bottom:6px;`;
-
-    const draftBox = document.createElement("textarea");
-    draftBox.readOnly = true;
-    draftBox.spellcheck = false;
-    draftBox.style.cssText = `
-      width: 100%;
-      min-height: 54px;
-      max-height: 160px;
-      resize: vertical;
-      border: 1px solid rgba(255,255,255,0.14);
-      border-radius: 10px;
-      background: rgba(255,255,255,0.08);
-      color: #fff;
-      padding: 8px 10px;
-      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      outline: none;
-    `;
-
-    const btnRow = document.createElement("div");
-    btnRow.style.cssText = `display:flex; gap:8px; margin-top:8px; flex-wrap: wrap;`;
-
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.textContent = "Copy JSON";
-    copyBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.16); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const clearBtn = document.createElement("button");
-    clearBtn.type = "button";
-    clearBtn.textContent = "Clear Draft";
-    clearBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      padding: 6px 10px; border-radius: 10px;
-      background: rgba(255,255,255,0.10); color:#fff;
-      font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-    `;
-
-    const draftCountRow = document.createElement("div");
-    draftCountRow.style.cssText = `opacity:.85; margin-top:8px;`;
-    draftCountRow.textContent = "Draft: 0";
-
-    const pill = document.createElement("div");
-    pill.style.cssText = `
-      display:none; position: fixed; z-index: 2147483647;
-      background: rgba(0,0,0,0.37);
-      color:#fff;
-      border-radius: 999px;
-      padding: 4px 6px;
-      font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      box-shadow: 0 10px 28px rgba(0,0,0,.25);
-      backdrop-filter: blur(6px);
-      user-select: none;
-      touch-action: none;
-      max-width: 220px;
-      overflow: hidden;
-    `;
-
-    const pillRow = document.createElement("div");
-    pillRow.style.cssText = `display:flex; align-items:center; gap:8px; min-width: 0;`;
-
-    const pillText = document.createElement("div");
-    pillText.style.cssText = `padding: 1px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width:0; max-width: 150px;`;
-
-    const pillExpandBtn = document.createElement("button");
-    pillExpandBtn.type = "button";
-    pillExpandBtn.textContent = "+";
-    pillExpandBtn.title = "Expand";
-    pillExpandBtn.style.cssText = `
-      appearance:none; border:0; cursor:pointer;
-      width:22px; height:22px; border-radius:8px;
-      background:rgba(255,255,255,0.10); color:#fff;
-      font-size:14px; line-height:22px; padding:0;
-      flex: 0 0 auto;
-    `;
-
-    function refreshToggleUI() {
-      const on = enabled();
-      toggleBtn.textContent = on ? "ON" : "OFF";
-      toggleBtn.style.background = on ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.10)";
-      pillText.textContent = `PF (${on ? "ON" : "OFF"})`;
-    }
-
-    function refreshSummary() {
-      if (!glossaryOk) {
-        summary.textContent = "Glossary error";
-        return;
-      }
-      const line1 = `• Characters: ${charactersCount}` + (charactersList3 ? ` • ${charactersList3}` : "");
-      const line2 = `• Changed: ${changedTotal}`;
-      summary.textContent = `${line1}\n${line2}`;
-    }
-
-    function setDraftUI(jsonSnippet, count) {
-      const draftCount = count || 0;
-      draftCountRow.textContent = `Draft: ${draftCount}`;
-
-      const show = draftSectionOpen;
-      draftWrap.style.display = show ? "block" : "none";
-
-      const hasDraft = draftCount > 0 && !!jsonSnippet;
-      draftBox.value = show ? (hasDraft ? jsonSnippet : "") : "";
-
-      copyBtn.disabled = !hasDraft;
-      clearBtn.disabled = !hasDraft;
-      copyBtn.style.opacity = hasDraft ? "1" : "0.55";
-      clearBtn.style.opacity = hasDraft ? "1" : "0.55";
-
-      sectionToggle.textContent = draftSectionOpen ? "Close" : "Open";
-    }
-
-    toggleBtn.onclick = () => {
-      setEnabled(!enabled());
-      refreshToggleUI();
-      setTimeout(() => location.reload(), 150);
-    };
-
-    helpBtn.onclick = () => {
-      showOnboard = !showOnboard;
-      onboard.style.display = showOnboard ? "block" : "none";
-      localStorage.setItem(ONBOARD_KEY, "1");
-      clampToViewport(box);
-    };
-
-    function setMin(min) {
-      localStorage.setItem(UI_KEY_MIN, min ? "1" : "0");
-      box.style.display = min ? "none" : "block";
-      pill.style.display = min ? "block" : "none";
-    }
-
-    minBtn.onclick = () => setMin(true);
-    pillExpandBtn.onclick = () => setMin(false);
-    pillText.onclick = () => setMin(false);
-
-    sectionToggle.onclick = () => {
-      draftSectionOpen = !draftSectionOpen;
-      const d = loadDraft();
-      setDraftUI(d?.snippet || "", (d?.items || []).length);
-      clampToViewport(box);
-    };
-
-    controls.appendChild(toggleBtn);
-    controls.appendChild(helpBtn);
-    controls.appendChild(minBtn);
-
-    topRow.appendChild(title);
-    topRow.appendChild(controls);
-
-    sectionHeader.appendChild(sectionTitle);
-    sectionHeader.appendChild(sectionToggle);
-
-    box.appendChild(topRow);
-    box.appendChild(disclaimer);
-    box.appendChild(summary);
-    box.appendChild(onboard);
-    box.appendChild(divider);
-    box.appendChild(sectionHeader);
-
-    draftWrap.appendChild(draftLabel);
-    draftWrap.appendChild(draftBox);
-
-    btnRow.appendChild(copyBtn);
-    btnRow.appendChild(clearBtn);
-
-    draftWrap.appendChild(btnRow);
-    box.appendChild(draftWrap);
-    box.appendChild(draftCountRow);
-
-    pillRow.appendChild(pillText);
-    pillRow.appendChild(pillExpandBtn);
-    pill.appendChild(pillRow);
-
-    document.documentElement.appendChild(box);
-    document.documentElement.appendChild(pill);
-
-    applyPos(box);
-    applyPos(pill);
-
-    enableDrag(box, true);
-    enableDrag(pill, true);
-
-    refreshToggleUI();
-    refreshSummary();
-
-    // minimized by default
-    setMin(true);
-
-    if (localStorage.getItem(ONBOARD_KEY) === "1") {
-      showOnboard = false;
-      onboard.style.display = "none";
-    }
-
-    async function writeClipboard(text) {
-      try {
-        await navigator.clipboard.writeText(text);
-        return true;
-      } catch {
-        try {
-          const ta = document.createElement("textarea");
-          ta.value = text;
-          ta.style.position = "fixed";
-          ta.style.left = "-9999px";
-          document.body.appendChild(ta);
-          ta.focus();
-          ta.select();
-          const ok = document.execCommand("copy");
-          document.body.removeChild(ta);
-          return ok;
-        } catch {
-          return false;
+      function makeUI() {
+        let savedPos = {};
+        try { savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}"); }
+        catch { savedPos = {}; localStorage.removeItem(UI_KEY_POS); }
+      
+        const enabledInit = localStorage.getItem(UI_KEY_ON);
+        if (enabledInit !== "0" && enabledInit !== "1") localStorage.setItem(UI_KEY_ON, "1");
+      
+        function enabled() { return localStorage.getItem(UI_KEY_ON) !== "0"; }
+        function setEnabled(v) { localStorage.setItem(UI_KEY_ON, v ? "1" : "0"); }
+      
+        let glossaryOk = true;
+      
+        // Summary state
+        let charactersCount = 0;
+        let charactersList3 = "";
+        let changedTotal = 0;
+      
+        // Full detected cache (for UI view)
+        let lastDetectedEntries = [];
+      
+        // View state: "main" or "chars"
+        let view = "main";
+      
+        const ONBOARD_KEY = "wtrpf_onboard_seen_v1";
+        let showOnboard = false;
+      
+        const style = document.createElement("style");
+        style.textContent = `
+          .wtrpf-added-term {
+            text-shadow: 0 0 10px rgba(255,255,255,0.25);
+            outline: 1px solid rgba(255,255,255,0.18);
+            border-radius: 4px;
+            padding: 0 2px;
+          }
+          .wtrpf-linklike {
+            cursor: pointer;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+          }
+          .wtrpf-linklike:hover { opacity: .92; }
+        `;
+        document.documentElement.appendChild(style);
+      
+        function applyPos(el) {
+          if (savedPos.left != null) {
+            el.style.left = savedPos.left + "px";
+            el.style.right = "auto";
+          } else {
+            el.style.left = "12px";
+            el.style.right = "auto";
+          }
+          el.style.top = (savedPos.top ?? 12) + "px";
         }
-      }
-    }
-
-    copyBtn.onclick = async () => {
-      if (copyBtn.disabled) return;
-      const d = loadDraft();
-      const txt = d?.snippet || "";
-      if (!txt) return;
-      await writeClipboard(txt);
-    };
-
-    clearBtn.onclick = () => {
-      if (clearBtn.disabled) return;
-      saveDraft({ items: [], snippet: "" });
-      setDraftUI("", 0);
-    };
-
-    return {
-      isEnabled: () => enabled(),
-      setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshSummary(); },
-      setCharacters: (detectedEntries) => {
-        charactersCount = detectedEntries.length;
-        const base = detectedEntries.length ? detectedEntries : [];
-        const names = base.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
-          const g = String(info.gender || "").toLowerCase();
-          const label = (g === "female" || g === "male") ? g : "unknown";
-          return `${name} (${label})`;
-        });
-        charactersList3 = names.join(", ") + (base.length > MAX_NAMES_SHOWN ? " …" : "");
+      
+        function clampToViewport(el) {
+          const rect = el.getBoundingClientRect();
+          const maxLeft = Math.max(6, window.innerWidth - rect.width - 6);
+          const maxTop = Math.max(6, window.innerHeight - rect.height - 6);
+          const left = Math.min(Math.max(6, rect.left), maxLeft);
+          const top = Math.min(Math.max(6, rect.top), maxTop);
+          el.style.left = left + "px";
+          el.style.top = top + "px";
+          el.style.right = "auto";
+          localStorage.setItem(UI_KEY_POS, JSON.stringify({ left: Math.round(left), top: Math.round(top) }));
+        }
+      
+        function enableDrag(el, allowButtonClicks = true) {
+          let startX = 0, startY = 0, startTop = 0, startLeft = 0, dragging = false;
+      
+          el.addEventListener("pointerdown", e => {
+            if (allowButtonClicks && e.target && e.target.tagName === "BUTTON") return;
+            dragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = el.getBoundingClientRect();
+            startTop = rect.top;
+            startLeft = rect.left;
+            try { el.setPointerCapture(e.pointerId); } catch {}
+          });
+      
+          el.addEventListener("pointermove", e => {
+            if (!dragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            el.style.top = (startTop + dy) + "px";
+            el.style.left = (startLeft + dx) + "px";
+            el.style.right = "auto";
+          });
+      
+          const end = () => {
+            if (!dragging) return;
+            dragging = false;
+            clampToViewport(el);
+          };
+      
+          el.addEventListener("pointerup", end);
+          el.addEventListener("pointercancel", end);
+        }
+      
+        const isMobile = window.innerWidth <= 480;
+      
+        const box = document.createElement("div");
+        box.style.cssText = `
+          position: fixed; z-index: 2147483647;
+          background: rgba(0,0,0,0.50);
+          color: #fff;
+          border-radius: 12px;
+          padding: 10px 12px;
+          font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+          box-shadow: 0 10px 28px rgba(0,0,0,.25);
+          max-width: ${isMobile ? "60vw" : "min(520px, 58vw)"};
+          width: ${isMobile ? "60vw" : "auto"};
+          height: auto;
+          backdrop-filter: blur(6px);
+          user-select: none;
+          touch-action: none;
+        `;
+      
+        const topRow = document.createElement("div");
+        topRow.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px;`;
+      
+        const title = document.createElement("div");
+        title.textContent = "PronounsFix";
+        title.style.cssText = `font-weight: 600;`;
+      
+        const controls = document.createElement("div");
+        controls.style.cssText = `display:flex; gap:8px; align-items:center;`;
+      
+        const toggleBtn = document.createElement("button");
+        toggleBtn.type = "button";
+        toggleBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          padding: 6px 10px; border-radius: 999px;
+          background: rgba(255,255,255,0.12); color:#fff;
+          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        `;
+      
+        const helpBtn = document.createElement("button");
+        helpBtn.type = "button";
+        helpBtn.textContent = "?";
+        helpBtn.title = "Help";
+        helpBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          width:26px; height:26px; border-radius:9px;
+          background:rgba(255,255,255,0.10); color:#fff;
+          font-size:14px; line-height:26px; padding:0;
+        `;
+      
+        const minBtn = document.createElement("button");
+        minBtn.type = "button";
+        minBtn.textContent = "—";
+        minBtn.title = "Minimise";
+        minBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          width:26px; height:26px; border-radius:9px;
+          background:rgba(255,255,255,0.12); color:#fff;
+          font-size:16px; line-height:26px; padding:0;
+        `;
+      
+        const disclaimer = document.createElement("div");
+        disclaimer.textContent = "Works best on single page reader type";
+        disclaimer.style.cssText = `
+          margin-top: 4px;
+          font-size: 11px;
+          font-style: italic;
+          opacity: .78;
+          user-select: none;
+        `;
+      
+        // SUMMARY (clickable line1)
+        const summary = document.createElement("div");
+        summary.style.cssText = `white-space: pre-line; opacity: .95; margin-top:8px;`;
+      
+        const summaryLine1 = document.createElement("div");
+        summaryLine1.style.cssText = `white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`;
+        summaryLine1.classList.add("wtrpf-linklike");
+      
+        const summaryLine2 = document.createElement("div");
+        summaryLine2.style.cssText = `margin-top: 2px;`;
+      
+        summary.appendChild(summaryLine1);
+        summary.appendChild(summaryLine2);
+      
+        // Onboard block
+        const onboard = document.createElement("div");
+        onboard.style.cssText = `
+          display:none;
+          margin-top:10px;
+          padding: 8px 10px;
+          border-radius: 10px;
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.12);
+          opacity: .95;
+        `;
+      
+        const tipsTitle = document.createElement("div");
+        tipsTitle.textContent = "Tips:";
+        tipsTitle.style.cssText = `font-weight: 600; margin-bottom: 6px;`;
+      
+        const tipsList = document.createElement("ul");
+        tipsList.style.cssText = `margin: 0; padding-left: 18px; white-space: normal;`;
+      
+        const tipItems = [
+          "Long-press a WTR term (span) to open the character menu.",
+          "Choose Male/Female to add a one-line JSON snippet to Draft.",
+          "Draft persists; Copy JSON copies the snippet.",
+          "Pronoun fixes rerun automatically when you go Next."
+        ];
+        for (const t of tipItems) {
+          const li = document.createElement("li");
+          li.textContent = t;
+          li.style.cssText = `margin: 4px 0;`;
+          tipsList.appendChild(li);
+        }
+        onboard.appendChild(tipsTitle);
+        onboard.appendChild(tipsList);
+      
+        const divider = document.createElement("div");
+        divider.style.cssText = `height:1px; background: rgba(255,255,255,0.12); margin:10px 0;`;
+      
+        // Draft / New Character section (unchanged UI)
+        const sectionHeader = document.createElement("div");
+        sectionHeader.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:8px;`;
+      
+        const sectionTitle = document.createElement("div");
+        sectionTitle.textContent = "New Character (JSON)";
+        sectionTitle.style.cssText = `font-weight: 700; opacity:.95;`;
+      
+        const sectionToggle = document.createElement("button");
+        sectionToggle.type = "button";
+        sectionToggle.textContent = "Open";
+        sectionToggle.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          padding: 6px 10px; border-radius: 10px;
+          background: rgba(255,255,255,0.12); color:#fff;
+          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+          flex: 0 0 auto;
+        `;
+      
+        let draftSectionOpen = false;
+      
+        const draftWrap = document.createElement("div");
+        draftWrap.style.cssText = `display:none; margin-top:10px;`;
+      
+        const draftLabel = document.createElement("div");
+        draftLabel.textContent = "Draft (copy into glossary.json)";
+        draftLabel.style.cssText = `font-weight:600; opacity:.9; margin-bottom:6px;`;
+      
+        const draftBox = document.createElement("textarea");
+        draftBox.readOnly = true;
+        draftBox.spellcheck = false;
+        draftBox.style.cssText = `
+          width: 100%;
+          min-height: 54px;
+          max-height: 160px;
+          resize: vertical;
+          border: 1px solid rgba(255,255,255,0.14);
+          border-radius: 10px;
+          background: rgba(255,255,255,0.08);
+          color: #fff;
+          padding: 8px 10px;
+          font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+          outline: none;
+        `;
+      
+        const btnRow = document.createElement("div");
+        btnRow.style.cssText = `display:flex; gap:8px; margin-top:8px; flex-wrap: wrap;`;
+      
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.textContent = "Copy JSON";
+        copyBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          padding: 6px 10px; border-radius: 10px;
+          background: rgba(255,255,255,0.16); color:#fff;
+          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        `;
+      
+        const clearBtn = document.createElement("button");
+        clearBtn.type = "button";
+        clearBtn.textContent = "Clear Draft";
+        clearBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          padding: 6px 10px; border-radius: 10px;
+          background: rgba(255,255,255,0.10); color:#fff;
+          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        `;
+      
+        const draftCountRow = document.createElement("div");
+        draftCountRow.style.cssText = `opacity:.85; margin-top:8px;`;
+        draftCountRow.textContent = "Draft: 0";
+      
+        // Minimized pill
+        const pill = document.createElement("div");
+        pill.style.cssText = `
+          display:none; position: fixed; z-index: 2147483647;
+          background: rgba(0,0,0,0.37);
+          color:#fff;
+          border-radius: 999px;
+          padding: 4px 6px;
+          font: 11px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+          box-shadow: 0 10px 28px rgba(0,0,0,.25);
+          backdrop-filter: blur(6px);
+          user-select: none;
+          touch-action: none;
+          max-width: 220px;
+          overflow: hidden;
+        `;
+      
+        const pillRow = document.createElement("div");
+        pillRow.style.cssText = `display:flex; align-items:center; gap:8px; min-width: 0;`;
+      
+        const pillText = document.createElement("div");
+        pillText.style.cssText = `padding: 1px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width:0; max-width: 150px;`;
+      
+        const pillExpandBtn = document.createElement("button");
+        pillExpandBtn.type = "button";
+        pillExpandBtn.textContent = "+";
+        pillExpandBtn.title = "Expand";
+        pillExpandBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          width:22px; height:22px; border-radius:8px;
+          background:rgba(255,255,255,0.10); color:#fff;
+          font-size:14px; line-height:22px; padding:0;
+          flex: 0 0 auto;
+        `;
+      
+        // Characters view container (NEW)
+        const charView = document.createElement("div");
+        charView.style.cssText = `display:none; margin-top:10px;`;
+      
+        const charHeader = document.createElement("div");
+        charHeader.style.cssText = `display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;`;
+      
+        const charTitle = document.createElement("div");
+        charTitle.textContent = "Characters on this page";
+        charTitle.style.cssText = `font-weight:700; opacity:.95;`;
+      
+        const backBtn = document.createElement("button");
+        backBtn.type = "button";
+        backBtn.textContent = "Back";
+        backBtn.style.cssText = `
+          appearance:none; border:0; cursor:pointer;
+          padding: 6px 10px; border-radius: 10px;
+          background: rgba(255,255,255,0.12); color:#fff;
+          font: 12px/1 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+          flex: 0 0 auto;
+        `;
+      
+        const charListWrap = document.createElement("div");
+        // Height capped; internal scroll
+        charListWrap.style.cssText = `
+          border: 1px solid rgba(255,255,255,0.12);
+          border-radius: 10px;
+          background: rgba(255,255,255,0.06);
+          padding: 8px 10px;
+          max-height: ${isMobile ? "38vh" : "42vh"};
+          overflow: auto;
+          overscroll-behavior: contain;
+        `;
+      
+        const charList = document.createElement("ul");
+        charList.style.cssText = `margin: 0; padding-left: 18px; white-space: normal;`;
+      
+        charListWrap.appendChild(charList);
+        charHeader.appendChild(charTitle);
+        charHeader.appendChild(backBtn);
+        charView.appendChild(charHeader);
+        charView.appendChild(charListWrap);
+      
+        function refreshToggleUI() {
+          const on = enabled();
+          toggleBtn.textContent = on ? "ON" : "OFF";
+          toggleBtn.style.background = on ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.10)";
+          pillText.textContent = `PF (${on ? "ON" : "OFF"})`;
+        }
+      
+        function refreshSummary() {
+          if (!glossaryOk) {
+            summaryLine1.textContent = "Glossary error";
+            summaryLine2.textContent = "";
+            summaryLine1.classList.remove("wtrpf-linklike");
+            return;
+          }
+      
+          // line1 is clickable to open character view
+          summaryLine1.classList.add("wtrpf-linklike");
+          summaryLine1.textContent =
+            `• Characters: ${charactersCount}` + (charactersList3 ? ` • ${charactersList3}` : "");
+      
+          summaryLine2.textContent = `• Changed: ${changedTotal}`;
+        }
+      
+        function renderCharList(detectedEntries) {
+          charList.innerHTML = "";
+          const list = Array.isArray(detectedEntries) ? detectedEntries : [];
+      
+          if (!list.length) {
+            const li = document.createElement("li");
+            li.textContent = "No characters detected on this page.";
+            li.style.cssText = `margin: 4px 0; opacity: .9;`;
+            charList.appendChild(li);
+            return;
+          }
+      
+          for (const [name, info] of list) {
+            const g = String(info?.gender || "").toLowerCase();
+            const label = (g === "female" || g === "male") ? g : "unknown";
+      
+            const li = document.createElement("li");
+            li.style.cssText = `margin: 4px 0;`;
+      
+            // name (gender)
+            const strong = document.createElement("span");
+            strong.textContent = `${name}`;
+            strong.style.cssText = `font-weight: 600;`;
+      
+            const meta = document.createElement("span");
+            meta.textContent = ` (${label})`;
+            meta.style.cssText = `opacity: .85;`;
+      
+            li.appendChild(strong);
+            li.appendChild(meta);
+      
+            charList.appendChild(li);
+          }
+        }
+      
+        function setView(next) {
+          view = next === "chars" ? "chars" : "main";
+      
+          const inChars = (view === "chars");
+      
+          // In Characters view: hide everything except topRow + charView
+          disclaimer.style.display = inChars ? "none" : "block";
+          summary.style.display = inChars ? "none" : "block";
+          onboard.style.display = inChars ? "none" : (showOnboard ? "block" : "none");
+          divider.style.display = inChars ? "none" : "block";
+          sectionHeader.style.display = inChars ? "none" : "flex";
+          draftWrap.style.display = inChars ? "none" : (draftSectionOpen ? "block" : "none");
+          draftCountRow.style.display = inChars ? "none" : "block";
+      
+          charView.style.display = inChars ? "block" : "none";
+      
+          clampToViewport(box);
+        }
+      
+        function setDraftUI(jsonSnippet, count) {
+          const draftCount = count || 0;
+          draftCountRow.textContent = `Draft: ${draftCount}`;
+      
+          const show = draftSectionOpen;
+          draftWrap.style.display = show ? "block" : "none";
+      
+          const hasDraft = draftCount > 0 && !!jsonSnippet;
+          draftBox.value = show ? (hasDraft ? jsonSnippet : "") : "";
+      
+          copyBtn.disabled = !hasDraft;
+          clearBtn.disabled = !hasDraft;
+          copyBtn.style.opacity = hasDraft ? "1" : "0.55";
+          clearBtn.style.opacity = hasDraft ? "1" : "0.55";
+      
+          sectionToggle.textContent = draftSectionOpen ? "Close" : "Open";
+        }
+      
+        toggleBtn.onclick = () => {
+          setEnabled(!enabled());
+          refreshToggleUI();
+          setTimeout(() => location.reload(), 150);
+        };
+      
+        helpBtn.onclick = () => {
+          showOnboard = !showOnboard;
+          onboard.style.display = showOnboard ? "block" : "none";
+          localStorage.setItem(ONBOARD_KEY, "1");
+          clampToViewport(box);
+        };
+      
+        function setMin(min) {
+          localStorage.setItem(UI_KEY_MIN, min ? "1" : "0");
+          box.style.display = min ? "none" : "block";
+          pill.style.display = min ? "block" : "none";
+        }
+      
+        minBtn.onclick = () => setMin(true);
+        pillExpandBtn.onclick = () => setMin(false);
+        pillText.onclick = () => setMin(false);
+      
+        sectionToggle.onclick = () => {
+          draftSectionOpen = !draftSectionOpen;
+          const d = loadDraft();
+          setDraftUI(d?.snippet || "", (d?.items || []).length);
+          clampToViewport(box);
+        };
+      
+        // Click line1 to enter Characters view (NEW)
+        summaryLine1.onclick = () => {
+          if (!glossaryOk) return;
+          renderCharList(lastDetectedEntries);
+          setView("chars");
+        };
+      
+        backBtn.onclick = () => {
+          setView("main");
+        };
+      
+        controls.appendChild(toggleBtn);
+        controls.appendChild(helpBtn);
+        controls.appendChild(minBtn);
+      
+        topRow.appendChild(title);
+        topRow.appendChild(controls);
+      
+        sectionHeader.appendChild(sectionTitle);
+        sectionHeader.appendChild(sectionToggle);
+      
+        box.appendChild(topRow);
+        box.appendChild(disclaimer);
+        box.appendChild(summary);
+        box.appendChild(onboard);
+        box.appendChild(divider);
+        box.appendChild(sectionHeader);
+      
+        draftWrap.appendChild(draftLabel);
+        draftWrap.appendChild(draftBox);
+      
+        btnRow.appendChild(copyBtn);
+        btnRow.appendChild(clearBtn);
+      
+        draftWrap.appendChild(btnRow);
+        box.appendChild(draftWrap);
+        box.appendChild(draftCountRow);
+      
+        // Characters view goes after summary area (still inside expanded box)
+        box.appendChild(charView);
+      
+        pillRow.appendChild(pillText);
+        pillRow.appendChild(pillExpandBtn);
+        pill.appendChild(pillRow);
+      
+        document.documentElement.appendChild(box);
+        document.documentElement.appendChild(pill);
+      
+        applyPos(box);
+        applyPos(pill);
+      
+        enableDrag(box, true);
+        enableDrag(pill, true);
+      
+        refreshToggleUI();
         refreshSummary();
-      },
-      setChanged: (val) => {
-        changedTotal = clamp(Number(val) || 0, 0, 999999);
-        refreshSummary();
-      },
-      setMinimized: (min) => setMin(!!min),
-      setDraftUI,
-      refreshDraftUI: () => {
-        const d = loadDraft();
-        setDraftUI(d?.snippet || "", (d?.items || []).length);
+      
+        // minimized by default
+        setMin(true);
+      
+        if (localStorage.getItem(ONBOARD_KEY) === "1") {
+          showOnboard = false;
+          onboard.style.display = "none";
+        }
+      
+        // Ensure correct initial view
+        setView("main");
+      
+        async function writeClipboard(text) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return true;
+          } catch {
+            try {
+              const ta = document.createElement("textarea");
+              ta.value = text;
+              ta.style.position = "fixed";
+              ta.style.left = "-9999px";
+              document.body.appendChild(ta);
+              ta.focus();
+              ta.select();
+              const ok = document.execCommand("copy");
+              document.body.removeChild(ta);
+              return ok;
+            } catch {
+              return false;
+            }
+          }
+        }
+      
+        copyBtn.onclick = async () => {
+          if (copyBtn.disabled) return;
+          const d = loadDraft();
+          const txt = d?.snippet || "";
+          if (!txt) return;
+          await writeClipboard(txt);
+        };
+      
+        clearBtn.onclick = () => {
+          if (clearBtn.disabled) return;
+          saveDraft({ items: [], snippet: "" });
+          setDraftUI("", 0);
+        };
+      
+        return {
+          isEnabled: () => enabled(),
+          setGlossaryOk: (ok) => { glossaryOk = !!ok; refreshSummary(); },
+          setCharacters: (detectedEntries, meta = {}) => {
+            const base = Array.isArray(detectedEntries) ? detectedEntries : [];
+            lastDetectedEntries = base;
+      
+            charactersCount = base.length;
+      
+            const names = base.slice(0, MAX_NAMES_SHOWN).map(([name, info]) => {
+              const g = String(info.gender || "").toLowerCase();
+              const label = (g === "female" || g === "male") ? g : "unknown";
+              return `${name} (${label})`;
+            });
+            charactersList3 = names.join(", ") + (base.length > MAX_NAMES_SHOWN ? " …" : "");
+            refreshSummary();
+      
+            // If user is currently in character view, live-refresh the list
+            if (view === "chars") {
+              renderCharList(lastDetectedEntries);
+            }
+          },
+          setChanged: (val) => {
+            changedTotal = clamp(Number(val) || 0, 0, 999999);
+            refreshSummary();
+          },
+          setMinimized: (min) => setMin(!!min),
+          setDraftUI,
+          refreshDraftUI: () => {
+            const d = loadDraft();
+            setDraftUI(d?.snippet || "", (d?.items || []).length);
+          }
+        };
       }
-    };
-  }
 
   // ==========================================================
   // Add popup (small + X + Male/Female only)
@@ -1544,45 +1739,6 @@
     
     return { hide };
   }
-
-  // URL+DOM route observer” that cannot miss SPA transitions
-//    function installRouteObserver(onNav) {
-//    let lastHref = location.href;
-//    let lastFire = 0;
-  
-  //  const fire = (why) => {
-   //   const now = Date.now();
-   //   if (now - lastFire < 250) return; // debounce
-  //    lastFire = now;
-  //    onNav(why);
-  //  };
-  
-    // 1) MutationObserver on BODY subtree (SPA content swaps)
-//    const mo = new MutationObserver(() => {
- //     const href = location.href;
-  //    if (href !== lastHref) {
-     //   lastHref = href;
-      //  fire("mo-href-change");
-     //   return;
-     // }
-  
-      // Even if href didn't change, reader content often re-renders
-      // so still fire lightly (nav sweep will decide whether to run)
-   //   fire("mo-dom-change");
-  //  });
-  //  mo.observe(document.body, { childList: true, subtree: true });
-  
-    // 2) Also patch history (some sites update URL without DOM mutations immediately)
-   // const _push = history.pushState;
-   // const _rep = history.replaceState;
-   // history.pushState = function () { const r = _push.apply(this, arguments); fire("pushState"); return r; };
-  //  history.replaceState = function () { const r = _rep.apply(this, arguments); fire("replaceState"); return r; };
-  //  window.addEventListener("popstate", () => fire("popstate"), true);
-  
-    // 3) Immediate invoke
-   // fire("route-init");
-//  }
-
 
   // ==========================================================
   // Navigation hooks
@@ -1988,9 +2144,19 @@
   }
 
     function updateDetectedCharactersUI(root) {
+      const cid = getChapterId(root);
+      const sig = chapterSignature(root);
+    
+      const cached = getCharCache(cid);
+      if (cached && cached.sig && sig && cached.sig === sig) {
+        ui.setCharacters(cached.detected || [], { fromCache: true });
+        return;
+      }
+    
       const detected = detectCharactersOnPage(root, entries);
-      if (detected.length) ui.setCharacters(detected);
-      else ui.setCharacters(entries.slice(0, Math.min(entries.length, MAX_NAMES_SHOWN)));
+      setCharCache(cid, sig, detected);
+    
+      ui.setCharacters(detected || [], { fromCache: false });
     }
 
     let lastActorGender = null;
@@ -2007,6 +2173,21 @@
       navSweepTimer = null;
     }
 
+  /* =========================
+   Character detection cache
+   ========================= */
+    const _charDetectCache = new Map(); // key: chapterId -> { sig, detected }
+    
+    // helper
+    function getCharCache(chapterId) {
+      return _charDetectCache.get(String(chapterId || "unknown")) || null;
+    }
+    function setCharCache(chapterId, sig, detected) {
+      _charDetectCache.set(String(chapterId || "unknown"), {
+        sig: String(sig || ""),
+        detected: Array.isArray(detected) ? detected : []
+      });
+    }
 
     function rootPatchedFor(root, chapterId) {
       return root?.dataset?.wtrpfPatchedChapter === String(chapterId);
@@ -2030,7 +2211,7 @@
    - Fix: accept {forcedRoot, forcedChapterId} params (no global run._forcedRoot)
    - Fix: running guard only blocks non-force runs
    - Fix: correct marker clearing selectors (dataset → data-wtrpf-patched*, etc.)
-   - Fix: include chapterId in signature gating / appliedSig logic (optional; see snippet below)
+   - Fix: include chapterId in signature gating / appliedSig logic
    ========================================================== */
 
     // helper: clear patch markers correctly
@@ -2066,8 +2247,8 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
   if (!ui.isEnabled()) return;
   if (document.hidden) return;
 
-  // Allow forceFull to proceed even if another run is active? NO.
-  // We keep "single-flight" to avoid interleaving; forceFull just bypasses cooldown/signature gates.
+  // Single-flight always: even forceFull won't run concurrently.
+  // forceFull only bypasses cooldown/signature gates; pending runs are handled by requestRun + _pendingForced.
   if (running) return;
 
   const now = Date.now();
@@ -2075,6 +2256,11 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
 
   const root = forcedRoot || (rootManager?.getRoot?.() || findContentRoot());
   if (!root) return;
+
+  // If this run is targeting an infinite body, clear its queued marker
+  if (root?.dataset?.wtrpfQueued === "1") {
+    delete root.dataset.wtrpfQueued;
+  }
 
   const urlCid = getUrlChapterId();
   const domCid = getDomChapterId(root);
@@ -2147,6 +2333,12 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
 
     // If forceFull, clear per-node markers to reprocess
     if (forceFull) clearPatchMarkers(root);
+
+    // If root is a chapter body, clear infinite-mode flags too
+    if (root?.classList?.contains("chapter-body") && root?.dataset) {
+      delete root.dataset.wtrpfSwept;
+      delete root.dataset.wtrpfQueued;
+    }
 
     // UI: show last known count for this chapter until we compute a new one
     const st0 = loadChapterState();
@@ -2293,6 +2485,52 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
   }
 }
 
+    /* =========================
+   C) NEW: Single debounced scheduler (upgrade #1)
+   Put this inside Main (async IIFE) after you define run()
+   and before you install hooks.
+   ========================= */
+    const RUN_DEBOUNCE_MS = 140;
+    
+    let _runTimer = null;
+    let _pendingRun = null; // { forceFull, forcedRoot, forcedChapterId, reason, ts }
+    
+    function requestRun(reason, opts = {}) {
+      if (!ui.isEnabled() || document.hidden) return;
+    
+      const req = {
+        forceFull: !!opts.forceFull,
+        forcedRoot: opts.forcedRoot || null,
+        forcedChapterId: opts.forcedChapterId || null,
+        reason: String(reason || "request"),
+        ts: Date.now()
+      };
+    
+      // Latest wins; forceFull is "sticky" (once requested, keep it true)
+      if (_pendingRun) {
+        req.forceFull = req.forceFull || _pendingRun.forceFull;
+        if (!req.forcedRoot && _pendingRun.forcedRoot) req.forcedRoot = _pendingRun.forcedRoot;
+        if (!req.forcedChapterId && _pendingRun.forcedChapterId) req.forcedChapterId = _pendingRun.forcedChapterId;
+      }
+      _pendingRun = req;
+
+      if (_runTimer) return;
+      _runTimer = setTimeout(() => {
+        _runTimer = null;
+        const r = _pendingRun;
+        _pendingRun = null;
+        if (!r) return;
+    
+        // IMPORTANT: run() already guards single-flight; this just coalesces triggers
+        console.log("[WTRPF] requestRun→run:", r.reason, "forceFull=", r.forceFull);
+        run({
+          forceFull: r.forceFull,
+          forcedRoot: r.forcedRoot,
+          forcedChapterId: r.forcedChapterId
+        });
+      }, RUN_DEBOUNCE_MS);
+    }
+
       /* ==========================================================
        DROP-IN SNIPPET A: drain pending forced run
        Place near the end of run() finally OR in your monitor tick.
@@ -2328,7 +2566,10 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         .filter(b => (b.innerText || "").trim().length > 200);
     
       for (const body of bodies) {
-        if (body?.dataset?.wtrpfSwept === "1") continue;
+        if (!body) continue;
+    
+        // If we already declared this body stable, skip
+        if (body.dataset.wtrpfSwept === "1") continue;
     
         const cid = getChapterIdForBody(body);
         if (!cid || cid === "unknown") continue;
@@ -2337,33 +2578,29 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         const sigNow = chapterSignature(body);
         const applied = getAppliedSig(novelKey, cid);
     
-        // Already applied & stable → mark and skip
+        // If it’s already applied & stable, mark swept and clear queued
         if (applied && sigNow && sigNow === applied) {
           body.dataset.wtrpfSwept = "1";
+          clearBodyQueued(body);
           continue;
         }
     
-        // If a run is in progress, queue ONE pending forced run (latest wins)
+        // If we already queued it, don't spam requestRun every tick
+        if (bodyIsQueued(body)) continue;
+    
+        // If busy, queue ONE pending forced run (latest wins) and mark queued
         if (running) {
           _pendingForced = { root: body, cid, tries: 0 };
+          markBodyQueued(body);
           continue;
         }
     
-        // Try forced run on this body
-        const beforeApplied = getAppliedSig(novelKey, cid);
-        run({ forceFull: true, forcedRoot: body, forcedChapterId: cid });
-    
-        // Only mark swept if chapter is now stable or appliedSig changed
-        const afterApplied = getAppliedSig(novelKey, cid);
-        const sigAfter = chapterSignature(body);
-    
-        if ((afterApplied && sigAfter && sigAfter === afterApplied) || (afterApplied && afterApplied !== beforeApplied)) {
-          body.dataset.wtrpfSwept = "1";
-        }
+        // Queue a forced run (debounced). Mark queued to prevent re-queue spam.
+        markBodyQueued(body);
+        requestRun("infinite-sweep", { forceFull: true, forcedRoot: body, forcedChapterId: cid });
       }
     }
 
-    
     function startChapterMonitor() {
       let startedAt = Date.now();
     
@@ -2395,13 +2632,13 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
     
         // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
         if (!applied || sigNow !== applied) {
-          run({ forceFull: true });
+          requestRun("monitor-force", { forceFull: true });
           return;
         }
     
         // Optional warmup light passes right after load/nav
         if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
-          run({ forceFull: false });
+          requestRun("monitor-light", { forceFull: false });
         }
       }, CHAPTER_MONITOR_MS);
     }
@@ -2468,7 +2705,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
           const applied = getAppliedSig(novelKey, cid);
       
           if (!applied || sigNow !== applied) {
-            run({ forceFull: true });
+            requestRun("nav-sweep", { forceFull: true });
             stableHits = 0;
             return;
           }
@@ -2485,80 +2722,133 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
       let preNavCid = "";
       let navEpoch = 0;
    
-      const onNav = (why) => {
-        console.log("[WTRPF] onNav fired:", why, "href=", location.href);
-      
-        localStorage.setItem(UI_KEY_MIN, "1");
-        ui.setMinimized(true);
-      
-        // Reset session gates
-        lastSig = "";
-        lastChapterId = null;
-      
-        // Capture "before nav" identity so sweep won't 'stabilize' on old chapter
-        const root0 = rootManager?.getRoot?.() || findContentRoot();
-        preNavCid = root0 ? getChapterId(root0) : "";
-        preNavSig = root0 ? chapterSignature(root0) : "";
-        navEpoch++;
-      
-        rootManager.resolve();
-        startNavSweep(String(why || "nav"), navEpoch);
-      };
-
-      // Firefox Android: DOM often mounts slightly later than URL change
+        const onNav = (why) => {
+          console.log("[WTRPF] onNav fired:", why, "href=", location.href);
+        
+          localStorage.setItem(UI_KEY_MIN, "1");
+          ui.setMinimized(true);
+        
+          // Reset session gates
+          lastSig = "";
+          lastChapterId = null;
+        
+          // Capture "before nav" identity so sweep won't stabilize on old chapter
+          const root0 = rootManager?.getRoot?.() || findContentRoot();
+          preNavCid = root0 ? getChapterId(root0) : "";
+          preNavSig = root0 ? chapterSignature(root0) : "";
+          navEpoch++;
+        
+          rootManager.resolve();
+          startNavSweep(String(why || "nav"), navEpoch); // startNavSweep will requestRun when safe
+        };
+        
+        // Keep your nav-nudge:
         setTimeout(() => startNavSweep("nav-nudge"), 900);
       
-      installNextButtonHook(onNav);
-      installUrlChangeWatcher(onNav, ui.isEnabled);
-      installHistoryHooksLite(onNav);
-      installChapterTrackerObserver(onNav, ui.isEnabled);
-      installInfiniteReaderAppendObserver((why) => {
+      /* =========================
+         F) Mode-aware wiring (upgrade #4)
+         Replace your hook install section with this.
+         (Keeps your hooks but avoids redundant observers per mode.)
+         ========================= */
+
+    let _hooksWired = false;
+    let _hookMode = null; // "infinite" or "single"
+
+    function isInfiniteModeNow() {
+      return !!document.querySelector(".chapter-infinite-reader");
+    }
+
+    function wireHooksModeAware() {
+      const infinite = isInfiniteModeNow();
+      const mode = infinite ? "infinite" : "single";
+    
+      // If we already installed hooks, DO NOT install again.
+      // Just detect if mode changed and nudge the sweep.
+      if (_hooksWired) {
+        if (_hookMode !== mode) {
+          _hookMode = mode;
+          // Mode changed after mount (single <-> infinite): re-resolve root + run a nav sweep.
+          rootManager.resolve();
+          onNav("mode-changed");
+        } else {
+          // Mode same: just refresh root + do a mild sweep in case the reader mounted late.
+          rootManager.resolve();
+          startNavSweep("late-mount-nudge", navEpoch);
+        }
+        return;
+      }
+    
+      _hooksWired = true;
+      _hookMode = mode;
+    
+      // Always helpful across modes
+      installNextButtonHook((why) => onNav(why));
+      installHistoryHooksLite((why) => onNav(why));
+      installChapterTrackerObserver((why) => onNav(why), ui.isEnabled);
+    
+      // URL watcher mainly for single-chapter
+      if (!infinite) {
+        installUrlChangeWatcher((why) => onNav(why), ui.isEnabled);
+    
+        installActiveContentObserver(
+          () => (rootManager?.getRoot?.() || findContentRoot()),
+          (why) => {
+            const root = rootManager?.getRoot?.() || findContentRoot();
+            if (!root || !contentReady(root)) return;
+    
+            const cid = getChapterId(root);
+            const sigNow = chapterSignature(root);
+            if (!cid || !sigNow) return;
+    
+            const applied = getAppliedSig(novelKey, cid);
+            if (!applied || sigNow !== applied) {
+              requestRun("active-root-overwrite", { forceFull: true });
+            }
+          },
+          ui.isEnabled
+        );
+      } else {
+        installInfiniteReaderAppendObserver((why) => {
           onNav(why);
           setTimeout(() => sweepInfiniteBodies(), 80);
         }, ui.isEnabled);
+      }
+    }
+ 
+      // Call once at startup:
+      wireHooksModeAware();
+      
+      // And re-evaluate once shortly after load (reader can mount late):
+      setTimeout(() => wireHooksModeAware(), 1600);
 
 
     // React overwrite catcher: if the active chapter root mutates after we applied,
       // rerun full pass (debounced). This is the missing piece for single-chapter Next.
-      installActiveContentObserver(
-        () => (rootManager?.getRoot?.() || findContentRoot()),
-        (why) => {
+   //   installActiveContentObserver(
+     //   () => (rootManager?.getRoot?.() || findContentRoot()),
+      //  (why) => {
           // Only re-run if the current DOM diverges from what we recorded as applied
-          const root = rootManager?.getRoot?.() || findContentRoot();
-          if (!root || !contentReady(root)) return;
+       //   const root = rootManager?.getRoot?.() || findContentRoot();
+       //   if (!root || !contentReady(root)) return;
       
-          const cid = getChapterId(root);
-          const sigNow = chapterSignature(root);
-          if (!cid || !sigNow) return;
+       //   const cid = getChapterId(root);
+        //  const sigNow = chapterSignature(root);
+        //  if (!cid || !sigNow) return;
       
-          const applied = getAppliedSig(novelKey, cid);
-          if (!applied || sigNow !== applied) {
-            run({ forceFull: true });
-          }
-        },
-        ui.isEnabled
-      );
+        //  const applied = getAppliedSig(novelKey, cid);
+        //  if (!applied || sigNow !== applied) {
+        //    run({ forceFull: true });
+        //  }
+       // },
+     //   ui.isEnabled
+    //  );
 
       // Initial run
-      run({ forceFull: true });
+      requestRun("initial", { forceFull: true });
       
       // Start watchdog
       startChapterMonitor();
       
-      // Light observer for late paragraph insertions on the initial root only (debounced)
-     // const root0 = findContentRoot();
-  //    if (root0 && root0 !== document.body) {
-      //  let incrTimer = null;
-       // const mo = new MutationObserver(() => {
-       //   if (!ui.isEnabled()) return;
-        //  if (incrTimer) return;
-      //    incrTimer = setTimeout(() => {
-       //     incrTimer = null;
-       //     run({ forceFull: false });
-       //   }, 260);
-       // });
-     //   mo.observe(root0, { childList: true, subtree: true });
-   //   }
 
   })();
 })();
