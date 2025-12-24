@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.2
+// @version      1.3.3
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -569,6 +569,51 @@
     const blocks = getTextBlocks(root);
     const textLen = (root.innerText || "").trim().length;
     return (blocks.length >= 2 && textLen >= 200);
+  }
+
+  function getInfiniteHost() {
+  return document.querySelector(".chapter-infinite-reader") || null;
+}
+
+  function getAllChapterBodiesInInfinite() {
+    const host = getInfiniteHost();
+    if (!host) return [];
+    return Array.from(host.querySelectorAll(".chapter-body"))
+      .filter(b => (b.innerText || "").trim().length > 200);
+  }
+  
+  function getChapterIdForBody(body) {
+    // Prefer tracker inside / near this body:
+    const tracker =
+      body.querySelector?.(".chapter-tracker.active[data-chapter-no]") ||
+      body.querySelector?.(".chapter-tracker[data-chapter-no]") ||
+      body.closest?.(".chapter, .chapter-infinite-reader")?.querySelector?.(".chapter-tracker.active[data-chapter-no]");
+  
+    const no = tracker?.getAttribute?.("data-chapter-no");
+    if (no && /^\d+$/.test(no)) return `chapter-${no}`;
+  
+    // Try id="tracker-776"
+    const tid = tracker?.id || "";
+    const m1 = tid.match(/tracker-(\d+)/i);
+    if (m1) return `chapter-${m1[1]}`;
+  
+    // Fall back to DOM chapter id logic using this body as root
+    const domCid = getDomChapterId(body);
+    if (domCid && domCid !== "unknown") return domCid;
+  
+    // As last resort: URL
+    const urlCid = getUrlChapterId();
+    if (urlCid && urlCid !== "unknown") return urlCid;
+  
+    return "unknown";
+  }
+  
+  // Mark bodies we’ve already fully handled (separate from your per-block markers)
+  function bodyIsSwept(body) {
+    return body?.dataset?.wtrpfSwept === "1";
+  }
+  function markBodySwept(body) {
+    if (body?.dataset) body.dataset.wtrpfSwept = "1";
   }
 
   // ==========================================================
@@ -1951,7 +1996,7 @@
       const now = Date.now();
       if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
     
-      const root = rootManager?.getRoot?.() || findContentRoot();
+      const root = run._forcedRoot || (rootManager?.getRoot?.() || findContentRoot());
       if (!root) return;
     
       const urlCid = getUrlChapterId();
@@ -2004,8 +2049,11 @@
       }
       run._domGraceStart = 0;
 
-      const chapterId = (domCid !== "unknown") ? domCid : urlCid;
-    
+      const forcedCid = run._forcedChapterId;
+      const chapterId = (forcedCid && forcedCid !== "unknown")
+        ? forcedCid
+        : ((domCid !== "unknown") ? domCid : urlCid);
+
       // MUST be function-scoped (used after try/finally)
       let pronounEdits = 0;
     
@@ -2211,11 +2259,54 @@
       }
     
     }
+
+    // ==========================================================
+    // Infinite reader sweep (NEW)
+    // ==========================================================
+    function sweepInfiniteBodies() {
+      const host = document.querySelector(".chapter-infinite-reader");
+      if (!host) return;
     
+      const bodies = Array.from(host.querySelectorAll(".chapter-body"))
+        .filter(b => (b.innerText || "").trim().length > 200);
+    
+      for (const body of bodies) {
+        if (body.dataset?.wtrpfSwept === "1") continue;
+    
+        const cid = getChapterId(body);
+        if (!cid || cid === "unknown") continue;
+        if (!contentReady(body)) continue;
+    
+        const sigNow = chapterSignature(body);
+        const applied = getAppliedSig(novelKey, cid);
+    
+        // Already applied & stable → mark and skip
+        if (applied && sigNow && sigNow === applied) {
+          body.dataset.wtrpfSwept = "1";
+          continue;
+        }
+    
+        // 🔥 Force run on THIS body
+        run._forcedRoot = body;
+        run._forcedChapterId = cid;
+        run({ forceFull: true });
+    
+        body.dataset.wtrpfSwept = "1";
+      }
+    
+      // cleanup
+      run._forcedRoot = null;
+      run._forcedChapterId = null;
+    }
+
     function startChapterMonitor() {
       let startedAt = Date.now();
     
       setInterval(() => {
+        if (document.querySelector(".chapter-infinite-reader")) {
+          sweepInfiniteBodies();
+        }
+
         if (!ui.isEnabled()) return;
         if (document.hidden) return;
         if (running) return;
@@ -2348,7 +2439,11 @@
       installUrlChangeWatcher(onNav, ui.isEnabled);
       installHistoryHooksLite(onNav);
       installChapterTrackerObserver(onNav, ui.isEnabled);
-      installInfiniteReaderAppendObserver(onNav, ui.isEnabled);
+      installInfiniteReaderAppendObserver((why) => {
+          onNav(why);
+          setTimeout(() => sweepInfiniteBodies(), 80);
+        }, ui.isEnabled);
+
 
     // React overwrite catcher: if the active chapter root mutates after we applied,
       // rerun full pass (debounced). This is the missing piece for single-chapter Next.
