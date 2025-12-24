@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.2.9
+// @version      1.3.0
 // @description  Fixes Firefox Android Next navigation reliability + long-press popup reliability. Force runs bypass cooldown/signature gating. Adds touch long-press fallback. Keeps all UI/UX + New Character (JSON) section + small popup + Male/Female only.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -1589,6 +1589,61 @@
         }, 250);
       }
 
+      function installChapterTrackerObserver(onNav, isEnabled) {
+      let lastCid = null;
+      let mo = null;
+    
+      function getActiveTrackerCid() {
+        const tr = document.querySelector(".chapter-tracker.active[data-chapter-no]");
+        const no = tr?.getAttribute?.("data-chapter-no");
+        return (no && /^\d+$/.test(no)) ? `chapter-${no}` : null;
+      }
+    
+      function arm() {
+        const host =
+          document.querySelector(".chapter-infinite-reader") ||
+          document.querySelector(".chapter-tracker")?.parentElement ||
+          document.body;
+    
+        if (mo) {
+          try { mo.disconnect(); } catch {}
+          mo = null;
+        }
+    
+        mo = new MutationObserver(() => {
+          if (!isEnabled() || document.hidden) return;
+    
+          const cid = getActiveTrackerCid();
+          if (!cid) return;
+    
+          // First seed
+          if (!lastCid) { lastCid = cid; return; }
+    
+          // If Next changed the active tracker, this is our “navigation”
+          if (cid !== lastCid) {
+            lastCid = cid;
+            onNav("tracker-active-changed");
+          }
+        });
+    
+        // Watch for class flips (active) and chapter-no changes / node swaps
+        mo.observe(host, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: ["class", "data-chapter-no", "id"]
+        });
+    
+        // Seed initial
+        lastCid = getActiveTrackerCid() || lastCid;
+      }
+    
+      arm();
+    
+      // In case the reader remounts, re-arm once after a short delay
+      setTimeout(arm, 1200);
+    }
+
   // ==========================================================
   // Main
   // ==========================================================
@@ -2163,14 +2218,11 @@
       
       installNextButtonHook(onNav);
       installUrlChangeWatcher(onNav, ui.isEnabled);
-      //installChapterBodyReplaceWatcher(onNav);
-      // Optional (lite only)
       installHistoryHooksLite(onNav);
-      // Remove these:
-      // installHistoryHooks(onNav);
-      // installChapterBodyObserver(onNav);
-      // installRouteObserver(onNav);
       
+      // ✅ add this
+      installChapterTrackerObserver(onNav, ui.isEnabled);
+
       // Initial run
       run({ forceFull: true });
       
