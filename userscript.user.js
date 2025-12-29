@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.6
+// @version      1.3.7
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -2787,7 +2787,63 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
           rootManager.resolve();
           startNavSweep(String(why || "nav"), navEpoch); // startNavSweep will requestRun when safe
         };
+
+        // ==========================================================
+        // Route watcher: hide pill immediately when leaving chapter pages (SPA-safe)
+        // - Calls syncPillVisibility() right away on ANY route change
+        // - Does NOT call run() or onNav() (so it's cheap / safe)
+        // ==========================================================
+        function installRouteWatcher({ ui, rootManager, stopNavSweep }) {
+          let lastHref = location.href;
         
+          const sync = (why) => {
+            try { rootManager?.resolve?.(); } catch {}
+            try { ui?.syncPillVisibility?.(); } catch {}
+        
+            // Optional safety: if we left chapter pages, stop any active nav sweep
+            try {
+              if (typeof stopNavSweep === "function" && !isChapterReadingPage()) {
+                stopNavSweep();
+              }
+            } catch {}
+          };
+        
+          // Back/forward
+          window.addEventListener("popstate", () => sync("popstate"), true);
+        
+          // Hash routes (rare here but free)
+          window.addEventListener("hashchange", () => sync("hashchange"), true);
+        
+          // Patch pushState/replaceState (SPA navigations)
+          const _push = history.pushState;
+          const _rep  = history.replaceState;
+        
+          function wrapped(fn, why) {
+            return function () {
+              const r = fn.apply(this, arguments);
+              setTimeout(() => sync(why), 0);
+              return r;
+            };
+          }
+        
+          history.pushState = wrapped(_push, "pushState");
+          history.replaceState = wrapped(_rep, "replaceState");
+        
+          // Polling fallback (catches weird edge cases)
+          setInterval(() => {
+            const href = location.href;
+            if (href === lastHref) return;
+            lastHref = href;
+            sync("href-poll");
+          }, 250);
+        
+          // Click nudge (some apps change view after click w/o immediate URL updates)
+          document.addEventListener("click", () => setTimeout(() => sync("click"), 60), true);
+        
+          // Initial sync on install
+          sync("init");
+        }
+
         // Keep your nav-nudge:
         setTimeout(() => startNavSweep("nav-nudge"), 900);
       
@@ -2863,6 +2919,9 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
  
       // Call once at startup:
       wireHooksModeAware();
+
+    // Install route watcher once (SPA: hide pill immediately when leaving chapter pages)
+      installRouteWatcher({ ui, rootManager, stopNavSweep });
       
       // And re-evaluate once shortly after load (reader can mount late):
       setTimeout(() => wireHooksModeAware(), 1600);
