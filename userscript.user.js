@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.5
+// @version      1.3.6
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -658,6 +658,33 @@
     if (body?.dataset) delete body.dataset.wtrpfQueued;
   }
 
+    // ==========================================================
+  // Chapter-page gate (NEW)
+  // ==========================================================
+  function isLikelyChapterUrl() {
+    // Fast path: your chapters use /chapter-<n>
+    return /\/chapter-\d+(?:\/|$|\?)/i.test(location.href);
+  }
+
+  function isChapterReadingPage() {
+    // 1) URL says it's a chapter page → true immediately
+    if (isLikelyChapterUrl()) return true;
+
+    // 2) DOM says we have a readable chapter body (single or infinite)
+    // Keep this conservative to avoid showing pill on TOC/description pages.
+    const root = rootManager?.getRoot?.() || findContentRoot();
+    if (!root) return false;
+
+    // Must look like reader content and be ready
+    if (!contentReady(root)) return false;
+
+    // Extra: require a chapter-body or active tracker somewhere near
+    const hasBody = !!(root.classList?.contains("chapter-body") || root.querySelector?.(".chapter-body") || root.closest?.(".chapter-body"));
+    const hasTracker = !!document.querySelector(".chapter-tracker.active[data-chapter-no]");
+    const hasInfinite = !!document.querySelector(".chapter-infinite-reader");
+
+    return hasBody || hasTracker || hasInfinite;
+  }
 
   // ==========================================================
   // Root Observer Manager (NEW)
@@ -722,6 +749,7 @@
   // ==========================================================
   const rootManager = createRootObserverManager((newRoot) => {
     console.log("[WTRPF] Root changed:", newRoot);
+    try { window.__wtrpf_ui?.syncPillVisibility?.(); } catch {}
     // Do NOT auto-run here; nav sweep controls execution
   });
 
@@ -1338,9 +1366,12 @@
         function setMin(min) {
           localStorage.setItem(UI_KEY_MIN, min ? "1" : "0");
           box.style.display = min ? "none" : "block";
-          pill.style.display = min ? "block" : "none";
+
+          // Pill visibility is now gated by chapter reading page detection
+          const canShowPill = min && isChapterReadingPage();
+          pill.style.display = canShowPill ? "block" : "none";
         }
-      
+
         minBtn.onclick = () => setMin(true);
         pillExpandBtn.onclick = () => setMin(false);
         pillText.onclick = () => setMin(false);
@@ -1487,7 +1518,12 @@
           refreshDraftUI: () => {
             const d = loadDraft();
             setDraftUI(d?.snippet || "", (d?.items || []).length);
-          }
+          },
+          syncPillVisibility: () => {
+            const isMin = localStorage.getItem(UI_KEY_MIN) === "1";
+            // Only show pill if minimized AND on chapter reading page
+            pill.style.display = (isMin && isChapterReadingPage()) ? "block" : "none";
+          },
         };
       }
 
@@ -2009,6 +2045,8 @@
   // ==========================================================
   (async () => {
     const ui = makeUI();
+     ui.syncPillVisibility?.();
+        window.__wtrpf_ui = ui;
     if (!ui.isEnabled()) return;
 
     ui.refreshDraftUI?.();
@@ -2497,6 +2535,13 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
     
     function requestRun(reason, opts = {}) {
       if (!ui.isEnabled() || document.hidden) return;
+
+      // NEW: never schedule runs when not on a chapter reading page
+      // (prevents wasted work on TOC/description pages)
+      if (!isChapterReadingPage()) {
+        ui.syncPillVisibility?.();
+        return;
+      }
     
       const req = {
         forceFull: !!opts.forceFull,
@@ -2727,6 +2772,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         
           localStorage.setItem(UI_KEY_MIN, "1");
           ui.setMinimized(true);
+             ui.syncPillVisibility?.();
         
           // Reset session gates
           lastSig = "";
