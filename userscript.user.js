@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.9
+// @version      1.3.10
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -37,7 +37,7 @@
   const UI_KEY_POS = "wtrpf_ui_pos_v1";
   const UI_KEY_ON  = "wtrpf_enabled_v1";
 
-  const DRAFT_KEY = "wtrpf_draft_v1";
+  const DRAFT_KEY_PREFIX = "wtrpf_draft_v1:";
   const TERM_MEM_KEY_PREFIX = "wtrpf_term_mem_v1:";
   const CHAPTER_STATE_KEY_PREFIX = "wtrpf_chapter_state_v1:";
 
@@ -570,13 +570,25 @@
   }
 
   // ==========================================================
-  // Draft helpers
+  // Draft helpers (PER-NOVEL)
   // ==========================================================
-  function loadDraft() {
-    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || '{"items":[],"snippet":""}'); }
-    catch { return { items: [], snippet: "" }; }
+  function draftKeyFor(novelKey) {
+    // novelKey is like "wtr-lab.com/en/novel/14370/"
+    const nk = novelKey || getNovelKeyFromURL();
+    return DRAFT_KEY_PREFIX + nk;
   }
-  function saveDraft(d) { localStorage.setItem(DRAFT_KEY, JSON.stringify(d || { items: [], snippet: "" })); }
+  
+  function loadDraft(novelKey) {
+    try {
+      return JSON.parse(localStorage.getItem(draftKeyFor(novelKey)) || '{"items":[],"snippet":""}');
+    } catch {
+      return { items: [], snippet: "" };
+    }
+  }
+  
+  function saveDraft(novelKey, d) {
+    localStorage.setItem(draftKeyFor(novelKey), JSON.stringify(d || { items: [], snippet: "" }));
+  }
 
   function oneLineCharacterSnippet(name, gender, aliases) {
     const obj = { gender: String(gender) };
@@ -1481,7 +1493,7 @@
       
         sectionToggle.onclick = () => {
           draftSectionOpen = !draftSectionOpen;
-          const d = loadDraft();
+          const d = loadDraft(getNovelKeyFromURL());
           setDraftUI(d?.snippet || "", (d?.items || []).length);
           clampToViewport(box);
         };
@@ -1578,7 +1590,7 @@
       
         copyBtn.onclick = async () => {
           if (copyBtn.disabled) return;
-          const d = loadDraft();
+          const d = loadDraft(getNovelKeyFromURL());
           const txt = d?.snippet || "";
           if (!txt) return;
           await writeClipboard(txt);
@@ -1586,7 +1598,7 @@
       
         clearBtn.onclick = () => {
           if (clearBtn.disabled) return;
-          saveDraft({ items: [], snippet: "" });
+          saveDraft(getNovelKeyFromURL(), { items: [], snippet: "" });
           setDraftUI("", 0);
         };
       
@@ -1619,7 +1631,7 @@
           setMinimized: (min) => setMin(!!min),
           setDraftUI,
           refreshDraftUI: () => {
-            const d = loadDraft();
+            const d = loadDraft(getNovelKeyFromURL());
             setDraftUI(d?.snippet || "", (d?.items || []).length);
           },
           syncPillVisibility: () => {
@@ -1731,11 +1743,11 @@
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
 
     function upsertDraftLine(line) {
-      const d = loadDraft();
+      const d = loadDraft(getNovelKeyFromURL());
       const items = Array.isArray(d.items) ? d.items : [];
       if (!items.includes(line)) items.push(line);
       const snippet = items.join("\n");
-      saveDraft({ items, snippet });
+      saveDraft(getNovelKeyFromURL(), { items, snippet });
       ui.refreshDraftUI?.();
     }
 
@@ -2894,7 +2906,8 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         
           localStorage.setItem(UI_KEY_MIN, "1");
           ui.setMinimized(true);
-             ui.syncPillVisibility?.();
+          ui.syncPillVisibility?.();
+          ui.refreshDraftUI?.(); // NEW: load draft for the current novel immediately
         
           // Reset session gates
           lastSig = "";
