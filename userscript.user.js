@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.8
+// @version      1.3.9
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -82,6 +82,98 @@
   function escapeRegExp(s) {
     return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
+
+  function wordBoundaryRegex(phrase) {
+  // Unicode-ish boundaries: not a letter/number/_ on either side
+  const p = escapeRegExp(String(phrase || "").trim());
+  if (!p) return null;
+  return new RegExp(String.raw`(^|[^\p{L}\p{N}_])(${p})(?=[^\p{L}\p{N}_]|$)`, "giu");
+  }
+  
+  function findAllMatches(rx, text, max = 20) {
+    rx.lastIndex = 0;
+    const out = [];
+    let m;
+    while ((m = rx.exec(text)) && out.length < max) out.push({ index: m.index, match: m[2] || m[0] });
+    return out;
+  }
+  
+  function scoreGenderInText(text, entries) {
+    const s = normalizeWeirdSpaces(String(text || ""));
+    const sL = s.toLowerCase();
+  
+    // Weight pronouns (weak signal), names/aliases (strong signal)
+    const maleP = countMatches(RX_PRONOUN_MALE, s);
+    const femP  = countMatches(RX_PRONOUN_FEMALE, s);
+  
+    // If paragraph contains only pronouns and no names, don’t “invent” a gender
+    // (carry heuristics already handle this better)
+    let anyNameHit = false;
+  
+    const candidates = []; // {gender, score, name}
+    for (const [name, info] of entries) {
+      const g = String(info?.gender || "").toLowerCase();
+      if (g !== "male" && g !== "female") continue;
+  
+      const names = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
+        .filter(Boolean)
+        .sort((a,b) => String(b).length - String(a).length);
+  
+      let hitScore = 0;
+      let hitCount = 0;
+  
+      for (const n of names) {
+        const rx = wordBoundaryRegex(n);
+        if (!rx) continue;
+  
+        // match count (capped) so long paragraphs don’t explode CPU
+        const matches = findAllMatches(rx, s, 12);
+        if (!matches.length) continue;
+  
+        anyNameHit = true;
+        hitCount += matches.length;
+  
+        // Proximity pronoun score: look around each name match
+        for (const mm of matches) {
+          const center = mm.index;
+          const lo = Math.max(0, center - 180);
+          const hi = Math.min(s.length, center + 260);
+          const window = s.slice(lo, hi);
+  
+          // Pronouns in the local window matter more than the whole paragraph
+          const mLocal = countMatches(RX_PRONOUN_MALE, window);
+          const fLocal = countMatches(RX_PRONOUN_FEMALE, window);
+  
+          // Base for “name present”
+          hitScore += 6;
+  
+          // Local pronouns bias the name
+          hitScore += (g === "male" ? mLocal : fLocal) * 2;
+          hitScore -= (g === "male" ? fLocal : mLocal) * 1;
+        }
+      }
+  
+      if (hitCount > 0) {
+        // Small global pronoun nudge (kept weak)
+        const globalBias = (g === "male" ? maleP : femP) - (g === "male" ? femP : maleP);
+        hitScore += clamp(globalBias, -2, 3);
+        candidates.push({ gender: g, score: hitScore, name });
+      }
+    }
+  
+      if (!anyNameHit) return null;
+      if (!candidates.length) return null;
+    
+      candidates.sort((a,b) => b.score - a.score);
+      const best = candidates[0];
+      const second = candidates[1];
+    
+      // Require separation so we don’t flip-flop in mixed paragraphs
+      if (second && (best.score - second.score) < 4) return null;
+      if (best.score < 6) return null;
+    
+      return best.gender;
+    }
 
   function isSceneBreak(t) {
     const s = (t || "").trim();
@@ -185,19 +277,16 @@
     }
 
     // REPLACED chapterSignature(root) with this cheaper version
-    function chapterSignature(root) {
-      if (!root) return "";
-      const cid = getChapterId(root) || getDomChapterId(root) || "unknown";
-    
-      const { blocksCount, totalLen } = approxChapterMetrics(root);
-      const sampled = getSampledText(root, { head: 6, tail: 2 });
-    
-      // signature is stable enough to detect re-render/DOM swaps without hashing whole chapter
-      const h = sampled ? hash32(sampled) : "0";
-      return `${cid}|b:${blocksCount}|len:${totalLen}|h:${h}`;
-    }
+  function chapterSignature(root, forcedCid = null) {
+    if (!root) return "";
+    const cid = forcedCid || getChapterId(root) || "unknown";
+    const { blocksCount, totalLen } = approxChapterMetrics(root);
+    const sampled = getSampledText(root, { head: 6, tail: 2 });
+    const h = sampled ? hash32(sampled) : "0";
+    return `${cid}|b:${blocksCount}|len:${totalLen}|h:${h}`;
+  }
 
-    function appliedSigKey(novelKey) {
+  function appliedSigKey(novelKey) {
     return APPLIED_SIG_KEY_PREFIX + novelKey;
   }
   function loadAppliedSigMap(novelKey) {
@@ -692,7 +781,17 @@
         rootObserver = null;
       }
     }
-  
+
+    // add a short retry when findContentRoot() returns null
+    let resolveRetryTimer = null;
+    function scheduleResolveRetry() {
+      if (resolveRetryTimer) return;
+      resolveRetryTimer = setTimeout(() => {
+        resolveRetryTimer = null;
+        resolve();
+      }, 180);
+    }
+
     function observe(root) {
       disconnect();
       if (!root) return;
@@ -700,18 +799,23 @@
       currentRoot = root;
   
       rootObserver = new MutationObserver((muts) => {
+        // NEW: if React/SPA detached the root without a clean "removedNodes includes root" signal
+        if (currentRoot && !document.contains(currentRoot)) {
+          resolve();
+          return;
+        }
+      
         for (const m of muts) {
-          // If the root itself is removed or replaced, we must re-resolve
-          if (
-            m.type === "childList" &&
-            Array.from(m.removedNodes || []).includes(currentRoot)
-          ) {
+          if (m.type !== "childList") continue;
+      
+          // Keep your original strict check too (still useful when it does happen)
+          if (Array.from(m.removedNodes || []).includes(currentRoot)) {
             resolve();
             return;
           }
         }
       });
-  
+
       // Observe parent, not the root itself (React replaces children)
       const parent = root.parentNode || document.body;
       rootObserver.observe(parent, { childList: true });
@@ -719,7 +823,13 @@
   
     function resolve() {
       const newRoot = findContentRoot();
-      if (!newRoot) return false;
+    
+      // NEW: during remounts findContentRoot can be temporarily null — retry once shortly
+      if (!newRoot) {
+        scheduleResolveRetry();
+        return false;
+      }
+    
       if (newRoot === currentRoot) return true;
     
       observe(newRoot);
@@ -749,20 +859,20 @@
   // ==========================================================
   // Character detection
   // ==========================================================
+
   function detectCharactersOnPage(root, entries) {
-    const hay = (root?.innerText || "").toLowerCase();
-    const detected = [];
-    for (const [name, info] of entries) {
-      const nameLower = String(name || "").toLowerCase();
-      if (nameLower && hay.includes(nameLower)) { detected.push([name, info]); continue; }
-      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
-      for (const a of aliases) {
-        const aLower = String(a || "").toLowerCase();
-        if (aLower && hay.includes(aLower)) { detected.push([name, info]); break; }
-      }
-    }
-    return detected;
+  const hay = normalizeWeirdSpaces(root?.innerText || "").toLowerCase();
+  const detected = [];
+  for (const [name, info] of entries) {
+    const names = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
+      .filter(Boolean)
+      .map(s => normalizeWeirdSpaces(String(s)).toLowerCase());
+
+    if (names.some(n => n && hay.includes(n))) detected.push([name, info]);
   }
+  return detected;
+}
+
 
   // ==========================================================
   // Glossary helpers
@@ -1712,12 +1822,8 @@
       tTimer = setTimeout(() => {
         const txt = (tSpan?.textContent || "").trim();
         if (!txt) return;
-    
-        // We are intentionally taking over the gesture now.
+      
         tTriggered = true;
-        try { e.preventDefault(); } catch {}
-        try { e.stopPropagation(); } catch {}
-    
         showAt(tStartX + 6, tStartY + 6, txt);
       }, LONGPRESS_MS);
     }, { capture: true, passive: false });
@@ -1908,6 +2014,7 @@
       function installChapterTrackerObserver(onNav, isEnabled) {
       let lastCid = null;
       let mo = null;
+      let fireAt = 0;
     
       function getActiveTrackerCid() {
         const tr = document.querySelector(".chapter-tracker.active[data-chapter-no]");
@@ -1938,6 +2045,11 @@
           // If Next changed the active tracker, this is our “navigation”
           if (cid !== lastCid) {
             lastCid = cid;
+
+            const now = Date.now();
+            if (now - fireAt < 250) return;   // throttle
+            fireAt = now;
+            
             onNav("tracker-active-changed");
           }
         });
@@ -2136,12 +2248,16 @@
     if (forceGender === "male" || forceGender === "female") return forceGender;
   
     const t = String(text || "");
+    
     const tL = t.toLowerCase();
-  
     if (primaryCharacter && tL.includes(String(primaryCharacter).toLowerCase()) && characters[primaryCharacter]) {
       const g0 = String(characters[primaryCharacter].gender || "").toLowerCase();
       if (g0 === "female" || g0 === "male") return g0;
     }
+
+    // NEW: scored detection (more robust than includes)
+    const scored = scoreGenderInText(t, entries);
+    if (scored) return scored;
   
     if (U.passiveVoice) {
       const gAgent = detectPassiveAgentGender(t, entries);
@@ -2154,29 +2270,25 @@
     }
   
     for (const [name, info] of entries) {
-      const nameL = String(name || "").toLowerCase();
-      const aliases = Array.isArray(info.aliases) ? info.aliases : [];
+    const g = String(info.gender || "").toLowerCase();
+    if (g !== "female" && g !== "male") continue;
   
-      if (nameL && tL.includes(nameL)) {
-        const g = String(info.gender || "").toLowerCase();
-        if (g === "female" || g === "male") return g;
-      }
+    const all = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
+      .filter(Boolean)
+      .sort((a,b) => String(b).length - String(a).length);
   
-      for (const a of aliases) {
-        const aL = String(a || "").toLowerCase();
-        if (aL && tL.includes(aL)) {
-          const g = String(info.gender || "").toLowerCase();
-          if (g === "female" || g === "male") return g;
-        }
-      }
+    for (const n of all) {
+      const rx = wordBoundaryRegex(n);
+      if (rx && rx.test(t)) return g;
     }
-  
+  }
+
     return null;
   }
 
     function updateDetectedCharactersUI(root) {
       const cid = getChapterId(root);
-      const sig = chapterSignature(root);
+      const sig = chapterSignature(root, cid);
     
       const cached = getCharCache(cid);
       if (cached && cached.sig && sig && cached.sig === sig) {
@@ -2250,24 +2362,17 @@
       try {
         if (!root) return;
     
-        // Root "chapter processed" marker (you DO set this)
-        if (root?.dataset) {
+        // root marker
+        if (root.dataset) {
           delete root.dataset.wtrpfPatchedChapter;
+          delete root.dataset.wtrpfSwept;
+          delete root.dataset.wtrpfQueued;
         }
     
-        // Clear per-block markers inside this root (you DO set these)
-        root.querySelectorAll?.("[data-wtrpf-patched]").forEach(el => {
+        // block markers
+        const blocks = root.querySelectorAll?.("p, blockquote, li") || [];
+        blocks.forEach(el => {
           if (el?.dataset) delete el.dataset.wtrpfPatched;
-        });
-    
-        // Defensive: only if any older variants exist
-        root.querySelectorAll?.("[data-wtrpf-patched='1']").forEach(el => {
-          if (el?.dataset) delete el.dataset.wtrpfPatched;
-        });
-    
-        // If you ever used a different attribute name historically, clear it too
-        root.querySelectorAll?.("[data-wtrpf-patched-chapter]").forEach(el => {
-          if (el?.dataset) delete el.dataset.wtrpfPatchedChapter;
         });
       } catch {}
     }
@@ -2319,7 +2424,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
     // forceFull still must not patch old content
     if (!contentReady(root)) return;
 
-    const sigNow = chapterSignature(root);
+    const sigNow = chapterSignature(root, (domCid !== "unknown" ? domCid : urlCid));
 
     // If DOM still shows previous chapter and it's already stable, don't waste a run
     if (domCid !== "unknown" && urlCid !== "unknown" && domCid !== urlCid) {
@@ -2341,10 +2446,24 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
 
   let pronounEdits = 0;
 
+  function paragraphSeemsSingleGender(text, gender) {
+      const s = normalizeWeirdSpaces(String(text || ""));
+      const m = countMatches(RX_PRONOUN_MALE, s);
+      const f = countMatches(RX_PRONOUN_FEMALE, s);
+    
+      // If paragraph has both genders’ pronouns, be conservative
+      if (m > 0 && f > 0) {
+        // allow if strongly skewed toward the target gender
+        if (gender === "male") return m >= (f * 3);
+        return f >= (m * 3);
+      }
+      return true;
+    }
+
   if (!contentReady(root)) return;
 
   // Signature gate: only skip if same as last applied in this session (unless forceFull)
-  const sigBefore = chapterSignature(root);
+  const sigBefore = chapterSignature(root, chapterId);
   if (!forceFull && sigBefore && sigBefore === lastSig) return;
 
   running = true;
@@ -2464,9 +2583,15 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
 
         let doFull = true;
         if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
+        
+        // NEW: extra safety in mixed paragraphs
+        if (doFull && !paragraphSeemsSingleGender(bt, g)) doFull = false;
 
         if (doFull) {
-          pronounEdits += replaceInTextNodes(b, (txt) => replacePronounsSmart(txt, dir));
+          pronounEdits += replaceInTextNodes(b, (txt) => {
+            if (!paragraphSeemsSingleGender(txt, g)) return { text: txt, changed: 0 };
+            return replacePronounsSmart(txt, dir);
+          });
         }
 
         if (usedMode !== "chapter" && hadDirectMatch) {
@@ -2482,7 +2607,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
 
     // Avoid inflating counts if already equals applied signature
     if (pronounEdits > 0) {
-      const sigNow = chapterSignature(root);
+      const sigNow = chapterSignature(root, chapterId);
       const applied = getAppliedSig(novelKey, chapterId);
       if (applied && sigNow === applied) pronounEdits = 0;
     }
@@ -2501,7 +2626,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
     }
 
     // Record signature AFTER applying
-    const sigAfter = chapterSignature(root);
+    const sigAfter = chapterSignature(root, chapterId);
     if (sigAfter) {
       setAppliedSig(novelKey, chapterId, sigAfter);
       lastSig = sigAfter;
@@ -2514,6 +2639,9 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
     running = false;
     lastRunAt = Date.now();
   }
+
+  // NEW: if a forced body was queued while we were busy, run it now
+  try { drainPendingForced(); } catch {}
 }
 
     /* =========================
@@ -2613,7 +2741,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         if (!cid || cid === "unknown") continue;
         if (!contentReady(body)) continue;
     
-        const sigNow = chapterSignature(body);
+        const sigNow = chapterSignature(body, cid);
         const applied = getAppliedSig(novelKey, cid);
     
         // If it’s already applied & stable, mark swept and clear queued
@@ -2663,7 +2791,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         if (!contentReady(root)) return;
     
         const cid = getChapterId(root);
-        const sigNow = chapterSignature(root);
+        const sigNow = chapterSignature(root, cid);
         if (!cid || !sigNow) return;
     
         const applied = getAppliedSig(novelKey, cid);
@@ -2721,7 +2849,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
             return;
           }
       
-          const sigNow = chapterSignature(root);
+          const sigNow = chapterSignature(root, cid);
           if (!sigNow) { stableHits = 0; return; }
       
           // Don't "stabilize" on the old chapter before React swaps.
