@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.12
+// @version      1.3.13
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -556,42 +556,49 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
 
       const dir = (gender === "female") ? "toFemale" : "toMale";
 
-      for (const n of allNames) {
-        const nEsc = escapeRegExp(n);
-        const re = new RegExp(String.raw`\b${nEsc}\b`, "g");
-        let m;
-
-        while ((m = re.exec(s)) !== null) {
-          const start = m.index;
-
-          const baseEnd = verbBasedWindow
-            ? getSentenceEndIndex(s, start + n.length, 360)
-            : Math.min(s.length, start + n.length + LOCAL_ANCHOR_WINDOW);
-
-          let end = baseEnd;
-          if (strictPossessive) end = Math.min(s.length, Math.max(end, start + n.length + 220));
-
-          const region = s.slice(start, end);
-          if (onlyChangeIfWrong && !conservativeShouldApply(region, gender)) continue;
-
-          let out = replacePronounsSmart(region, dir);
-
-          if (passiveVoice) {
-            const gAgent = detectPassiveAgentGender(region, entries);
-            if (gAgent) {
-              const d2 = (gAgent === "female") ? "toFemale" : "toMale";
-              const out2 = replacePronounsSmart(out.text, d2);
-              out = { text: out2.text, changed: out.changed + out2.changed };
-            }
-          }
-
-          if (out.text !== region) {
-            s = s.slice(0, start) + out.text + s.slice(end);
-            changed += Math.max(1, out.changed);
-            re.lastIndex = start + out.text.length;
+    for (const n of allNames) {
+      const re = wordBoundaryRegexCached(n);
+      if (!re) continue;
+    
+      let m;
+      while ((m = re.exec(s)) !== null) {
+        // wordBoundaryRegex() structure:
+        //  (1) left boundary group, (2) the actual phrase
+        const left = m[1] || "";
+        const hit = m[2] || n;
+        const start = (m.index || 0) + left.length;
+    
+        const baseEnd = verbBasedWindow
+          ? getSentenceEndIndex(s, start + hit.length, 360)
+          : Math.min(s.length, start + hit.length + LOCAL_ANCHOR_WINDOW);
+    
+        let end = baseEnd;
+        if (strictPossessive) end = Math.min(s.length, Math.max(end, start + hit.length + 220));
+    
+        const region = s.slice(start, end);
+        if (onlyChangeIfWrong && !conservativeShouldApply(region, gender)) continue;
+    
+        let out = replacePronounsSmart(region, dir);
+    
+        if (passiveVoice) {
+          const gAgent = detectPassiveAgentGender(region, entries);
+          if (gAgent) {
+            const d2 = (gAgent === "female") ? "toFemale" : "toMale";
+            const out2 = replacePronounsSmart(out.text, d2);
+            out = { text: out2.text, changed: out.changed + out2.changed };
           }
         }
+    
+        if (out.text !== region) {
+          s = s.slice(0, start) + out.text + s.slice(end);
+          changed += Math.max(1, out.changed);
+    
+          // IMPORTANT: re-sync lastIndex so we don't loop forever or skip
+          re.lastIndex = start + out.text.length;
+        }
       }
+    }
+
     }
 
     return { text: s, changed };
@@ -2149,25 +2156,32 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     }, 15000);
   }
 
-      function installUrlChangeWatcher(onNav, isEnabled) {
-        let lastHref = location.href;
-        let lastFireAt = 0;
-      
-        setInterval(() => {
-          if (!isEnabled() || document.hidden) return;
-      
-          const href = location.href;
-          if (href === lastHref) return;
-      
-          lastHref = href;
-      
-          const now = Date.now();
-          if (now - lastFireAt < 450) return; // throttle
-          lastFireAt = now;
-      
-          onNav("url-change");
-        }, 250);
+  function installUrlChangeWatcher(onNav, isEnabled) {
+    let lastHref = location.href;
+    let lastFireAt = 0;
+  
+    const timer = setInterval(() => {
+      if (!isEnabled() || document.hidden) return;
+  
+      const href = location.href;
+      if (href === lastHref) return;
+  
+      lastHref = href;
+  
+      const now = Date.now();
+      if (now - lastFireAt < 450) return; // throttle
+      lastFireAt = now;
+  
+      onNav("url-change");
+    }, 250);
+  
+    // NEW: allow disposal on mode flip
+    return {
+      disconnect() {
+        try { clearInterval(timer); } catch {}
       }
+    };
+  }
 
       function installChapterTrackerObserver(onNav, isEnabled) {
       let lastCid = null;
@@ -2230,43 +2244,43 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       setTimeout(arm, 1200);
     }
 
-      function installActiveContentObserver(getRoot, onDirty, isEnabled) {
-      let mo = null;
-      let lastRoot = null;
-      let t = null;
-    
-      const arm = () => {
+  function installActiveContentObserver(getRoot, onDirty, isEnabled) {
+    let mo = null;
+    let lastRoot = null;
+    let t = null;
+  
+    const arm = () => {
+      if (!isEnabled() || document.hidden) return;
+  
+      const root = (typeof getRoot === "function" ? getRoot() : null) || (rootManager?.getRoot?.() || findContentRoot());
+      if (!root || root === lastRoot) return;
+  
+      if (mo) { try { mo.disconnect(); } catch {} }
+      lastRoot = root;
+  
+      mo = new MutationObserver(() => {
         if (!isEnabled() || document.hidden) return;
-    
-        const root = rootManager?.getRoot() || findContentRoot();
-        if (!root || root === lastRoot) return;
-    
-        // swap observer to new root
-        if (mo) { try { mo.disconnect(); } catch {} }
-        lastRoot = root;
-    
-        mo = new MutationObserver(() => {
-          if (!isEnabled() || document.hidden) return;
-          if (t) return;
-          t = setTimeout(() => { t = null; onDirty("active-root-mutation"); }, 220);
-        });
-    
-        // React tends to replace nodes (childList) and also text (characterData)
-        mo.observe(root, { subtree: true, childList: true, characterData: true });
-      };
-    
-      // re-arm periodically (root can change without being removed cleanly)
-      const tick = setInterval(arm, 600);
-      setTimeout(() => clearInterval(tick), 25000);
-    
-      // also arm immediately
-      arm();
-    
-      return {
-        rearm: arm,
-        disconnect: () => { if (mo) { try { mo.disconnect(); } catch {} mo = null; } }
-      };
-    }
+        if (t) return;
+        t = setTimeout(() => { t = null; onDirty("active-root-mutation"); }, 220);
+      });
+  
+      mo.observe(root, { subtree: true, childList: true, characterData: true });
+    };
+  
+    // re-arm periodically (root can change without being removed cleanly)
+    const tick = setInterval(arm, 600);
+    setTimeout(() => clearInterval(tick), 25000);
+  
+    arm();
+  
+    return {
+      rearm: arm,
+      disconnect: () => {
+        try { clearInterval(tick); } catch {}
+        if (mo) { try { mo.disconnect(); } catch {} mo = null; }
+      }
+    };
+  }
 
       function installInfiniteReaderAppendObserver(onNav, isEnabled) {
       let mo = null;
@@ -3256,17 +3270,24 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         
           history.pushState = wrapped(_push, "pushState");
           history.replaceState = wrapped(_rep, "replaceState");
-        
-          setInterval(() => {
-            const href = location.href;
-            if (href === lastHref) return;
-            lastHref = href;
-            syncBurst("href-poll");
-          }, 250);
-        
+
+          const hrefPollTimer = setInterval(() => {
+          const href = location.href;
+          if (href === lastHref) return;
+          lastHref = href;
+          syncBurst("href-poll");
+        }, 250);
+          
           document.addEventListener("click", () => setTimeout(() => syncBurst("click"), 60), true);
         
           syncBurst("init");
+        
+        return {
+          disconnect() {
+            try { clearInterval(hrefPollTimer); } catch {}
+            // (We don’t unpatch history.* here—keeping it simple + safe.)
+          }
+        };
         }
 
         // Keep your nav-nudge:
@@ -3280,6 +3301,20 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
 
     let _hooksWired = false;
     let _hookMode = null; // "infinite" or "single"
+    
+    // Keep track of disconnectors so we can cleanly switch modes
+    const _hookDisposers = new Set();
+    function _trackDisposer(d) {
+      if (!d) return;
+      if (typeof d === "function") _hookDisposers.add(d);
+      else if (typeof d.disconnect === "function") _hookDisposers.add(() => d.disconnect());
+    }
+    function _disposeModeSpecificHooks() {
+      for (const fn of _hookDisposers) {
+        try { fn(); } catch {}
+      }
+      _hookDisposers.clear();
+    }
 
     function isInfiniteModeNow() {
       return !!document.querySelector(".chapter-infinite-reader");
@@ -3289,22 +3324,58 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       const infinite = isInfiniteModeNow();
       const mode = infinite ? "infinite" : "single";
     
-      // If we already installed hooks, DO NOT install again.
-      // Just detect if mode changed and nudge the sweep.
-      if (_hooksWired) {
-        if (_hookMode !== mode) {
-          _hookMode = mode;
-          // Mode changed after mount (single <-> infinite): re-resolve root + run a nav sweep.
-          rootManager.resolve();
-          onNav("mode-changed");
-        } else {
-          // Mode same: just refresh root + do a mild sweep in case the reader mounted late.
-          rootManager.resolve();
-          startNavSweep("late-mount-nudge", navEpoch);
-        }
-        return;
-      }
+    // If we already installed hooks, DO NOT install again.
+    // But if mode changed, dispose mode-specific observers and re-arm the right set.
+    if (_hooksWired) {
+      if (_hookMode !== mode) {
+        _hookMode = mode;
     
+        // NEW: tear down mode-specific observers from prior mode
+        _disposeModeSpecificHooks();
+    
+        rootManager.resolve();
+        onNav("mode-changed");
+    
+        // Re-arm mode-specific observers for the new mode
+        // (We intentionally do NOT re-install the always-on click/history/tracker hooks.)
+        if (mode === "single") {
+          // URL watcher mainly for single-chapter
+          _trackDisposer(installUrlChangeWatcher((why) => onNav(why), ui.isEnabled));
+    
+          const activeObs = installActiveContentObserver(
+            () => (rootManager?.getRoot?.() || findContentRoot()),
+            (why) => {
+              const root = rootManager?.getRoot?.() || findContentRoot();
+              if (!root || !contentReady(root)) return;
+    
+              const cid = getChapterId(root);
+              const sigNow = chapterSignature(root, cid);
+              if (!cid || !sigNow) return;
+    
+              const applied = getAppliedSig(novelKey, cid);
+              if (!applied || sigNow !== applied) {
+                requestRun("active-root-overwrite", { forceFull: true });
+              }
+            },
+            ui.isEnabled
+          );
+          _trackDisposer(activeObs);
+        } else {
+          const infObs = installInfiniteReaderAppendObserver((why) => {
+            onNav(why);
+            setTimeout(() => sweepInfiniteBodies(), 80);
+          }, ui.isEnabled);
+          _trackDisposer(infObs);
+        }
+    
+      } else {
+        // Mode same: just refresh root + do a mild sweep in case the reader mounted late.
+        rootManager.resolve();
+        startNavSweep("late-mount-nudge", navEpoch);
+      }
+      return;
+    }
+ 
       _hooksWired = true;
       _hookMode = mode;
     
@@ -3313,20 +3384,20 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       installHistoryHooksLite((why) => onNav(why));
       installChapterTrackerObserver((why) => onNav(why), ui.isEnabled);
     
-      // URL watcher mainly for single-chapter
+      // Mode-specific observers must be disposable (for mode flips)
       if (!infinite) {
-        installUrlChangeWatcher((why) => onNav(why), ui.isEnabled);
-    
-        installActiveContentObserver(
+        _trackDisposer(installUrlChangeWatcher((why) => onNav(why), ui.isEnabled));
+      
+        const activeObs = installActiveContentObserver(
           () => (rootManager?.getRoot?.() || findContentRoot()),
           (why) => {
             const root = rootManager?.getRoot?.() || findContentRoot();
             if (!root || !contentReady(root)) return;
-    
+      
             const cid = getChapterId(root);
-            const sigNow = chapterSignature(root);
+            const sigNow = chapterSignature(root, cid);
             if (!cid || !sigNow) return;
-    
+      
             const applied = getAppliedSig(novelKey, cid);
             if (!applied || sigNow !== applied) {
               requestRun("active-root-overwrite", { forceFull: true });
@@ -3334,11 +3405,13 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
           },
           ui.isEnabled
         );
+        _trackDisposer(activeObs);
       } else {
-        installInfiniteReaderAppendObserver((why) => {
+        const infObs = installInfiniteReaderAppendObserver((why) => {
           onNav(why);
           setTimeout(() => sweepInfiniteBodies(), 80);
         }, ui.isEnabled);
+        _trackDisposer(infObs);
       }
     }
  
@@ -3346,7 +3419,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       wireHooksModeAware();
 
     // Install route watcher once (SPA: hide pill immediately when leaving chapter pages)
-      installRouteWatcher({ ui, rootManager, stopNavSweep });
+      _trackDisposer(installRouteWatcher({ ui, rootManager, stopNavSweep }));
       
       // And re-evaluate once shortly after load (reader can mount late):
       setTimeout(() => wireHooksModeAware(), 1600);
