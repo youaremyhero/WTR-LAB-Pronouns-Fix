@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.10
+// @version      1.3.12
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -43,9 +43,9 @@
 
   const SELF_MUTATION_COOLDOWN_MS = 450;
 
-  const NAV_SWEEP_MS = 9000;
+  const NAV_SWEEP_MS = 8000;
   const NAV_POLL_MS  = 250;
-  const CHAPTER_MONITOR_MS = 350;      // watchdog interval
+  const CHAPTER_MONITOR_MS = 500;      // watchdog interval
   const CHAPTER_MONITOR_WARMUP_MS = 12000; // optional: run more often right after load/nav
 
 
@@ -89,91 +89,138 @@
   if (!p) return null;
   return new RegExp(String.raw`(^|[^\p{L}\p{N}_])(${p})(?=[^\p{L}\p{N}_]|$)`, "giu");
   }
+
+  /* =========================
+     Word-boundary regex cache (perf)
+     ========================= */
+    const _wtrpfWordRxCache = new Map();
   
-  function findAllMatches(rx, text, max = 20) {
-    rx.lastIndex = 0;
-    const out = [];
-    let m;
-    while ((m = rx.exec(text)) && out.length < max) out.push({ index: m.index, match: m[2] || m[0] });
-    return out;
-  }
+    function wordBoundaryRegexCached(phrase) {
+      const key = normalizeWeirdSpaces(String(phrase || "")).trim();
+      if (!key) return null;
+      if (_wtrpfWordRxCache.has(key)) return _wtrpfWordRxCache.get(key);
+      const rx = wordBoundaryRegex(key);
+      _wtrpfWordRxCache.set(key, rx);
+      return rx;
+    }
+
+    function findAllMatches(rx, text, max = 20) {
+      rx.lastIndex = 0;
+      const out = [];
+      let m;
+    
+      while ((m = rx.exec(text)) && out.length < max) {
+        // Your wordBoundaryRegex structure is:
+        //  (1) left boundary group, (2) the actual phrase
+        const left = m[1] || "";
+        const phrase = m[2] || m[0] || "";
+        const phraseIndex = (m.index || 0) + left.length; // <-- centers on actual name
+        out.push({ index: phraseIndex, match: phrase });
+      }
+    
+      return out;
+    }
   
   function scoreGenderInText(text, entries) {
     const s = normalizeWeirdSpaces(String(text || ""));
     const sL = s.toLowerCase();
+    if (!sL) return null;
   
-    // Weight pronouns (weak signal), names/aliases (strong signal)
+    // Weak global pronoun signal
     const maleP = countMatches(RX_PRONOUN_MALE, s);
     const femP  = countMatches(RX_PRONOUN_FEMALE, s);
   
     // If paragraph contains only pronouns and no names, don’t “invent” a gender
-    // (carry heuristics already handle this better)
     let anyNameHit = false;
   
-    const candidates = []; // {gender, score, name}
+    const candidates = []; // { gender, score, name }
+  
     for (const [name, info] of entries) {
       const g = String(info?.gender || "").toLowerCase();
       if (g !== "male" && g !== "female") continue;
   
-      const names = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
+      const aliases = Array.isArray(info?.aliases) ? info.aliases : [];
+      const names = [name, ...aliases]
         .filter(Boolean)
-        .sort((a,b) => String(b).length - String(a).length);
+        .map(x => normalizeWeirdSpaces(String(x)).trim())
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+  
+      // Cheap prefilter: if none of the names/aliases even appear as substrings, skip regex work
+      let mightAppear = false;
+      for (const n of names) {
+        if (n && sL.includes(n.toLowerCase())) { mightAppear = true; break; }
+      }
+      if (!mightAppear) continue;
   
       let hitScore = 0;
       let hitCount = 0;
   
       for (const n of names) {
-        const rx = wordBoundaryRegex(n);
+        const rx = wordBoundaryRegexCached(n);
         if (!rx) continue;
   
-        // match count (capped) so long paragraphs don’t explode CPU
+        // Cap matches so long paragraphs don’t explode CPU
         const matches = findAllMatches(rx, s, 12);
         if (!matches.length) continue;
   
         anyNameHit = true;
         hitCount += matches.length;
   
-        // Proximity pronoun score: look around each name match
         for (const mm of matches) {
+          // NOTE: mm.index is the match start in the full string
           const center = mm.index;
+  
+          // Local window around the name mention
           const lo = Math.max(0, center - 180);
           const hi = Math.min(s.length, center + 260);
           const window = s.slice(lo, hi);
   
-          // Pronouns in the local window matter more than the whole paragraph
           const mLocal = countMatches(RX_PRONOUN_MALE, window);
           const fLocal = countMatches(RX_PRONOUN_FEMALE, window);
   
-          // Base for “name present”
+          // Base: “name present”
           hitScore += 6;
   
-          // Local pronouns bias the name
-          hitScore += (g === "male" ? mLocal : fLocal) * 2;
-          hitScore -= (g === "male" ? fLocal : mLocal) * 1;
+          // Local pronouns bias the name’s known gender
+          if (g === "male") {
+            hitScore += mLocal * 2;
+            hitScore -= fLocal * 1;
+          } else {
+            hitScore += fLocal * 2;
+            hitScore -= mLocal * 1;
+          }
         }
       }
   
       if (hitCount > 0) {
+        // Small “name repetition” bonus (capped)
+        hitScore += clamp(hitCount, 0, 3);
+  
         // Small global pronoun nudge (kept weak)
-        const globalBias = (g === "male" ? maleP : femP) - (g === "male" ? femP : maleP);
+        const globalBias =
+          (g === "male" ? maleP : femP) - (g === "male" ? femP : maleP);
         hitScore += clamp(globalBias, -2, 3);
+  
         candidates.push({ gender: g, score: hitScore, name });
       }
     }
   
-      if (!anyNameHit) return null;
-      if (!candidates.length) return null;
-    
-      candidates.sort((a,b) => b.score - a.score);
-      const best = candidates[0];
-      const second = candidates[1];
-    
-      // Require separation so we don’t flip-flop in mixed paragraphs
-      if (second && (best.score - second.score) < 4) return null;
-      if (best.score < 6) return null;
-    
-      return best.gender;
-    }
+    if (!anyNameHit) return null;
+    if (!candidates.length) return null;
+  
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    const second = candidates[1];
+  
+    // Require separation so we don’t flip-flop in mixed paragraphs
+    if (second && (best.score - second.score) < 4) return null;
+  
+    // Require minimum confidence
+    if (best.score < 6) return null;
+  
+    return best.gender;
+  }
 
   function isSceneBreak(t) {
     const s = (t || "").trim();
@@ -197,6 +244,86 @@
   }
 
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
+
+  /* =========================
+   Sentence helpers (NEW)
+   ========================= */
+
+  function splitIntoSentencesLoose(s) {
+    const out = [];
+    let start = 0;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "." || ch === "!" || ch === "?" || ch === "…" || ch === "\n") {
+        const end = i + 1;
+        out.push(s.slice(start, end));
+        start = end;
+      }
+    }
+    if (start < s.length) out.push(s.slice(start));
+    return out.filter(x => x && x.trim().length);
+  }
+  
+  function sentenceIsSafeForGender(sentence, gender) {
+    const m = countMatches(RX_PRONOUN_MALE, sentence);
+    const f = countMatches(RX_PRONOUN_FEMALE, sentence);
+  
+    if (gender === "female") {
+      if (m <= 0) return false;
+      if (f > 0 && f >= m) return false;
+      return true;
+    } else {
+      if (f <= 0) return false;
+      if (m > 0 && m >= f) return false;
+      return true;
+    }
+  }
+  
+  function replacePronounsSentenceScoped(text, gender) {
+    const dir = (gender === "female") ? "toFemale" : "toMale";
+    const parts = splitIntoSentencesLoose(text);
+    if (!parts.length) return { text, changed: 0 };
+  
+    let changed = 0;
+    const out = parts.map(seg => {
+      if (!sentenceIsSafeForGender(seg, gender)) return seg;
+      const r = replacePronounsSmart(seg, dir);
+      if (r.changed) changed += r.changed;
+      return r.text;
+    }).join("");
+  
+    return { text: out, changed };
+  }
+
+/* =========================
+  Carry guard: block carry when opposite-gender character appears early
+  (word-boundary aware + skip tiny aliases)
+ ========================= */
+function carryGuardAllows(text, assumedGender, entries, limit = 220) {
+  const s = normalizeWeirdSpaces(String(text || "")).slice(0, limit);
+  const sL = s.toLowerCase();
+
+  for (const [name, info] of entries) {
+    const g = String(info?.gender || "").toLowerCase();
+    if (g !== "male" && g !== "female") continue;
+    if (g === assumedGender) continue;
+
+    const aliases = Array.isArray(info?.aliases) ? info.aliases : [];
+    const names = [name, ...aliases]
+      .filter(Boolean)
+      .map(x => normalizeWeirdSpaces(String(x)).trim())
+      .filter(Boolean);
+
+    for (const n of names) {
+      if (n.length < 3) continue;                 // avoid tiny alias false positives
+      if (!sL.includes(n.toLowerCase())) continue; // cheap prefilter
+
+      const rx = wordBoundaryRegexCached(n);
+      if (rx && rx.test(s)) return false;
+    }
+  }
+  return true;
+}
 
   function getUrlChapterId() {
     const m = location.href.match(/\/chapter-(\d+)(?:\/|$|\?)/i);
@@ -477,6 +604,36 @@
     const m = location.href.match(/wtr-lab\.com\/en\/novel\/(\d+)\//i);
     return m ? `wtr-lab.com/en/novel/${m[1]}/` : "wtr-lab.com/en/novel/";
   }
+
+  function createNovelKeyReloadGuard(getNovelKey) {
+    const RELOAD_GUARD_KEY = "wtrpf_reload_guard_href_v1";
+    let lastNovelKey = getNovelKey();
+  
+    function check(why) {
+      const nk = getNovelKey();
+      if (!nk) return;
+  
+      if (nk !== lastNovelKey) {
+        const href = location.href;
+        const guard = sessionStorage.getItem(RELOAD_GUARD_KEY);
+  
+        if (guard === href) {
+          lastNovelKey = nk;
+          return;
+        }
+  
+        sessionStorage.setItem(RELOAD_GUARD_KEY, href);
+        console.log("[WTRPF] Novel changed -> reload:", { why, from: lastNovelKey, to: nk, href });
+        location.reload();
+        return;
+      }
+  
+      lastNovelKey = nk;
+    }
+  
+    return { check };
+  }
+
   function getChapterId(root) {
   const domCid = getDomChapterId(root);
   if (domCid && domCid !== "unknown") return domCid;
@@ -601,6 +758,10 @@
   // Content targeting
   // ==========================================================
     function findContentRoot() {
+
+    // Guard: never resolve a root on TOC/description/non-chapter pages
+    if (!isChapterReadingPage()) return null;
+
       // 1) Prefer ACTIVE chapter in infinite reader mode (or when tracker exists)
       const activeTracker = document.querySelector(".chapter-tracker.active[data-chapter-no]");
       const no = activeTracker?.getAttribute?.("data-chapter-no");
@@ -714,25 +875,24 @@
   }
   
   function getChapterIdForBody(body) {
-    // Prefer tracker inside / near this body:
+    const container =
+      body.closest?.(".chapter, .chapter-infinite-reader, article, section, main") || body;
+  
     const tracker =
-      body.querySelector?.(".chapter-tracker.active[data-chapter-no]") ||
+      container.querySelector?.(".chapter-tracker[data-chapter-no]") ||
       body.querySelector?.(".chapter-tracker[data-chapter-no]") ||
-      body.closest?.(".chapter, .chapter-infinite-reader")?.querySelector?.(".chapter-tracker.active[data-chapter-no]");
+      null;
   
     const no = tracker?.getAttribute?.("data-chapter-no");
     if (no && /^\d+$/.test(no)) return `chapter-${no}`;
   
-    // Try id="tracker-776"
     const tid = tracker?.id || "";
     const m1 = tid.match(/tracker-(\d+)/i);
     if (m1) return `chapter-${m1[1]}`;
   
-    // Fall back to DOM chapter id logic using this body as root
     const domCid = getDomChapterId(body);
     if (domCid && domCid !== "unknown") return domCid;
   
-    // As last resort: URL
     const urlCid = getUrlChapterId();
     if (urlCid && urlCid !== "unknown") return urlCid;
   
@@ -828,9 +988,8 @@
         }
       });
 
-      // Observe parent, not the root itself (React replaces children)
       const parent = root.parentNode || document.body;
-      rootObserver.observe(parent, { childList: true });
+      rootObserver.observe(parent, { childList: true, subtree: true });
     }
   
     function resolve() {
@@ -999,7 +1158,7 @@
   // ==========================================================
   // UI (same behavior as your requirements)
   // ==========================================================
-      function makeUI() {
+      function makeUI({ novelKey }) {
         let savedPos = {};
         try { savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}"); }
         catch { savedPos = {}; localStorage.removeItem(UI_KEY_POS); }
@@ -1493,7 +1652,7 @@
       
         sectionToggle.onclick = () => {
           draftSectionOpen = !draftSectionOpen;
-          const d = loadDraft(getNovelKeyFromURL());
+          const d = loadDraft(novelKey);
           setDraftUI(d?.snippet || "", (d?.items || []).length);
           clampToViewport(box);
         };
@@ -1590,7 +1749,7 @@
       
         copyBtn.onclick = async () => {
           if (copyBtn.disabled) return;
-          const d = loadDraft(getNovelKeyFromURL());
+          const d = loadDraft(novelKey);
           const txt = d?.snippet || "";
           if (!txt) return;
           await writeClipboard(txt);
@@ -1598,7 +1757,7 @@
       
         clearBtn.onclick = () => {
           if (clearBtn.disabled) return;
-          saveDraft(getNovelKeyFromURL(), { items: [], snippet: "" });
+          saveDraft(novelKey, { items: [], snippet: "" });
           setDraftUI("", 0);
         };
       
@@ -1631,7 +1790,7 @@
           setMinimized: (min) => setMin(!!min),
           setDraftUI,
           refreshDraftUI: () => {
-            const d = loadDraft(getNovelKeyFromURL());
+            const d = loadDraft(novelKey);
             setDraftUI(d?.snippet || "", (d?.items || []).length);
           },
           syncPillVisibility: () => {
@@ -1646,7 +1805,7 @@
   // Add popup (small + X + Male/Female only)
   // - FIX: add touch long-press fallback (Firefox Android)
   // ==========================================================
-  function installAddPopup({ ui }) {
+  function installAddPopup({ ui, novelKey }) {
     const popup = document.createElement("div");
     popup.style.cssText = `
       position: fixed; z-index: 2147483647;
@@ -1743,13 +1902,13 @@
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
 
     function upsertDraftLine(line) {
-      const d = loadDraft(getNovelKeyFromURL());
-      const items = Array.isArray(d.items) ? d.items : [];
-      if (!items.includes(line)) items.push(line);
-      const snippet = items.join("\n");
-      saveDraft(getNovelKeyFromURL(), { items, snippet });
-      ui.refreshDraftUI?.();
-    }
+    const d = loadDraft(novelKey); // keep per-novel
+    const items = Array.isArray(d.items) ? d.items : [];
+    if (!items.includes(line)) items.push(line);
+    const snippet = items.join("\n");
+    saveDraft(novelKey, { items, snippet });
+    ui.refreshDraftUI?.();
+  }
 
     maleBtn.onclick = () => {
       if (!ctxText) return;
@@ -1940,19 +2099,6 @@
         }
       }, true);
     }
-
-// function installHistoryHooks(onNav) {
- //   const fire = () => setTimeout(() => onNav("history"), 60);
-  //  window.addEventListener("popstate", fire);
-
- //   const _push = history.pushState;
-   // const _rep = history.replaceState;
-  //  history.pushState = function () { const r = _push.apply(this, arguments); fire(); return r; };
-  //  history.replaceState = function () { const r = _rep.apply(this, arguments); fire(); return r; };
-
-  //  window.addEventListener("pageshow", fire, true);
-  //  document.addEventListener("visibilitychange", () => { if (!document.hidden) fire(); }, true);
-//  }
 
     function installHistoryHooksLite(onNav) {
     const fire = (why) => setTimeout(() => onNav(why || "history-lite"), 60);
@@ -2157,66 +2303,82 @@
       return { disconnect: () => { if (mo) { try { mo.disconnect(); } catch {} } } };
     }
   
-  // ==========================================================
-  // Main
-  // ==========================================================
-  (async () => {
-    const ui = makeUI();
-     ui.syncPillVisibility?.();
-        window.__wtrpf_ui = ui;
-    if (!ui.isEnabled()) return;
+    // ==========================================================
+    // Main
+    // ==========================================================
+    (async () => {
+      // 1) Load glossary (cached loader already handles fallback)
+      let glossary;
+      try {
+        glossary = await loadGlossaryJSON(GLOSSARY_URL);
+        if (!glossary || typeof glossary !== "object") throw new Error("bad glossary");
+      } catch {
+        return;
+      }
+    
+      // 2) Pick config block for this URL
+      const key = pickKey(glossary);
+      const cfg = glossary[key] || {};
+    
+      // 3) Resolve novelKey EARLY (used by UI + per-novel storage)
+      const novelKey = (key === "default") ? getNovelKeyFromURL() : key;
+      const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
+    
+      // 4) Build UI FIRST (fixes ui-used-before-init + ensures per-novel draft)
+      const ui = makeUI({ novelKey });
+      window.__wtrpf_ui = ui;
+      ui.syncPillVisibility?.();
+    
+      // Respect OFF toggle early
+      if (!ui.isEnabled()) return;
+    
+    // Optional: reload-on-novel-switch safety (recommended)
+    const novelReloadGuard = createNovelKeyReloadGuard(getNovelKeyFromURL);
 
-    ui.refreshDraftUI?.();
-
-    if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
-      ui.setGlossaryOk(false);
-      return;
-    }
-
-    let glossary;
-    try {
-      glossary = await loadGlossaryJSON(GLOSSARY_URL);
-      if (!glossary || typeof glossary !== "object") throw new Error("bad glossary");
-    } catch {
-      ui.setGlossaryOk(false);
-      return;
-    }
-
-    const key = pickKey(glossary);
-    const cfg = glossary[key] || {};
-
-    const upgrades = cfg.upgrades || {};
-    const U = {
-      anchoredFixes: upgrades.anchoredFixes !== false,
-      verbBasedWindow: !!upgrades.verbBasedWindow,
-      passiveVoice: !!upgrades.passiveVoice,
-      dialogueSpeaker: !!upgrades.dialogueSpeaker,
-      roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
-      onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong,
-      termMemoryAssist: !!upgrades.termMemoryAssist,
-      enforcePinnedTermsOnPlainText: !!upgrades.enforcePinnedTermsOnPlainText
-    };
-
-    const characters = {
-      ...(glossary.default?.characters || {}),
-      ...(cfg.characters || {})
-    };
-    const entries = Object.entries(characters);
-    if (!entries.length) { ui.setGlossaryOk(false); return; }
-    ui.setGlossaryOk(true);
-
-    const cfgTerms = cfg.terms || {};
-    const novelKey = key === "default" ? getNovelKeyFromURL() : key;
-    const chapterStateKey = CHAPTER_STATE_KEY_PREFIX + novelKey;
-
-    installAddPopup({ ui });
-
-    const mode = String(cfg.mode || "paragraph").toLowerCase();
-    const primaryCharacter = cfg.primaryCharacter || null;
-    const forceGender = String(cfg.forceGender || "").toLowerCase();
-    const carryParagraphs = Number.isFinite(+cfg.carryParagraphs)
-      ? Math.max(0, Math.min(5, +cfg.carryParagraphs))
-      : DEFAULT_CARRY_PARAGRAPHS;
+      // 5) Validate glossary URL (tokenized GitHub URLs tend to break)
+      if (!GLOSSARY_URL || /\?token=GHSAT/i.test(GLOSSARY_URL)) {
+        ui.setGlossaryOk(false);
+        return;
+      }
+    
+      // 6) Upgrades flags
+      const upgrades = cfg.upgrades || {};
+      const U = {
+        anchoredFixes: upgrades.anchoredFixes !== false,
+        verbBasedWindow: !!upgrades.verbBasedWindow,
+        passiveVoice: !!upgrades.passiveVoice,
+        dialogueSpeaker: !!upgrades.dialogueSpeaker,
+        roleHeuristicCarry: !!upgrades.roleHeuristicCarry,
+        onlyChangeIfWrong: !!upgrades.onlyChangeIfWrong,
+        termMemoryAssist: !!upgrades.termMemoryAssist,
+        enforcePinnedTermsOnPlainText: !!upgrades.enforcePinnedTermsOnPlainText
+      };
+    
+      // 7) Merge characters + validate
+      const characters = {
+        ...(glossary.default?.characters || {}),
+        ...(cfg.characters || {})
+      };
+      const entries = Object.entries(characters);
+    
+      if (!entries.length) {
+        ui.setGlossaryOk(false);
+        return;
+      }
+      ui.setGlossaryOk(true);
+    
+      // 8) Terms + UI bootstraps
+      const cfgTerms = cfg.terms || {};
+      ui.refreshDraftUI?.();
+      installAddPopup({ ui, novelKey });
+    
+      // 9) Mode + behavioral settings
+      const mode = String(cfg.mode || "paragraph").toLowerCase();
+      const primaryCharacter = cfg.primaryCharacter || null;
+      const forceGender = String(cfg.forceGender || "").toLowerCase();
+      const carryParagraphs = Number.isFinite(+cfg.carryParagraphs)
+        ? Math.max(0, Math.min(5, +cfg.carryParagraphs))
+        : DEFAULT_CARRY_PARAGRAPHS;
 
     function installChapterBodyReplaceWatcher(onNav) {
       const mo = new MutationObserver((muts) => {
@@ -2238,11 +2400,11 @@
       mo.observe(document.body, { childList: true, subtree: true });
     }
 
-    
     function loadChapterState() {
       try { return JSON.parse(sessionStorage.getItem(chapterStateKey) || "{}"); }
       catch { return {}; }
     }
+    
     function saveChapterState(st) {
       sessionStorage.setItem(chapterStateKey, JSON.stringify(st || {}));
     }
@@ -2256,18 +2418,27 @@
       st.lastByChapter[chapterId] = val;
     }
 
-    function computeGenderForText(text) {
+  function computeGenderForText(text) {
     if (forceGender === "male" || forceGender === "female") return forceGender;
   
     const t = String(text || "");
-    
     const tL = t.toLowerCase();
+  
     if (primaryCharacter && tL.includes(String(primaryCharacter).toLowerCase()) && characters[primaryCharacter]) {
       const g0 = String(characters[primaryCharacter].gender || "").toLowerCase();
       if (g0 === "female" || g0 === "male") return g0;
     }
-
-    // NEW: scored detection (more robust than includes)
+  
+    // If the paragraph looks like dialogue attribution, try speaker first
+    const looksDialogue =
+      /["“][^"”]{3,}["”]/.test(t) &&
+      /\b(said|asked|replied|shouted|whispered|muttered|yelled)\b/i.test(t);
+  
+    if (looksDialogue && U.dialogueSpeaker) {
+      const gSpeaker = detectDialogueSpeakerGender(t, entries);
+      if (gSpeaker) return gSpeaker;
+    }
+  
     const scored = scoreGenderInText(t, entries);
     if (scored) return scored;
   
@@ -2277,24 +2448,25 @@
     }
   
     if (U.dialogueSpeaker) {
-      const gSpeaker = detectDialogueSpeakerGender(t, entries);
-      if (gSpeaker) return gSpeaker;
+      const gSpeaker2 = detectDialogueSpeakerGender(t, entries);
+      if (gSpeaker2) return gSpeaker2;
     }
   
+    // Fallback: strict word-boundary
     for (const [name, info] of entries) {
-    const g = String(info.gender || "").toLowerCase();
-    if (g !== "female" && g !== "male") continue;
+      const g = String(info.gender || "").toLowerCase();
+      if (g !== "female" && g !== "male") continue;
   
-    const all = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
-      .filter(Boolean)
-      .sort((a,b) => String(b).length - String(a).length);
+      const all = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
+        .filter(Boolean)
+        .sort((a,b) => String(b).length - String(a).length);
   
-    for (const n of all) {
-      const rx = wordBoundaryRegex(n);
-      if (rx && rx.test(t)) return g;
+      for (const n of all) {
+        const rx = wordBoundaryRegexCached(n);
+        if (rx && rx.test(t)) return g;
+      }
     }
-  }
-
+  
     return null;
   }
 
@@ -2360,15 +2532,15 @@
       b.dataset.wtrpfPatched = "1";
     }
 
-    // RUN FUNCTION
-/* ==========================================================
-   REWRITE 2: run()
-   - Fix: accept {forcedRoot, forcedChapterId} params (no global run._forcedRoot)
-   - Fix: running guard only blocks non-force runs
-   - Fix: correct marker clearing selectors (dataset → data-wtrpf-patched*, etc.)
-   - Fix: include chapterId in signature gating / appliedSig logic
-   ========================================================== */
-
+    // ==========================================================
+    // RUN + MONITOR (REWRITE)
+    // - single-flight (no concurrent runs, even forceFull)
+    // - consistent scheduling funnel (everything goes through requestRun)
+    // - safer SPA mismatch handling (compare sigs apples-to-apples)
+    // - "not ready" retry (prevents missed runs after Next/TOC)
+    // - monitor is single-instance + mode-aware + avoids global forceFull in infinite
+    // ==========================================================
+    
     // helper: clear patch markers correctly
     function clearPatchMarkers(root) {
       try {
@@ -2388,345 +2560,396 @@
         });
       } catch {}
     }
-
-function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = {}) {
-  console.log("[WTRPF] run() enter forceFull=", forceFull, "href=", location.href);
-
-  if (!ui.isEnabled()) return;
-  if (document.hidden) return;
-
-  // Single-flight always: even forceFull won't run concurrently.
-  // forceFull only bypasses cooldown/signature gates; pending runs are handled by requestRun + _pendingForced.
-  if (running) return;
-
-  const now = Date.now();
-  if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
-
-  const root = forcedRoot || (rootManager?.getRoot?.() || findContentRoot());
-  if (!root) return;
-
-  // If this run is targeting an infinite body, clear its queued marker
-  if (root?.dataset?.wtrpfQueued === "1") {
-    delete root.dataset.wtrpfQueued;
-  }
-
-  const urlCid = getUrlChapterId();
-  const domCid = getDomChapterId(root);
-
-  run._lastHref = run._lastHref || location.href;
-  if (location.href !== run._lastHref) {
-    run._lastHref = location.href;
-    run._domGraceStart = 0;
-  }
-
-  // During SPA nav, URL often changes before DOM.
-  // Non-forceFull: wait briefly for DOM. forceFull: still require contentReady.
-  const DOM_GRACE_MS = 1200;
-  run._domGraceStart = run._domGraceStart || 0;
-
-  const mismatch =
-    (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) ||
-    (urlCid !== "unknown" && domCid === "unknown");
-
-  if (mismatch) {
-    if (!run._domGraceStart) run._domGraceStart = Date.now();
-
-    if (!forceFull && (Date.now() - run._domGraceStart < DOM_GRACE_MS)) return;
-
-    // forceFull still must not patch old content
-    if (!contentReady(root)) return;
-
-    const sigNow = chapterSignature(root, (domCid !== "unknown" ? domCid : urlCid));
-
-    // If DOM still shows previous chapter and it's already stable, don't waste a run
-    if (domCid !== "unknown" && urlCid !== "unknown" && domCid !== urlCid) {
-      const appliedDom = getAppliedSig(novelKey, domCid);
-      if (appliedDom && sigNow && sigNow === appliedDom) return;
-    }
-
-    const appliedUrl = getAppliedSig(novelKey, urlCid);
-    if (appliedUrl && sigNow && sigNow === appliedUrl) {
-      run._domGraceStart = 0;
-      return;
-    }
-  }
-  run._domGraceStart = 0;
-
-  const chapterId = (forcedChapterId && forcedChapterId !== "unknown")
-    ? forcedChapterId
-    : ((domCid !== "unknown") ? domCid : urlCid);
-
-  let pronounEdits = 0;
-
-  function paragraphSeemsSingleGender(text, gender) {
-      const s = normalizeWeirdSpaces(String(text || ""));
-      const m = countMatches(RX_PRONOUN_MALE, s);
-      const f = countMatches(RX_PRONOUN_FEMALE, s);
     
-      // If paragraph has both genders’ pronouns, be conservative
-      if (m > 0 && f > 0) {
-        // allow if strongly skewed toward the target gender
-        if (gender === "male") return m >= (f * 3);
-        return f >= (m * 3);
-      }
-      return true;
-    }
-
-  if (!contentReady(root)) return;
-
-  // Signature gate: only skip if same as last applied in this session (unless forceFull)
-  const sigBefore = chapterSignature(root, chapterId);
-  if (!forceFull && sigBefore && sigBefore === lastSig) return;
-
-  running = true;
-  try {
-    // New chapter boundary
-    if (chapterId !== lastChapterId) {
-      lastChapterId = chapterId;
-      localStorage.setItem(UI_KEY_MIN, "1");
-      ui.setMinimized(true);
-
-      lastActorGender = null;
-      lastActorTTL = 0;
-
-      // React can reuse DOM nodes; clear markers on boundary
-      clearPatchMarkers(root);
-    }
-
-    // If forceFull, clear per-node markers to reprocess
-    if (forceFull) clearPatchMarkers(root);
-
-    // If root is a chapter body, clear infinite-mode flags too
-    if (root?.classList?.contains("chapter-body") && root?.dataset) {
-      delete root.dataset.wtrpfSwept;
-      delete root.dataset.wtrpfQueued;
-    }
-
-    // UI: show last known count for this chapter until we compute a new one
-    const st0 = loadChapterState();
-    const lastChanged = getChapterLastChanged(st0, chapterId);
-    ui.setChanged(lastChanged > 0 ? lastChanged : 0);
-
-    // Apply term patches (if enabled)
-    if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
-      const mem = loadTermMemory(novelKey);
-      applyTermPatches(root, cfgTerms, mem, U);
-    }
-
-    updateDetectedCharactersUI(root);
-
-    // Resolve mode
-    let usedMode = mode;
-    let chapterGender = null;
-
-    if (mode === "chapter") {
-      if (forceGender === "male" || forceGender === "female") {
-        chapterGender = forceGender;
-      } else if (primaryCharacter && characters[primaryCharacter]) {
-        const g = String(characters[primaryCharacter].gender || "").toLowerCase();
-        if (g === "female" || g === "male") chapterGender = g;
-      }
-      if (!chapterGender) usedMode = "paragraph";
-    }
-
-    // Decide which blocks to process
-    const alreadyPatched = rootPatchedFor(root, chapterId);
-    const doFullPass = forceFull || !alreadyPatched;
-
-    const blocksAll = getTextBlocks(root);
-    const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
-    if (!blocks.length) return;
-
-    let lastGender = null;
-    let carryLeft = 0;
-
-    for (const b of blocks) {
-      const bt = (b.innerText || "").trim();
-      if (!bt) { markBlockPatched(b); continue; }
-
-      if (isSceneBreak(bt)) {
-        lastGender = null;
-        carryLeft = 0;
-        lastActorGender = null;
-        lastActorTTL = 0;
-        markBlockPatched(b);
-        continue;
-      }
-
-      // Anchored fixes first
-      if (U.anchoredFixes) {
-        pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, U));
-      }
-
-      let g = null;
-      let hadDirectMatch = false;
-
-      if (usedMode === "chapter") {
-        g = chapterGender;
-        hadDirectMatch = true;
-      } else {
-        const computed = computeGenderForText(bt); // (see snippet below to make it case-insensitive)
-        if (computed) {
-          g = computed;
-          hadDirectMatch = true;
-
-          if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
-            lastActorGender = computed;
-            lastActorTTL = 2;
-          }
-        } else {
-          if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
-            g = lastGender;
-            carryLeft--;
-          }
-
-          if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
-            if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
-              g = lastActorGender;
-              lastActorTTL--;
-            }
-          }
-        }
-      }
-
-      // Global pass within this block
-      if (g) {
-        const dir = (g === "female") ? "toFemale" : "toMale";
-
-        let doFull = true;
-        if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
-        
-        // NEW: extra safety in mixed paragraphs
-        if (doFull && !paragraphSeemsSingleGender(bt, g)) doFull = false;
-
-        if (doFull) {
-          pronounEdits += replaceInTextNodes(b, (txt) => {
-            if (!paragraphSeemsSingleGender(txt, g)) return { text: txt, changed: 0 };
-            return replacePronounsSmart(txt, dir);
-          });
-        }
-
-        if (usedMode !== "chapter" && hadDirectMatch) {
-          lastGender = g;
-          carryLeft = carryParagraphs;
-        }
-      }
-
-      markBlockPatched(b);
-    }
-
-    if (doFullPass) markRootPatched(root, chapterId);
-
-    // Avoid inflating counts if already equals applied signature
-    if (pronounEdits > 0) {
-      const sigNow = chapterSignature(root, chapterId);
-      const applied = getAppliedSig(novelKey, chapterId);
-      if (applied && sigNow === applied) pronounEdits = 0;
-    }
-
-    // Persist counts
-    const st = loadChapterState();
-    const prev = getChapterLastChanged(st, chapterId);
-
-    if (pronounEdits > 0) {
-      setChapterLastChanged(st, chapterId, pronounEdits);
-      ui.setChanged(pronounEdits);
-    } else if (prev > 0) {
-      ui.setChanged(prev);
-    } else {
-      ui.setChanged(0);
-    }
-
-    // Record signature AFTER applying
-    const sigAfter = chapterSignature(root, chapterId);
-    if (sigAfter) {
-      setAppliedSig(novelKey, chapterId, sigAfter);
-      lastSig = sigAfter;
-    } else {
-      lastSig = sigBefore;
-    }
-
-    saveChapterState(st);
-  } finally {
-    running = false;
-    lastRunAt = Date.now();
-  }
-
-  // NEW: if a forced body was queued while we were busy, run it now
-  try { drainPendingForced(); } catch {}
-}
-
-    /* =========================
-   C) NEW: Single debounced scheduler (upgrade #1)
-   Put this inside Main (async IIFE) after you define run()
-   and before you install hooks.
-   ========================= */
-    const RUN_DEBOUNCE_MS = 140;
+    function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = {}) {
+      console.log("[WTRPF] run() enter forceFull=", forceFull, "href=", location.href);
     
-    let _runTimer = null;
-    let _pendingRun = null; // { forceFull, forcedRoot, forcedChapterId, reason, ts }
+      if (!ui.isEnabled()) return;
+      if (document.hidden) return;
     
-    function requestRun(reason, opts = {}) {
-      if (!ui.isEnabled() || document.hidden) return;
-
-      // NEW: never schedule runs when not on a chapter reading page
-      // (prevents wasted work on TOC/description pages)
-      if (!isChapterReadingPage()) {
-        ui.syncPillVisibility?.();
+      // Single-flight always. forceFull bypasses gates, not concurrency.
+      if (running) return;
+    
+      const now = Date.now();
+      if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
+    
+      const root = forcedRoot || (rootManager?.getRoot?.() || findContentRoot());
+      if (!root) return;
+    
+      // If this run is targeting an infinite body, clear its queued marker
+      if (root?.dataset?.wtrpfQueued === "1") {
+        delete root.dataset.wtrpfQueued;
+      }
+    
+      // If content not ready, don't silently drop: schedule one retry (cheap insurance for SPA nav)
+      if (!contentReady(root)) {
+        if (!forceFull) requestRun("run-not-ready-retry", { forceFull: false, forcedRoot, forcedChapterId });
         return;
       }
     
-      const req = {
-        forceFull: !!opts.forceFull,
-        forcedRoot: opts.forcedRoot || null,
-        forcedChapterId: opts.forcedChapterId || null,
-        reason: String(reason || "request"),
-        ts: Date.now()
-      };
+      // --- SPA DOM/URL grace handling (avoid patching old content) ---
+      const urlCid = getUrlChapterId();
+      const domCid = getDomChapterId(root);
     
-      // Latest wins; forceFull is "sticky" (once requested, keep it true)
-      if (_pendingRun) {
-        req.forceFull = req.forceFull || _pendingRun.forceFull;
-        if (!req.forcedRoot && _pendingRun.forcedRoot) req.forcedRoot = _pendingRun.forcedRoot;
-        if (!req.forcedChapterId && _pendingRun.forcedChapterId) req.forcedChapterId = _pendingRun.forcedChapterId;
+      run._lastHref = run._lastHref || location.href;
+      if (location.href !== run._lastHref) {
+        run._lastHref = location.href;
+        run._domGraceStart = 0;
       }
-      _pendingRun = req;
+    
+      const DOM_GRACE_MS = 1200;
+      run._domGraceStart = run._domGraceStart || 0;
+    
+      const mismatch =
+        (urlCid !== "unknown" && domCid !== "unknown" && domCid !== urlCid) ||
+        (urlCid !== "unknown" && domCid === "unknown");
+    
+      if (mismatch) {
+        if (!run._domGraceStart) run._domGraceStart = Date.now();
+    
+        // Non-force: give the DOM a moment to catch up
+        if (!forceFull && (Date.now() - run._domGraceStart < DOM_GRACE_MS)) return;
+    
+        // forceFull still must not patch old content
+        if (!contentReady(root)) return;
+    
+        // Compare signatures with matching chapterIds (avoid domCid sig vs urlCid applied)
+        const sigDom = (domCid && domCid !== "unknown") ? chapterSignature(root, domCid) : "";
+        const sigUrl = (urlCid && urlCid !== "unknown") ? chapterSignature(root, urlCid) : "";
+    
+        // If DOM still shows previous chapter and it's already stable, don't waste a run
+        if (domCid !== "unknown" && urlCid !== "unknown" && domCid !== urlCid) {
+          const appliedDom = getAppliedSig(novelKey, domCid);
+          if (appliedDom && sigDom && sigDom === appliedDom) return;
+        }
+    
+        const appliedUrl = getAppliedSig(novelKey, urlCid);
+        if (appliedUrl && sigUrl && sigUrl === appliedUrl) {
+          run._domGraceStart = 0;
+          return;
+        }
+      }
+      run._domGraceStart = 0;
+    
+      // Final chapterId selection (forced wins; else prefer DOM id if known)
+      const chapterId =
+        (forcedChapterId && forcedChapterId !== "unknown")
+          ? forcedChapterId
+          : ((domCid !== "unknown") ? domCid : urlCid);
+    
+      let pronounEdits = 0;
+    
+      function paragraphSeemsSingleGender(text, gender) {
+        const s = normalizeWeirdSpaces(String(text || ""));
+        const m = countMatches(RX_PRONOUN_MALE, s);
+        const f = countMatches(RX_PRONOUN_FEMALE, s);
+    
+        // If paragraph has both genders’ pronouns, be conservative
+        if (m > 0 && f > 0) {
+          if (gender === "male") return m >= (f * 3);
+          return f >= (m * 3);
+        }
+        return true;
+      }
+    
+      // Signature gate: skip only if same as last applied in this session (unless forceFull)
+      const sigBefore = chapterSignature(root, chapterId);
+      if (!forceFull && sigBefore && sigBefore === lastSig) return;
+    
+      running = true;
+      try {
+        // New chapter boundary
+        if (chapterId !== lastChapterId) {
+          lastChapterId = chapterId;
+    
+          localStorage.setItem(UI_KEY_MIN, "1");
+          ui.setMinimized(true);
+    
+          lastActorGender = null;
+          lastActorTTL = 0;
+    
+          // React can reuse DOM nodes; clear markers on boundary
+          clearPatchMarkers(root);
+        }
+    
+        // If forceFull, clear markers to reprocess
+        if (forceFull) clearPatchMarkers(root);
+    
+        // If root is a chapter body, clear infinite-mode flags too
+        if (root?.classList?.contains("chapter-body") && root?.dataset) {
+          delete root.dataset.wtrpfSwept;
+          delete root.dataset.wtrpfQueued;
+        }
+    
+        // UI: show last known count for this chapter until we compute a new one
+        const st0 = loadChapterState();
+        const lastChanged = getChapterLastChanged(st0, chapterId);
+        ui.setChanged(lastChanged > 0 ? lastChanged : 0);
+    
+        // Apply term patches (if enabled)
+        if (U.termMemoryAssist || Object.keys(cfgTerms).length) {
+          const mem = loadTermMemory(novelKey);
+          applyTermPatches(root, cfgTerms, mem, U);
+        }
+    
+        updateDetectedCharactersUI(root);
+    
+        // Resolve mode
+        let usedMode = mode;
+        let chapterGender = null;
+    
+        if (mode === "chapter") {
+          if (forceGender === "male" || forceGender === "female") {
+            chapterGender = forceGender;
+          } else if (primaryCharacter && characters[primaryCharacter]) {
+            const g = String(characters[primaryCharacter].gender || "").toLowerCase();
+            if (g === "female" || g === "male") chapterGender = g;
+          }
+          if (!chapterGender) usedMode = "paragraph";
+        }
+    
+        // Decide which blocks to process
+        const alreadyPatched = rootPatchedFor(root, chapterId);
+        const doFullPass = forceFull || !alreadyPatched;
+    
+        const blocksAll = getTextBlocks(root);
+        const blocks = doFullPass ? blocksAll : blocksAll.filter(b => !blockIsPatched(b));
+        if (!blocks.length) return;
+    
+        let lastGender = null;
+        let carryLeft = 0;
+    
+        for (const b of blocks) {
+          const bt = (b.innerText || "").trim();
+          if (!bt) { markBlockPatched(b); continue; }
+    
+          if (isSceneBreak(bt)) {
+            lastGender = null;
+            carryLeft = 0;
+            lastActorGender = null;
+            lastActorTTL = 0;
+            markBlockPatched(b);
+            continue;
+          }
+    
+          // Anchored fixes first
+        if (U.anchoredFixes) {
+          const anchoredOpts = Object.assign({}, U, { onlyChangeIfWrong: true });
+          pronounEdits += replaceInTextNodes(b, (txt) => applyAnchoredFixes(txt, entries, anchoredOpts));
+        }
+    
+          let g = null;
+          let hadDirectMatch = false;
+    
+          if (usedMode === "chapter") {
+            g = chapterGender;
+            hadDirectMatch = true;
+          } else {
+            const computed = computeGenderForText(bt);
+            if (computed) {
+              g = computed;
+              hadDirectMatch = true;
+          
+              if (U.roleHeuristicCarry && RX_ATTACK_CUES.test(bt)) {
+                lastActorGender = computed;
+                lastActorTTL = 2;
+              }
+            } else {
+              // Carry from lastGender (guarded)
+              if (lastGender && carryLeft > 0 && (startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW))) {
+                if (carryGuardAllows(bt, lastGender, entries)) {
+                  g = lastGender;
+                  carryLeft--;
+                }
+              }
+          
+              // Role heuristic carry (only if still no gender)
+              if (!g && U.roleHeuristicCarry && lastActorGender && lastActorTTL > 0) {
+                if ((startsWithPronoun(bt) || pronounAppearsEarly(bt, EARLY_PRONOUN_WINDOW)) && RX_ATTACK_CUES.test(bt)) {
+                  g = lastActorGender;
+                  lastActorTTL--;
+                }
+              }
+            }
+          }
 
-      if (_runTimer) return;
-      _runTimer = setTimeout(() => {
+          if (g) {
+            const dir = (g === "female") ? "toFemale" : "toMale";
+    
+          let doFull = true;
+          if (U.onlyChangeIfWrong) doFull = conservativeShouldApply(bt, g);
+          
+          if (doFull) {
+            pronounEdits += replaceInTextNodes(b, (txt) => {
+              if (!paragraphSeemsSingleGender(txt, g)) {
+                return replacePronounsSentenceScoped(txt, g);
+              }
+              return replacePronounsSmart(txt, dir);
+            });
+          }
+
+            if (usedMode !== "chapter" && hadDirectMatch) {
+              lastGender = g;
+              carryLeft = carryParagraphs;
+            }
+          }
+    
+          markBlockPatched(b);
+        }
+    
+        if (doFullPass) markRootPatched(root, chapterId);
+    
+        // Avoid inflating counts if already equals applied signature
+        if (pronounEdits > 0) {
+          const sigNow = chapterSignature(root, chapterId);
+          const applied = getAppliedSig(novelKey, chapterId);
+          if (applied && sigNow === applied) pronounEdits = 0;
+        }
+    
+        // Persist counts
+        const st = loadChapterState();
+        const prev = getChapterLastChanged(st, chapterId);
+    
+        if (pronounEdits > 0) {
+          setChapterLastChanged(st, chapterId, pronounEdits);
+          ui.setChanged(pronounEdits);
+        } else if (prev > 0) {
+          ui.setChanged(prev);
+        } else {
+          ui.setChanged(0);
+        }
+    
+        // Record signature AFTER applying
+        const sigAfter = chapterSignature(root, chapterId);
+        if (sigAfter) {
+          setAppliedSig(novelKey, chapterId, sigAfter);
+          lastSig = sigAfter;
+        } else {
+          lastSig = sigBefore;
+        }
+    
+        saveChapterState(st);
+      } finally {
+        running = false;
+        lastRunAt = Date.now();
+      }
+    
+      // If a forced body was queued while we were busy, schedule it (through requestRun)
+      try { drainPendingForced(); } catch {}
+    }
+
+  /* =========================
+   C) Single debounced scheduler (upgrade #1) — hardened
+   ========================= */
+  const RUN_DEBOUNCE_MS = 140;
+  const RUN_TIMER_MAX_WAIT_MS = 2000; // failsafe: never get "stuck" longer than this
+  
+  let _runTimer = null;
+  let _runTimerSetAt = 0;
+  let _pendingRun = null; // { forceFull, forcedRoot, forcedChapterId, reason, ts, allowOffChapter }
+  
+  /**
+   * Coalesce triggers into a single run() call.
+   * - "Latest wins" for reason/root/chapterId
+   * - forceFull is sticky
+   */
+  function requestRun(reason, opts = {}) {
+    if (!ui.isEnabled() || document.hidden) return;
+  
+    const forcedRoot = opts.forcedRoot || null;
+  
+    // Gate: don't schedule runs off chapter pages unless explicitly allowed or forcedRoot is provided
+    if (!forcedRoot && !opts.allowOffChapter && !isChapterReadingPage()) {
+      ui.syncPillVisibility?.();
+      return;
+    }
+  
+    const req = {
+      forceFull: !!opts.forceFull,
+      forcedRoot,
+      forcedChapterId: opts.forcedChapterId || null,
+      allowOffChapter: !!opts.allowOffChapter,
+      reason: String(reason || "request"),
+      ts: Date.now()
+    };
+  
+    // Latest wins; forceFull is sticky
+    if (_pendingRun) {
+      req.forceFull = req.forceFull || _pendingRun.forceFull;
+  
+      if (!req.forcedRoot && _pendingRun.forcedRoot) req.forcedRoot = _pendingRun.forcedRoot;
+      if (!req.forcedChapterId && _pendingRun.forcedChapterId) req.forcedChapterId = _pendingRun.forcedChapterId;
+  
+      // If anything previously required off-chapter, keep it
+      req.allowOffChapter = req.allowOffChapter || _pendingRun.allowOffChapter;
+    }
+    _pendingRun = req;
+  
+    // If we already have a timer, ensure it can't get stuck forever
+    if (_runTimer) {
+      if (_runTimerSetAt && (Date.now() - _runTimerSetAt) > RUN_TIMER_MAX_WAIT_MS) {
+        clearTimeout(_runTimer);
         _runTimer = null;
-        const r = _pendingRun;
-        _pendingRun = null;
-        if (!r) return;
-    
-        // IMPORTANT: run() already guards single-flight; this just coalesces triggers
-        console.log("[WTRPF] requestRun→run:", r.reason, "forceFull=", r.forceFull);
-        run({
-          forceFull: r.forceFull,
-          forcedRoot: r.forcedRoot,
-          forcedChapterId: r.forcedChapterId
-        });
-      }, RUN_DEBOUNCE_MS);
+      } else {
+        return;
+      }
     }
-
-      /* ==========================================================
-       DROP-IN SNIPPET A: drain pending forced run
-       Place near the end of run() finally OR in your monitor tick.
-       This ensures sweep requests aren’t lost when a run was busy.
-       ========================================================== */
-    
-    function drainPendingForced() {
-      if (!_pendingForced || running) return;
-    
-      const { root, cid } = _pendingForced;
-      if (!root || !cid) { _pendingForced = null; return; }
-    
-      // Only attempt if still in DOM + ready
-      if (!document.contains(root) || !contentReady(root)) return;
-    
-      _pendingForced = null;
-      run({ forceFull: true, forcedRoot: root, forcedChapterId: cid });
+  
+    _runTimerSetAt = Date.now();
+    _runTimer = setTimeout(() => {
+      _runTimer = null;
+      _runTimerSetAt = 0;
+  
+      const r = _pendingRun;
+      _pendingRun = null;
+      if (!r) return;
+  
+      // If a run is in-flight, requeue once with a tiny delay instead of dropping the request
+      if (running) {
+        _pendingRun = r;
+        requestRun("rearm-while-running", { forceFull: r.forceFull, forcedRoot: r.forcedRoot, forcedChapterId: r.forcedChapterId, allowOffChapter: r.allowOffChapter });
+        return;
+      }
+  
+      console.log("[WTRPF] requestRun→run:", r.reason, "forceFull=", r.forceFull);
+      run({
+        forceFull: r.forceFull,
+        forcedRoot: r.forcedRoot,
+        forcedChapterId: r.forcedChapterId
+      });
+    }, RUN_DEBOUNCE_MS);
+  }
+  
+  /* ==========================================================
+     drainPendingForced() — hardened
+     - safe retries when DOM isn't ready yet
+     - doesn't lose work if _pendingForced is overwritten mid-check
+     ========================================================== */
+  function drainPendingForced() {
+    if (!_pendingForced || running) return;
+  
+    const snap = _pendingForced; // snapshot for race safety
+    const { root, cid } = snap || {};
+    if (!root || !cid) { _pendingForced = null; return; }
+  
+    if (!document.contains(root)) { _pendingForced = null; return; }
+  
+    // If not ready yet, retry a few times via scheduler
+    snap.tries = (snap.tries || 0) + 1;
+  
+    // If _pendingForced changed while we were working, don't stomp it
+    if (_pendingForced !== snap) return;
+  
+    if (!contentReady(root)) {
+      if (snap.tries > 10) { _pendingForced = null; return; }
+      // schedule a gentle retry (forcedRoot bypasses chapter-page gate)
+      requestRun("drain-pending-forced-retry", { forceFull: true, forcedRoot: root, forcedChapterId: cid });
+      return;
     }
+  
+    _pendingForced = null;
+    requestRun("drain-pending-forced", { forceFull: true, forcedRoot: root, forcedChapterId: cid });
+  }
 
 /* ==========================================================
    REWRITE 1: sweepInfiniteBodies()
@@ -2734,9 +2957,11 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
    - Fix: avoid forcedRoot globals; pass forcedRoot/forcedChapterId into run()
    - Fix: don’t lose a chapter if run is busy; queue for later
    ========================================================== */
-    let _pendingForced = null; // { root: Element, cid: string, tries: number }
-    
-    function sweepInfiniteBodies() {
+  // SINGLE shared pending forced run
+  // Used by sweepInfiniteBodies() + drainPendingForced()
+  let _pendingForced = null; // { root, cid, tries }
+  
+  function sweepInfiniteBodies() {
       const host = document.querySelector(".chapter-infinite-reader");
       if (!host) return;
     
@@ -2746,7 +2971,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
       for (const body of bodies) {
         if (!body) continue;
     
-        // If we already declared this body stable, skip
+        // Already declared stable → skip
         if (body.dataset.wtrpfSwept === "1") continue;
     
         const cid = getChapterIdForBody(body);
@@ -2756,152 +2981,205 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         const sigNow = chapterSignature(body, cid);
         const applied = getAppliedSig(novelKey, cid);
     
-        // If it’s already applied & stable, mark swept and clear queued
+        // Applied & stable → mark swept
         if (applied && sigNow && sigNow === applied) {
           body.dataset.wtrpfSwept = "1";
           clearBodyQueued(body);
           continue;
         }
     
-        // If we already queued it, don't spam requestRun every tick
+        // Already queued → don’t spam
         if (bodyIsQueued(body)) continue;
     
-        // If busy, queue ONE pending forced run (latest wins) and mark queued
+        // If a run is active, queue ONE pending forced body safely
         if (running) {
-          _pendingForced = { root: body, cid, tries: 0 };
+          // Do not overwrite an existing pending forced unless it's the same body
+          if (!_pendingForced || _pendingForced.root === body) {
+            _pendingForced = { root: body, cid, tries: 0 };
+          }
           markBodyQueued(body);
           continue;
         }
     
-        // Queue a forced run (debounced). Mark queued to prevent re-queue spam.
+        // Not running → schedule a forced run via scheduler
         markBodyQueued(body);
-        requestRun("infinite-sweep", { forceFull: true, forcedRoot: body, forcedChapterId: cid });
+    
+        requestRun("infinite-sweep", {
+          forceFull: true,
+          forcedRoot: body,
+          forcedChapterId: cid
+        });
       }
     }
 
     function startChapterMonitor() {
-      let startedAt = Date.now();
-    
-      setInterval(() => {
-        const inInfinite = !!document.querySelector(".chapter-infinite-reader");
-        if (inInfinite) {
-          sweepInfiniteBodies();
+    let startedAt = Date.now();
+  
+    // track nav resets if you want (optional): call this in onNav()
+    // startedAt = Date.now();
+  
+    let timer = null;
+  
+    const tick = () => {
+      const inInfinite = !!document.querySelector(".chapter-infinite-reader");
+      if (inInfinite) sweepInfiniteBodies();
+  
+      if (!ui.isEnabled()) return;
+      if (document.hidden) return;
+      if (running) return;
+  
+      drainPendingForced();
+  
+      if (inInfinite) return;
+  
+      const root = rootManager?.getRoot?.() || findContentRoot();
+      if (!contentReady(root)) return;
+  
+      const cid = getChapterId(root);
+      const sigNow = chapterSignature(root, cid);
+      if (!cid || !sigNow) return;
+  
+      const applied = getAppliedSig(novelKey, cid);
+  
+      if (!applied || sigNow !== applied) {
+        requestRun("monitor-force", { forceFull: true, forcedRoot: root, forcedChapterId: cid });
+        return;
+      }
+  
+      // Warmup: don't spam, only nudge occasionally
+      const age = Date.now() - startedAt;
+      if (age < CHAPTER_MONITOR_WARMUP_MS) {
+        // e.g. at most once per 1200ms
+        tick._lastWarm = tick._lastWarm || 0;
+        if (Date.now() - tick._lastWarm > 1200) {
+          tick._lastWarm = Date.now();
+          requestRun("monitor-light", { forceFull: false, forcedRoot: root, forcedChapterId: cid });
         }
-
-        if (!ui.isEnabled()) return;
-        if (document.hidden) return;
-        if (running) return;
-
-        drainPendingForced();
-
-        // In infinite mode, the sweeper + pending forced runs handle updates per-baody.
-        // Avoid "global forceFull" runs that may hit the wrong root.
-        
-        if (inInfinite) return;
-
-        const root = rootManager?.getRoot() || findContentRoot();
-        if (!contentReady(root)) return;
-    
-        const cid = getChapterId(root);
-        const sigNow = chapterSignature(root, cid);
-        if (!cid || !sigNow) return;
-    
-        const applied = getAppliedSig(novelKey, cid);
-    
-        // If we never applied to this chapter yet OR React overwrote after we applied, re-run.
-        if (!applied || sigNow !== applied) {
-          requestRun("monitor-force", { forceFull: true });
-          return;
-        }
-    
-        // Optional warmup light passes right after load/nav
-        if (Date.now() - startedAt < CHAPTER_MONITOR_WARMUP_MS) {
-          requestRun("monitor-light", { forceFull: false });
-        }
-      }, CHAPTER_MONITOR_MS);
-    }
+      }
+    };
+  
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+  
+      const age = Date.now() - startedAt;
+      const interval = (age < CHAPTER_MONITOR_WARMUP_MS) ? 350 : 900;
+  
+      timer = setTimeout(() => {
+        tick();
+        schedule();
+      }, interval);
+    };
+  
+    schedule();
+  
+    // optional: expose a reset hook
+    startChapterMonitor.resetWarmup = () => { startedAt = Date.now(); };
+  }
 
       // Nav sweep (A) — hardened so we ONLY apply once URL+DOM agree AND content is ready
       function startNavSweep(reason = "nav", epoch = navEpoch) {
-        stopNavSweep();
-      
-        const startAt = Date.now();
-        let stableHits = 0;
-        let lastSeenChapterId = null;
-        let sawNewContent = false;
-      
-        const FALLBACK_AFTER_MS = 1600;
-      
-        navSweepTimer = setInterval(() => {
-          if (epoch !== navEpoch) { stopNavSweep(); return; } // newer nav happened
-          if (!ui.isEnabled() || document.hidden) { stopNavSweep(); return; }
-          if (Date.now() - startAt > NAV_SWEEP_MS) { stopNavSweep(); return; }
-      
-          const root = rootManager?.getRoot() || findContentRoot();
+      stopNavSweep();
+    
+      const startAt = Date.now();
+      let stableHits = 0;
+      let lastSeenChapterId = null;
+      let sawNewContent = false;
+    
+      const FALLBACK_AFTER_MS = 1600;
+    
+      navSweepTimer = setInterval(() => {
+        if (epoch !== navEpoch) { stopNavSweep(); return; }
+        if (!ui.isEnabled() || document.hidden) { stopNavSweep(); return; }
+        if (Date.now() - startAt > NAV_SWEEP_MS) { stopNavSweep(); return; }
+    
+        // In infinite mode, do not use nav sweep for patching;
+        // sweeper + per-body forced runs own correctness.
+        if (document.querySelector(".chapter-infinite-reader")) {
           ui.syncPillVisibility?.();
-          if (!root || root === document.body) return;
-          if (!contentReady(root)) { stableHits = 0; return; }
-      
-          const urlCid = getUrlChapterId();
-          const domCid = getDomChapterId(root);
-      
-          const now = Date.now();
-          const canFallback = (now - startAt) >= FALLBACK_AFTER_MS;
-      
-          let cid = null;
-          if (urlCid !== "unknown" && domCid !== "unknown" && urlCid === domCid) {
-            cid = urlCid;
-          } else if (canFallback && urlCid !== "unknown") {
-            cid = urlCid;
-          } else if (domCid !== "unknown" && canFallback) {
-            // IMPORTANT: allow DOM-only progress when URL doesn't change
-            cid = domCid;
+          stopNavSweep();
+          return;
+        }
+    
+        const root = rootManager?.getRoot?.() || findContentRoot();
+        ui.syncPillVisibility?.();
+        if (!root || root === document.body) return;
+        if (!contentReady(root)) { stableHits = 0; return; }
+    
+        const urlCid = getUrlChapterId();
+        const domCid = getDomChapterId(root);
+    
+        const now = Date.now();
+        const canFallback = (now - startAt) >= FALLBACK_AFTER_MS;
+    
+        // Choose CID safely:
+        // 1) strict agree
+        // 2) fallback prefers DOM-derived cid (root-bound), because root is what we will patch
+        let cid = null;
+    
+        if (urlCid !== "unknown" && domCid !== "unknown" && urlCid === domCid) {
+          cid = urlCid;
+        } else if (canFallback && domCid !== "unknown") {
+          cid = domCid;
+        } else if (canFallback && urlCid !== "unknown" && domCid === "unknown") {
+          // only accept URL-only when DOM can't identify AND we've seen new content
+          cid = urlCid;
+        } else {
+          stableHits = 0;
+          return;
+        }
+    
+        const sigNow = chapterSignature(root, cid);
+        if (!sigNow) { stableHits = 0; return; }
+    
+        // Ensure we don't stabilize on "old chapter" before swap.
+        if (!sawNewContent) {
+          if (sigNow !== preNavSig || cid !== preNavCid) {
+            sawNewContent = true;
           } else {
             stableHits = 0;
             return;
           }
-      
-          const sigNow = chapterSignature(root, cid);
-          if (!sigNow) { stableHits = 0; return; }
-      
-          // Don't "stabilize" on the old chapter before React swaps.
-          if (!sawNewContent) {
-            if (sigNow !== preNavSig || cid !== preNavCid) {
-              sawNewContent = true;
-            } else {
-              stableHits = 0;
-              return;
-            }
+        }
+    
+        if (cid !== lastSeenChapterId) {
+          lastSeenChapterId = cid;
+          stableHits = 0;
+          localStorage.setItem(UI_KEY_MIN, "1");
+          ui.setMinimized(true);
+        }
+    
+        const applied = getAppliedSig(novelKey, cid);
+    
+        // If not applied or overwritten, schedule a deterministic forced run for THIS root/cid.
+        if (!applied || sigNow !== applied) {
+          // avoid spamming if a run is already happening / queued
+          if (!running) {
+            requestRun("nav-sweep", { forceFull: true, forcedRoot: root, forcedChapterId: cid });
           }
-      
-          if (cid !== lastSeenChapterId) {
-            lastSeenChapterId = cid;
-            stableHits = 0;
-            localStorage.setItem(UI_KEY_MIN, "1");
-            ui.setMinimized(true);
-          }
-      
-          const applied = getAppliedSig(novelKey, cid);
-      
-          if (!applied || sigNow !== applied) {
-            requestRun("nav-sweep", { forceFull: true });
-            stableHits = 0;
-            return;
-          }
-      
-          stableHits++;
-          if (stableHits >= 2) stopNavSweep();
-        }, NAV_POLL_MS);
-      }
+          stableHits = 0;
+          return;
+        }
+    
+        stableHits++;
+        if (stableHits >= 2) stopNavSweep();
+      }, NAV_POLL_MS);
+    }
 
       // ==========================================================
       // Hooks (B) — simplify: NO early forced runs; sweep decides when it's safe
       // ==========================================================
-       let preNavSig = "";
+      let preNavSig = "";
       let preNavCid = "";
       let navEpoch = 0;
+
+      let _onNavLastAt = 0;
+      let _onNavLastWhy = "";
    
         const onNav = (why) => {
+          const now = Date.now();
+          if (now - _onNavLastAt < 250) return; // throttle bursts
+          _onNavLastAt = now;
+          _onNavLastWhy = String(why || "");
           console.log("[WTRPF] onNav fired:", why, "href=", location.href);
         
           localStorage.setItem(UI_KEY_MIN, "1");
@@ -2912,7 +3190,9 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
           // Reset session gates
           lastSig = "";
           lastChapterId = null;
-        
+
+          try { startChapterMonitor.resetWarmup?.(); } catch {}
+
           // Capture "before nav" identity so sweep won't stabilize on old chapter
           const root0 = rootManager?.getRoot?.() || findContentRoot();
           preNavCid = root0 ? getChapterId(root0) : "";
@@ -2934,8 +3214,9 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         
           const doSync = (why) => {
             try { rootManager?.resolve?.(); } catch {}
+            try { novelReloadGuard?.check?.(why); } catch {}
             try { ui?.syncPillVisibility?.(); } catch {}
-        
+            
             // If we're NOT on a chapter page, stop any sweep and hard-hide pill
             // (syncPillVisibility already hides, this is just extra safety)
             try {
@@ -3070,34 +3351,14 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
       // And re-evaluate once shortly after load (reader can mount late):
       setTimeout(() => wireHooksModeAware(), 1600);
 
-
-    // React overwrite catcher: if the active chapter root mutates after we applied,
-      // rerun full pass (debounced). This is the missing piece for single-chapter Next.
-   //   installActiveContentObserver(
-     //   () => (rootManager?.getRoot?.() || findContentRoot()),
-      //  (why) => {
-          // Only re-run if the current DOM diverges from what we recorded as applied
-       //   const root = rootManager?.getRoot?.() || findContentRoot();
-       //   if (!root || !contentReady(root)) return;
-      
-       //   const cid = getChapterId(root);
-        //  const sigNow = chapterSignature(root);
-        //  if (!cid || !sigNow) return;
-      
-        //  const applied = getAppliedSig(novelKey, cid);
-        //  if (!applied || sigNow !== applied) {
-        //    run({ forceFull: true });
-        //  }
-       // },
-     //   ui.isEnabled
-    //  );
-
       // Initial run
       requestRun("initial", { forceFull: true });
       
       // Start watchdog
+      if (!document.querySelector(".chapter-infinite-reader")) {
       startChapterMonitor();
-      
+    }
 
+    
   })();
 })();
