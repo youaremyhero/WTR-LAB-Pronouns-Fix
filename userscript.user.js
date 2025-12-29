@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.7
+// @version      1.3.8
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -661,29 +661,22 @@
     // ==========================================================
   // Chapter-page gate (NEW)
   // ==========================================================
-  function isLikelyChapterUrl() {
-    // Fast path: your chapters use /chapter-<n>
-    return /\/chapter-\d+(?:\/|$|\?)/i.test(location.href);
-  }
-
+    function isLikelyChapterUrl() {
+      // Fast path: your chapters use /chapter-<n>
+      return /\/chapter-\d+(?:\/|$|\?)/i.test(location.href);
+    }
+  
   function isChapterReadingPage() {
-    // 1) URL says it's a chapter page → true immediately
+    // 1) URL is authoritative and fast
     if (isLikelyChapterUrl()) return true;
-
-    // 2) DOM says we have a readable chapter body (single or infinite)
-    // Keep this conservative to avoid showing pill on TOC/description pages.
-    const root = rootManager?.getRoot?.() || findContentRoot();
-    if (!root) return false;
-
-    // Must look like reader content and be ready
-    if (!contentReady(root)) return false;
-
-    // Extra: require a chapter-body or active tracker somewhere near
-    const hasBody = !!(root.classList?.contains("chapter-body") || root.querySelector?.(".chapter-body") || root.closest?.(".chapter-body"));
-    const hasTracker = !!document.querySelector(".chapter-tracker.active[data-chapter-no]");
-    const hasInfinite = !!document.querySelector(".chapter-infinite-reader");
-
-    return hasBody || hasTracker || hasInfinite;
+  
+    // 2) DOM-authoritative signals (NO contentReady / scoring fallbacks)
+    // These should not exist on TOC/description pages.
+    if (document.querySelector(".chapter-infinite-reader")) return true;
+    if (document.querySelector(".chapter-body")) return true;
+    if (document.querySelector(".chapter-tracker.active[data-chapter-no]")) return true;
+  
+    return false;
   }
 
   // ==========================================================
@@ -2705,6 +2698,7 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
           if (Date.now() - startAt > NAV_SWEEP_MS) { stopNavSweep(); return; }
       
           const root = rootManager?.getRoot() || findContentRoot();
+          ui.syncPillVisibility?.();
           if (!root || root === document.body) return;
           if (!contentReady(root)) { stableHits = 0; return; }
       
@@ -2795,12 +2789,14 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
         // ==========================================================
         function installRouteWatcher({ ui, rootManager, stopNavSweep }) {
           let lastHref = location.href;
+          let syncBurstTimer = null;
         
-          const sync = (why) => {
+          const doSync = (why) => {
             try { rootManager?.resolve?.(); } catch {}
             try { ui?.syncPillVisibility?.(); } catch {}
         
-            // Optional safety: if we left chapter pages, stop any active nav sweep
+            // If we're NOT on a chapter page, stop any sweep and hard-hide pill
+            // (syncPillVisibility already hides, this is just extra safety)
             try {
               if (typeof stopNavSweep === "function" && !isChapterReadingPage()) {
                 stopNavSweep();
@@ -2808,20 +2804,30 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
             } catch {}
           };
         
-          // Back/forward
-          window.addEventListener("popstate", () => sync("popstate"), true);
+          // Run a small burst of syncs so we catch "URL changed but DOM not swapped yet"
+          const syncBurst = (why) => {
+            if (syncBurstTimer) clearTimeout(syncBurstTimer);
         
-          // Hash routes (rare here but free)
-          window.addEventListener("hashchange", () => sync("hashchange"), true);
+            // Immediate + retries
+            doSync(why + ":t0");
+            setTimeout(() => doSync(why + ":t150"), 150);
+            setTimeout(() => doSync(why + ":t400"), 400);
+            setTimeout(() => doSync(why + ":t900"), 900);
         
-          // Patch pushState/replaceState (SPA navigations)
+            // Optional: one final delayed sync
+            syncBurstTimer = setTimeout(() => doSync(why + ":t1600"), 1600);
+          };
+        
+          window.addEventListener("popstate", () => syncBurst("popstate"), true);
+          window.addEventListener("hashchange", () => syncBurst("hashchange"), true);
+        
           const _push = history.pushState;
           const _rep  = history.replaceState;
         
           function wrapped(fn, why) {
             return function () {
               const r = fn.apply(this, arguments);
-              setTimeout(() => sync(why), 0);
+              setTimeout(() => syncBurst(why), 0);
               return r;
             };
           }
@@ -2829,19 +2835,16 @@ function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = 
           history.pushState = wrapped(_push, "pushState");
           history.replaceState = wrapped(_rep, "replaceState");
         
-          // Polling fallback (catches weird edge cases)
           setInterval(() => {
             const href = location.href;
             if (href === lastHref) return;
             lastHref = href;
-            sync("href-poll");
+            syncBurst("href-poll");
           }, 250);
         
-          // Click nudge (some apps change view after click w/o immediate URL updates)
-          document.addEventListener("click", () => setTimeout(() => sync("click"), 60), true);
+          document.addEventListener("click", () => setTimeout(() => syncBurst("click"), 60), true);
         
-          // Initial sync on install
-          sync("init");
+          syncBurst("init");
         }
 
         // Keep your nav-nudge:
