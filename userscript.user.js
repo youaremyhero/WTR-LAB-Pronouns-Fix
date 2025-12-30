@@ -3052,12 +3052,28 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       if (!cid || !sigNow) return;
   
       const applied = getAppliedSig(novelKey, cid);
-  
-      if (!applied || sigNow !== applied) {
-        requestRun("monitor-force", { forceFull: true, forcedRoot: root, forcedChapterId: cid });
+      
+      // PATCH — signature drift with stable chapterId (Contents-panel nav)
+      if (applied && sigNow && sigNow !== applied) {
+        // Content changed without chapterId change → force full re-run
+        requestRun("monitor-signature-drift", {
+          forceFull: true,
+          forcedRoot: root,
+          forcedChapterId: cid
+        });
         return;
       }
-  
+      
+      // Normal first-apply case
+      if (!applied) {
+        requestRun("monitor-first-apply", {
+          forceFull: true,
+          forcedRoot: root,
+          forcedChapterId: cid
+        });
+        return;
+      }
+
       // Warmup: don't spam, only nudge occasionally
       const age = Date.now() - startedAt;
       if (age < CHAPTER_MONITOR_WARMUP_MS) {
