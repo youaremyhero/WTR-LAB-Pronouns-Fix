@@ -319,7 +319,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       if (!sL.includes(n.toLowerCase())) continue; // cheap prefilter
 
       const rx = wordBoundaryRegexCached(n);
-      if (rx && rx.test(s)) return false;
+      if (rx) {
+        rx.lastIndex = 0;
+        if (rx.test(s)) return false;
+      }
     }
   }
   return true;
@@ -559,6 +562,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     for (const n of allNames) {
       const re = wordBoundaryRegexCached(n);
       if (!re) continue;
+      re.lastIndex = 0;
     
       let m;
       while ((m = re.exec(s)) !== null) {
@@ -1040,17 +1044,30 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   // ==========================================================
 
   function detectCharactersOnPage(root, entries) {
-  const hay = normalizeWeirdSpaces(root?.innerText || "").toLowerCase();
-  const detected = [];
-  for (const [name, info] of entries) {
-    const names = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
-      .filter(Boolean)
-      .map(s => normalizeWeirdSpaces(String(s)).toLowerCase());
+    const hay = normalizeWeirdSpaces(root?.innerText || "");
+    const hayLower = hay.toLowerCase();
+    const detected = [];
+    for (const [name, info] of entries) {
+      const names = [name, ...(Array.isArray(info.aliases) ? info.aliases : [])]
+        .filter(Boolean)
+        .map(s => normalizeWeirdSpaces(String(s)));
 
-    if (names.some(n => n && hay.includes(n))) detected.push([name, info]);
+      let hit = false;
+      for (const n of names) {
+        const trimmed = (n || "").trim();
+        if (trimmed.length < 3) continue;
+        if (!hayLower.includes(trimmed.toLowerCase())) continue;
+
+        const rx = wordBoundaryRegexCached(trimmed);
+        if (!rx) continue;
+        rx.lastIndex = 0;
+        if (rx.test(hay)) { hit = true; break; }
+      }
+
+      if (hit) detected.push([name, info]);
+    }
+    return detected;
   }
-  return detected;
-}
 
 
   // ==========================================================
@@ -1066,10 +1083,20 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   // ==========================================================
   // Reliable glossary loader (+ cache)
   // ==========================================================
+  function glossaryCacheKeys(url) {
+    const h = hash32(String(url || ""));
+    return {
+      dataKey: `${GLOSSARY_CACHE_KEY}:${h}`,
+      tsKey: `${GLOSSARY_CACHE_TS}:${h}`,
+    };
+  }
+
   function loadGlossaryJSON(url) {
     return new Promise((resolve, reject) => {
-      const cached = localStorage.getItem(GLOSSARY_CACHE_KEY);
-      const cachedTs = Number(localStorage.getItem(GLOSSARY_CACHE_TS) || "0");
+      const { dataKey, tsKey } = glossaryCacheKeys(url);
+
+      const cached = localStorage.getItem(dataKey);
+      const cachedTs = Number(localStorage.getItem(tsKey) || "0");
       const cacheFresh = cached && cachedTs && (Date.now() - cachedTs) <= GLOSSARY_CACHE_TTL_MS;
 
       const useCache = () => {
@@ -1091,8 +1118,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
                 if (cached) return useCache();
                 return reject(new Error("Glossary error"));
               }
-              localStorage.setItem(GLOSSARY_CACHE_KEY, r.responseText);
-              localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
+              localStorage.setItem(dataKey, r.responseText);
+              localStorage.setItem(tsKey, String(Date.now()));
               resolve(JSON.parse(r.responseText));
             } catch {
               if (cached) return useCache();
@@ -1111,8 +1138,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         .then(async (res) => {
           const txt = await res.text();
           if (!res.ok) throw new Error("Glossary error");
-          localStorage.setItem(GLOSSARY_CACHE_KEY, txt);
-          localStorage.setItem(GLOSSARY_CACHE_TS, String(Date.now()));
+          localStorage.setItem(dataKey, txt);
+          localStorage.setItem(tsKey, String(Date.now()));
           return JSON.parse(txt);
         })
         .then(resolve)
@@ -2420,7 +2447,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   
       for (const n of all) {
         const rx = wordBoundaryRegexCached(n);
-        if (rx && rx.test(t)) return g;
+        if (rx) {
+          rx.lastIndex = 0;
+          if (rx.test(t)) return g;
+        }
       }
     }
   
