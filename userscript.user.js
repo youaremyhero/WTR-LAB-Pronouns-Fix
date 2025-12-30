@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.15
+// @version      1.3.16
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -3210,6 +3210,30 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
           preNavCid = root0 ? getChapterId(root0) : "";
           preNavSig = root0 ? chapterSignature(root0) : "";
           navEpoch++;
+
+          /* ==========================================================
+           PATCH — targeted marker reset for TOC / tracker nav
+           Purpose:
+           - Handle React DOM reuse where chapter content changes
+             but the root element stays the same.
+           - Prevent deadlock where blocks remain marked patched
+             and run() exits early.
+           ========================================================== */
+          try {
+            const rootNow = rootManager?.getRoot?.() || findContentRoot();
+            if (rootNow && rootNow.dataset) {
+              // Clear root-level markers
+              delete rootNow.dataset.wtrpfPatchedChapter;
+              delete rootNow.dataset.wtrpfSwept;
+              delete rootNow.dataset.wtrpfQueued;
+          
+              // Clear block-level markers
+              const blocks = rootNow.querySelectorAll("p, blockquote, li");
+              blocks.forEach(b => {
+                if (b?.dataset?.wtrpfPatched) delete b.dataset.wtrpfPatched;
+              });
+            }
+          } catch {}
         
           rootManager.resolve();
           
