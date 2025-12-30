@@ -2578,7 +2578,27 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       const now = Date.now();
       if (!forceFull && (now - lastRunAt < SELF_MUTATION_COOLDOWN_MS)) return;
     
-      const root = forcedRoot || (rootManager?.getRoot?.() || findContentRoot());
+      let root = forcedRoot || (rootManager?.getRoot?.() || findContentRoot());
+
+      // PATCH D — infinite reader active body binding
+      if (!forcedRoot && document.querySelector(".chapter-infinite-reader")) {
+        const activeTracker =
+          document.querySelector(".chapter-tracker.active[data-chapter-no]");
+        const no = activeTracker?.getAttribute?.("data-chapter-no");
+      
+        if (no && /^\d+$/.test(no)) {
+          const body =
+            document.querySelector(`#chapter-${no} .chapter-body`) ||
+            document.querySelector(`#tracker-${no} .chapter-body`) ||
+            activeTracker.closest?.(
+              ".chapter, article, section, main"
+            )?.querySelector?.(".chapter-body") ||
+            null;
+      
+          if (body) root = body;
+        }
+      }
+
       if (!root) return;
     
       // If this run is targeting an infinite body, clear its queued marker
