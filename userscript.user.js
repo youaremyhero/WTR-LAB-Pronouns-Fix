@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.16
+// @version      1.3.17
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -16,9 +16,38 @@
   "use strict";
   if (!location.hostname.endsWith("wtr-lab.com")) return;
 
-  // ==========================================================
-  // USER SETTINGS
-  // ==========================================================
+    /* ==========================================================
+     CONTRACT (Global)
+     - No background polling that mutates content outside chapter-reading pages.
+     - All mutations flow through requestRun() → run() single-flight funnel.
+     - Infinite reader: per-body forced runs + sweepInfiniteBodies() own correctness.
+     ========================================================== */
+
+  /* ==========================================================
+   MAP (Search tokens)
+   - @CFG   Settings / constants
+   - @KEYS  Storage keys
+   - @GATE  Page gating / chapter detection
+   - @ROOT  Root resolution / root observers
+   - @NAV   Navigation detection (Next/TOC/history/url)
+   - @SCHED Scheduler (requestRun/drainPendingForced)
+   - @RUN   Mutation pipeline (run/apply/markers/signatures)
+   - @INF   Infinite reader sweep/per-body runs
+   - @UI    UI / pill / onboarding
+   - @GLOSS Glossary loader/cache/pickKey
+   - @TERM  Term memory / pinned replacement
+   - @GENDER Gender inference / carry / heuristics
+   - @PRON  Pronoun replacement (smart/sentence-scoped)
+   ========================================================== */
+
+  // Enables verbose lifecycle logging.
+  // Do NOT gate error or glossary-failure logs behind DEBUG.
+  const DEBUG = false;
+
+/* =========================
+   @CFG USER SETTINGS
+   ========================= */
+
   const GLOSSARY_URL =
     "https://raw.githubusercontent.com/youaremyhero/WTR-LAB-Pronouns-Fix/main/glossary.template.json"; // duplicate this file to your Github repo and change the link
 
@@ -57,9 +86,10 @@
   const POST_SWEEP_DELAYS = [150, 450, 900, 1600, 2600];
   const APPLIED_SIG_KEY_PREFIX = "wtrpf_applied_sig_v1:"; // per novelKey
 
-  // ==========================================================
-  // Utilities
-  // ==========================================================
+/* =========================
+   @UTIL UTILITIES
+   ========================= */
+
   const SENT_PREFIX = String.raw`(^|[\r\n]+|[.!?…]\s+)(["'“‘(\[]\s*)?`;
   const LETTER = String.raw`\p{L}`;
 
@@ -110,7 +140,7 @@
     let m;
 
     while ((m = rx.exec(text)) && out.length < max) {
-      // Your wordBoundaryRegex structure is:
+      // WordBoundaryRegex structure is:
       //  (1) left boundary group, (2) the actual phrase
       const left = m[1] || "";
       const phrase = m[2] || m[0] || "";
@@ -120,7 +150,9 @@
 
     return out;
   }
-  
+
+// CONTRACT (scoreGenderInText)
+// @GENDER Weighted scoring of name + pronoun proximity
   function scoreGenderInText(text, entries) {
     const s = normalizeWeirdSpaces(String(text || ""));
     const sL = s.toLowerCase();
@@ -213,7 +245,7 @@
     const best = candidates[0];
     const second = candidates[1];
   
-    // Require separation so we don’t flip-flop in mixed paragraphs
+    // Require separation so pronouns don’t flip-flop in mixed paragraphs
     if (second && (best.score - second.score) < 4) return null;
   
     // Require minimum confidence
@@ -278,7 +310,9 @@
       return true;
     }
   }
-  
+
+// CONTRACT (replacePronounsSentenceScoped)
+// @PRON Sentence-scoped replacement for mixed paragraphs
   function replacePronounsSentenceScoped(text, gender) {
     const dir = (gender === "female") ? "toFemale" : "toMale";
     const parts = splitIntoSentencesLoose(text);
@@ -298,6 +332,8 @@
 /* =========================
   Carry guard: block carry when opposite-gender character appears early
   (word-boundary aware + skip tiny aliases)
+// CONTRACT (carryGuardAllows)
+// @GENDER Carry-heuristic safety guard (prevents cross-character bleed)
  ========================= */
 function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   const s = normalizeWeirdSpaces(String(text || "")).slice(0, limit);
@@ -328,13 +364,17 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   return true;
 }
 
+// CONTRACT (getUrlChapterId)
+// @CID Chapter ID from URL (fast, authoritative)
   function getUrlChapterId() {
     const m = location.href.match(/\/chapter-(\d+)(?:\/|$|\?)/i);
     return m ? `chapter-${m[1]}` : "unknown";
   }
 
+// CONTRACT (getDomChapterId)
+// @CID Chapter ID from DOM (tracker-based, infinite-safe)
   function getDomChapterId(root) {
-    // Preferred: tracker element (your screenshot confirms this exists)
+    // Preferred: tracker element
     const tracker =
       document.querySelector(".chapter-tracker.active[data-chapter-no]") ||
       root?.closest?.(".chapter-infinite-reader")?.querySelector?.(".chapter-tracker.active[data-chapter-no]") ||
@@ -357,7 +397,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     const m2 = hid.match(/chapter-(\d+)/i);
     if (m2) return `chapter-${m2[1]}`;
   
-    // Legacy fallback (your old approach) — keep last
+    // Legacy fallback — keep last
     const el = root?.closest?.("[data-chapter-id]") || root?.querySelector?.("[data-chapter-id]");
     const id = el?.getAttribute?.("data-chapter-id");
     if (id) return id;
@@ -365,7 +405,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return "unknown";
   }
 
-  // cheap 32-bit hash (fast enough for innerText)
+// CONTRACT (hash32)
+// @SIG Cheap deterministic hash for sampled content (fast enough for innerText)
   function hash32(str) {
     let h = 5381;
     for (let i = 0; i < str.length; i++) {
@@ -374,9 +415,12 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return (h >>> 0).toString(16);
   }
 
-      /* =========================
-       A) NEW: Fast sampled text + signature
-       ========================= */
+  /* =========================
+     A) Fast sampled text + signature
+     Notes:
+     - Called from run(), nav sweep, monitor, and infinite sweeper.
+     - Keep it cheap; avoid full-root innerText hashing.
+     ========================= */
     
     function getSampledText(root, { head = 6, tail = 2 } = {}) {
       if (!root) return "";
@@ -406,7 +450,9 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       return { blocksCount: blocks.length, totalLen };
     }
 
-    // REPLACED chapterSignature(root) with this cheaper version
+
+// CONTRACT (chapterSignature)
+// @SIG Chapter signature (blocks + length + sampled hash)
   function chapterSignature(root, forcedCid = null) {
     if (!root) return "";
     const cid = forcedCid || getChapterId(root) || "unknown";
@@ -440,9 +486,11 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   }
 
 
-  // ==========================================================
-  // Pronoun replacement
-  // ==========================================================
+/* =========================
+   PRONOUN REPLACEMENT
+   ========================= */
+// CONTRACT (replacePronounsSmart)
+// @PRON Core pronoun replacement engine (case-aware, possessive-safe)
   function replacePronounsSmart(text, direction) {
     text = normalizeWeirdSpaces(text);
     const original = text;
@@ -500,9 +548,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return maleCount > 0;
   }
 
-  // ==========================================================
-  // Anchored fixes (kept from your base)
-  // ==========================================================
+/* =========================
+   ANCHORED FIXES
+   ========================= */
+
   function getSentenceEndIndex(s, start, maxExtra = 320) {
     const limit = Math.min(s.length, start + maxExtra);
     for (let i = start; i < limit; i++) {
@@ -597,7 +646,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
           s = s.slice(0, start) + out.text + s.slice(end);
           changed += Math.max(1, out.changed);
     
-          // IMPORTANT: re-sync lastIndex so we don't loop forever or skip
+          // IMPORTANT: re-sync lastIndex to prevent loop forever or skip
           re.lastIndex = start + out.text.length;
         }
       }
@@ -608,9 +657,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return { text: s, changed };
   }
 
-  // ==========================================================
-  // Term memory + patches (unchanged)
-  // ==========================================================
+/* =========================
+   TERM MEMORY
+   ========================= */
+
   function getNovelKeyFromURL() {
     const m = location.href.match(/wtr-lab\.com\/en\/novel\/(\d+)\//i);
     return m ? `wtr-lab.com/en/novel/${m[1]}/` : "wtr-lab.com/en/novel/";
@@ -645,6 +695,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return { check };
   }
 
+// CONTRACT (getChapterId)
+// @CID Unified chapter ID resolver (DOM → URL fallback)
   function getChapterId(root) {
   const domCid = getDomChapterId(root);
   if (domCid && domCid !== "unknown") return domCid;
@@ -672,7 +724,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     } catch {}
     localStorage.setItem(termMemKey(novelKey), JSON.stringify(mem || {}));
   }
-
+  // CONTRACT (applyTermPatches)
+  // @TERM Apply pinned / preferred term replacements
   function applyTermPatches(root, cfgTerms, mem, opts) {
     const enforcePlainText = !!opts?.enforcePinnedTermsOnPlainText;
     const map = Object.assign({}, cfgTerms || {}, mem || {});
@@ -737,15 +790,17 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return changed;
   }
 
-  // ==========================================================
-  // Draft helpers (PER-NOVEL)
-  // ==========================================================
+/* =========================
+   DRAFT HELPERS (PER-NOVEL)
+   ========================= */
+
   function draftKeyFor(novelKey) {
     // novelKey is like "wtr-lab.com/en/novel/14370/"
     const nk = novelKey || getNovelKeyFromURL();
     return DRAFT_KEY_PREFIX + nk;
   }
-  
+  // CONTRACT (loadDraft)
+  // @TERM Load per-novel draft
   function loadDraft(novelKey) {
     try {
       return JSON.parse(localStorage.getItem(draftKeyFor(novelKey)) || '{"items":[],"snippet":""}');
@@ -753,7 +808,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       return { items: [], snippet: "" };
     }
   }
-  
+  // CONTRACT (saveDraft)
+  // @TERM Persist per-novel draft
   function saveDraft(novelKey, d) {
     localStorage.setItem(draftKeyFor(novelKey), JSON.stringify(d || { items: [], snippet: "" }));
   }
@@ -765,10 +821,18 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return `"${name}": ${inner},`;
   }
 
-  // ==========================================================
-  // Content targeting
-  // ==========================================================
-    function findContentRoot() {
+/* =========================
+   CONTENT TARGETING
+   ========================= */
+// CONTRACT (findContentRoot)
+// @ROOT Resolve correct chapter body (single + infinite)
+  function findContentRoot() {
+
+// IMPORTANT:
+// - This function is primarily for single-chapter pages and initial bootstrapping.
+// - In infinite reader mode, run() (Patch D/E) and sweepInfiniteBodies() own the
+//   correctness of which chapter-body to patch.
+// - Avoid adding more infinite-mode heuristics here to prevent logic drift.
 
     // Guard: never resolve a root on TOC/description/non-chapter pages
     if (!isChapterReadingPage()) return null;
@@ -833,17 +897,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       const likely = document.querySelector("[data-chapter-id]")?.closest?.(".chapter-body, .chapter, main, article");
       if (likely) return likely;
     
-      const candidates = Array.from(document.querySelectorAll(
-        "article, main, .content, .chapter, .chapter-content, .reader, .novel, .novel-content, section"
-      ));
-      let best = null, bestScore = 0;
-      for (const el of candidates) {
-        const pCount = el.querySelectorAll("p").length;
-        const textLen = (el.innerText || "").trim().length;
-        const score = (pCount * 1200) + textLen;
-        if (score > bestScore && textLen > 300) { bestScore = score; best = el; }
-      }
-      return best || null;
+      return null;
     }
 
   const SKIP_CLOSEST = [
@@ -859,6 +913,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return !!(el && el.closest && el.closest(SKIP_CLOSEST));
   }
 
+// CONTRACT (getTextBlocks)
+// @ROOT Extract patchable text blocks
   function getTextBlocks(root) {
     const blocks = Array.from(root.querySelectorAll("p, blockquote, li"));
     return blocks.filter(b => {
@@ -868,24 +924,29 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     });
   }
 
+// CONTRACT (contentReady)
+// @ROOT Content readiness gate (prevents premature runs)
   function contentReady(root) {
     if (!root) return false;
     const blocks = getTextBlocks(root);
     const textLen = (root.innerText || "").trim().length;
     return (blocks.length >= 2 && textLen >= 200);
   }
-
+// CONTRACT (getInfiniteHost)
+// @INF Locate infinite reader host
   function getInfiniteHost() {
   return document.querySelector(".chapter-infinite-reader") || null;
 }
-
+// CONTRACT (getAllChapterBodiesInInfinite)
+// @INF Enumerate chapter bodies in infinite reader
   function getAllChapterBodiesInInfinite() {
     const host = getInfiniteHost();
     if (!host) return [];
     return Array.from(host.querySelectorAll(".chapter-body"))
       .filter(b => (b.innerText || "").trim().length > 200);
   }
-  
+  // CONTRACT (getChapterIdForBody)
+// @INF Resolve chapterId for a specific infinite body
   function getChapterIdForBody(body) {
     const container =
       body.closest?.(".chapter, .chapter-infinite-reader, article, section, main") || body;
@@ -912,7 +973,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   }
 
   // SWEEPER HELPERS 
-  // Mark bodies we’ve already fully handled (separate from your per-block markers)
+  // Mark bodies already fully handled (separate from per-block markers)
   function bodyIsSwept(body) {
     return body?.dataset?.wtrpfSwept === "1";
   }
@@ -920,7 +981,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     if (body?.dataset) body.dataset.wtrpfSwept = "1";
   }
 
-    // Mark bodies we have queued for a run (prevents re-queue spam)
+    // Mark bodies queued for a run (prevents re-queue spam)
   function bodyIsQueued(body) {
     return body?.dataset?.wtrpfQueued === "1";
   }
@@ -931,11 +992,12 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     if (body?.dataset) delete body.dataset.wtrpfQueued;
   }
 
-    // ==========================================================
-  // Chapter-page gate (NEW)
-  // ==========================================================
+/* =========================
+   CHAPTER PAGE GATE
+   ========================= */
+
     function isLikelyChapterUrl() {
-      // Fast path: your chapters use /chapter-<n>
+      // Fast path: chapters use /chapter-<n>
       return /\/chapter-\d+(?:\/|$|\?)/i.test(location.href);
     }
   
@@ -952,10 +1014,17 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return false;
   }
 
-  // ==========================================================
-  // Root Observer Manager (NEW)
-  // ==========================================================
+/* =========================
+   ROOT OBSERVER MANAGER
+   ========================= */
+// CONTRACT (createRootObserverManager)
+// @ROOT Tracks active chapter root across SPA remounts
   function createRootObserverManager(onRootChange) {
+    /* CONTRACT (RootObserverManager)
+       - Track a single "currentRoot" for single-reader mode.
+       - Re-resolve if the root is detached or explicitly removed.
+       - Never calls run() directly; navigation layer decides when to patch.
+     */
     let currentRoot = null;
     let rootObserver = null;
   
@@ -992,7 +1061,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         for (const m of muts) {
           if (m.type !== "childList") continue;
       
-          // Keep your original strict check too (still useful when it does happen)
+          // Keep original strict check
           if (Array.from(m.removedNodes || []).includes(currentRoot)) {
             resolve();
             return;
@@ -1030,18 +1099,20 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     };
   }
 
-  // ==========================================================
-  // Root manager instance (ADD THIS)
-  // ==========================================================
+/* =========================
+   ROOT MANAGER INSTANCE
+   ========================= */
+
   const rootManager = createRootObserverManager((newRoot) => {
     console.log("[WTRPF] Root changed:", newRoot);
     try { window.__wtrpf_ui?.syncPillVisibility?.(); } catch {}
     // Do NOT auto-run here; nav sweep controls execution
   });
 
-  // ==========================================================
-  // Character detection
-  // ==========================================================
+/* =========================
+   CHARACTER DETECTION
+   ========================= */
+
 
   function detectCharactersOnPage(root, entries) {
     const hay = normalizeWeirdSpaces(root?.innerText || "");
@@ -1069,10 +1140,11 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return detected;
   }
 
-
-  // ==========================================================
-  // Glossary helpers
-  // ==========================================================
+ /* =========================
+   GLOSSARY HELPERS
+   ========================= */
+// CONTRACT (pickKey)
+// @GLOSS Select glossary block by URL
   function pickKey(glossary) {
     const url = location.href;
     const keys = Object.keys(glossary || {}).filter(k => k !== "default");
@@ -1080,9 +1152,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return matches[0] || "default";
   }
 
-  // ==========================================================
-  // Reliable glossary loader (+ cache)
-  // ==========================================================
+/* =========================
+   RELIABLE GLOSSARY LOADER (+ CACHE)
+   ========================= */
+
   function glossaryCacheKeys(url) {
     const h = hash32(String(url || ""));
     return {
@@ -1090,8 +1163,14 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       tsKey: `${GLOSSARY_CACHE_TS}:${h}`,
     };
   }
-
+  // CONTRACT (loadGlossaryJSON)
+ // @GLOSS Cached glossary loader with fallback
   function loadGlossaryJSON(url) {
+    /* CONTRACT (Glossary loader)
+       - Prefer cached JSON when fresh; fall back to cached JSON on fetch errors.
+       - Never throw raw network errors (normalize to "Glossary error").
+       - Cache is keyed by URL hash to avoid collisions across forks/branches.
+     */
     return new Promise((resolve, reject) => {
       const { dataKey, tsKey } = glossaryCacheKeys(url);
 
@@ -1150,9 +1229,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     });
   }
 
-  // ==========================================================
-  // Node replacement counting
-  // ==========================================================
+/* =========================
+   NODE REPLACEMENT COUNTING
+   ========================= */
+
   function replaceInTextNodes(blockEl, fnReplace) {
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
@@ -1190,9 +1270,11 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return changed;
   }
 
-  // ==========================================================
-  // UI (same behavior as your requirements)
-  // ==========================================================
+/* =========================
+   UI DESIGN
+   ========================= */
+// CONTRACT (makeUI)
+// @UI Build pill + panel UI (stateful)
       function makeUI({ novelKey }) {
         let savedPos = {};
         try { savedPos = JSON.parse(localStorage.getItem(UI_KEY_POS) || "{}"); }
@@ -1839,6 +1921,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   // ==========================================================
   // Add popup (small + X + Male/Female only)
   // - FIX: add touch long-press fallback (Firefox Android)
+  // CONTRACT (installAddPopup)
+// @UI Long-press character popup (desktop + touch)
   // ==========================================================
   function installAddPopup({ ui, novelKey }) {
     const popup = document.createElement("div");
@@ -2024,7 +2108,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       tStartX = touch.clientX;
       tStartY = touch.clientY;
     
-      // Important: passive:false so we *can* preventDefault when the long-press triggers
+      // Important: passive:false to preventDefault when the long-press triggers
       tTimer = setTimeout(() => {
         const txt = (tSpan?.textContent || "").trim();
         if (!txt) return;
@@ -2045,7 +2129,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     }, { capture: true, passive: true });
     
     document.addEventListener("touchend", (e) => {
-      // If we triggered long-press, block the "ghost" click/select aftermath.
+      // If triggered long-press, block the "ghost" click/select aftermath.
       if (tTriggered) {
         try { e.preventDefault(); } catch {}
         try { e.stopPropagation(); } catch {}
@@ -2081,9 +2165,11 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     return { hide };
   }
 
-  // ==========================================================
-  // Navigation hooks
-  // ==========================================================
+/* =========================
+//   @NAV NAVIGATION HOOKS
+   ========================= */
+// CONTRACT (installNextButtonHook)
+// @NAV Detect Next navigation clicks
     function installNextButtonHook(onNav) {
       document.addEventListener("click", (e) => {
         const t = e.target;
@@ -2172,7 +2258,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       }
     };
   }
-
+      // CONTRACT (installChapterTrackerObserver)
+      // @NAV Observe active tracker changes (infinite & single)
       function installChapterTrackerObserver(onNav, isEnabled) {
       let lastCid = null;
       let mo = null;
@@ -2306,7 +2393,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     
       return { disconnect: () => { if (mo) { try { mo.disconnect(); } catch {} } } };
     }
-
+// CONTRACT (installTocClickHook)
+// @NAV Detect TOC chapter jumps
     function installTocClickHook(onNav) {
     document.addEventListener("click", (e) => {
       const a = e.target?.closest?.("a[href]") || null;
@@ -2325,9 +2413,10 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     }, true);
   }
 
-    // ==========================================================
-    // Main
-    // ==========================================================
+/* =========================
+   MAIN
+   ========================= */
+
     (async () => {
       // 1) Load glossary (cached loader already handles fallback)
       let glossary;
@@ -2420,6 +2509,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       st.lastByChapter[chapterId] = val;
     }
 
+ // CONTRACT (computeGenderForText)
+// @GENDER Main gender resolution pipeline (force → primary → dialogue → score → fallback)     
   function computeGenderForText(text) {
     if (forceGender === "male" || forceGender === "female") return forceGender;
   
@@ -2565,10 +2656,18 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         });
       } catch {}
     }
+
+    // RUN FUNCTION  
     
     function run({ forceFull = false, forcedRoot = null, forcedChapterId = null } = {}) {
-      console.log("[WTRPF] run() enter forceFull=", forceFull, "href=", location.href);
-    
+        /* CONTRACT @RUN (run)
+       - Single-flight: if running, drop (scheduler re-queues when needed).
+       - Never patch when document.hidden or feature toggle OFF.
+       - Never silently "miss" a nav: if root not ready, requestRun retry.
+       - forcedRoot/forcedChapterId must be treated as authoritative targets.
+       */
+      DEBUG && console.log("[WTRPF] run() enter forceFull=", forceFull, "href=", location.href);
+
       if (!ui.isEnabled()) return;
       if (document.hidden) return;
     
@@ -2599,7 +2698,35 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         }
       }
 
-      if (!root) return;
+      // PATCH E — fallback to most-visible chapter body (tracker lag hardening)
+        if (!forcedRoot && document.querySelector(".chapter-infinite-reader")) {
+          if (!root || !root.classList?.contains("chapter-body")) {
+            const bodies = Array.from(
+              document.querySelectorAll(".chapter-infinite-reader .chapter-body")
+            );
+        
+            let best = null;
+            let bestScore = 0;
+        
+            for (const b of bodies) {
+              const r = b.getBoundingClientRect();
+              if (r.bottom <= 0 || r.top >= window.innerHeight) continue;
+        
+              const visible =
+                Math.min(r.bottom, window.innerHeight) -
+                Math.max(r.top, 0);
+        
+              if (visible > bestScore) {
+                bestScore = visible;
+                best = b;
+              }
+            }
+        
+            if (best) root = best;
+          }
+        }
+
+     if (!root) return;
     
       // If this run is targeting an infinite body, clear its queued marker
       if (root?.dataset?.wtrpfQueued === "1") {
@@ -2634,9 +2761,6 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     
         // Non-force: give the DOM a moment to catch up
         if (!forceFull && (Date.now() - run._domGraceStart < DOM_GRACE_MS)) return;
-    
-        // forceFull still must not patch old content
-        if (!contentReady(root)) return;
     
         // Compare signatures with matching chapterIds (avoid domCid sig vs urlCid applied)
         const sigDom = (domCid && domCid !== "unknown") ? chapterSignature(root, domCid) : "";
@@ -2706,7 +2830,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
           delete root.dataset.wtrpfQueued;
         }
     
-        // UI: show last known count for this chapter until we compute a new one
+        // UI: show last known count for this chapter until compute a new one
         const st0 = loadChapterState();
         const lastChanged = getChapterLastChanged(st0, chapterId);
         ui.setChanged(lastChanged > 0 ? lastChanged : 0);
@@ -2859,12 +2983,12 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         lastRunAt = Date.now();
       }
     
-      // If a forced body was queued while we were busy, schedule it (through requestRun)
+      // If a forced body was queued while busy, schedule it (through requestRun)
       try { drainPendingForced(); } catch {}
     }
 
   /* =========================
-   C) Single debounced scheduler (upgrade #1) — hardened
+   C) Single debounced scheduler
    ========================= */
   const RUN_DEBOUNCE_MS = 140;
   const RUN_TIMER_MAX_WAIT_MS = 2000; // failsafe: never get "stuck" longer than this
@@ -2872,13 +2996,16 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   let _runTimer = null;
   let _runTimerSetAt = 0;
   let _pendingRun = null; // { forceFull, forcedRoot, forcedChapterId, reason, ts, allowOffChapter }
-  
-  /**
-   * Coalesce triggers into a single run() call.
-   * - "Latest wins" for reason/root/chapterId
-   * - forceFull is sticky
-   */
+
+// CONTRACT (requestRun)
+// @SCHED Debounced run scheduler (sticky forceFull)
   function requestRun(reason, opts = {}) {
+        /* CONTRACT (requestRun)
+      - The ONLY public entrypoint for scheduling mutations.
+       - Coalesces triggers; latest wins for root/chapterId; forceFull is sticky.
+       - Off-chapter pages are gated unless forcedRoot or allowOffChapter is true.
+       - Must not recurse unbounded (RUN_TIMER_MAX_WAIT_MS failsafe).
+     */
     if (!ui.isEnabled() || document.hidden) return;
   
     const forcedRoot = opts.forcedRoot || null;
@@ -2910,7 +3037,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     }
     _pendingRun = req;
   
-    // If we already have a timer, ensure it can't get stuck forever
+    // If already have a timer, ensure it can't get stuck forever
     if (_runTimer) {
       if (_runTimerSetAt && (Date.now() - _runTimerSetAt) > RUN_TIMER_MAX_WAIT_MS) {
         clearTimeout(_runTimer);
@@ -2953,11 +3080,18 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
   }
   
   /* ==========================================================
+     // CONTRACT (drainPendingForced)
+     // @SCHED Retry queued forced infinite runs
      drainPendingForced() — hardened
      - safe retries when DOM isn't ready yet
      - doesn't lose work if _pendingForced is overwritten mid-check
      ========================================================== */
   function drainPendingForced() {
+        /* CONTRACT (drainPendingForced)
+       - Single pending forced body only (_pendingForced).
+      - If body not ready yet, retry via requestRun up to a small cap.
+      - Must not stomp a newer _pendingForced snapshot.
+        */
     if (!_pendingForced || running) return;
   
     const snap = _pendingForced; // snapshot for race safety
@@ -2969,7 +3103,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     // If not ready yet, retry a few times via scheduler
     snap.tries = (snap.tries || 0) + 1;
   
-    // If _pendingForced changed while we were working, don't stomp it
+    // If _pendingForced changed while working, don't stomp it
     if (_pendingForced !== snap) return;
   
     if (!contentReady(root)) {
@@ -2985,15 +3119,26 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
 
 /* ==========================================================
    REWRITE 1: sweepInfiniteBodies()
-   - Fix: don’t mark swept unless we actually applied / stabilized
+   - Fix: don’t mark swept unless actually applied / stabilized
    - Fix: avoid forcedRoot globals; pass forcedRoot/forcedChapterId into run()
    - Fix: don’t lose a chapter if run is busy; queue for later
    ========================================================== */
   // SINGLE shared pending forced run
   // Used by sweepInfiniteBodies() + drainPendingForced()
   let _pendingForced = null; // { root, cid, tries }
-  
+
+  // IMPORTANT:
+  // _pendingForced is the ONLY cross-run bridge for infinite-reader bodies.
+  // Do NOT convert this into a queue/array without redesigning drainPendingForced(),
+  // its retry behavior, and how "queued" markers are managed.
+
   function sweepInfiniteBodies() {
+        /* CONTRACT @INF (sweepInfiniteBodies)
+       - Never marks swept unless the body's signature matches applied signature.
+       - Never calls run() directly; schedules forced runs via requestRun.
+       - Uses body queued marker to avoid spamming and to preserve work while running.
+       - Maintains ONLY one cross-run pending forced body (_pendingForced).
+     */
       const host = document.querySelector(".chapter-infinite-reader");
       if (!host) return;
     
@@ -3043,11 +3188,11 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         });
       }
     }
-
+// CONTRACT (startChapterMonitor)
+// @RUN Watchdog for silent DOM overwrites / signature drift
     function startChapterMonitor() {
     let startedAt = Date.now();
   
-    // track nav resets if you want (optional): call this in onNav()
     // startedAt = Date.now();
   
     let timer = null;
@@ -3124,7 +3269,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     startChapterMonitor.resetWarmup = () => { startedAt = Date.now(); };
   }
 
-      // Nav sweep (A) — hardened so we ONLY apply once URL+DOM agree AND content is ready
+  // CONTRACT (startNavSweep)
+  // @NAV Poll until URL + DOM stabilize, then requestRun
       function startNavSweep(reason = "nav", epoch = navEpoch) {
       stopNavSweep();
     
@@ -3161,7 +3307,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     
         // Choose CID safely:
         // 1) strict agree
-        // 2) fallback prefers DOM-derived cid (root-bound), because root is what we will patch
+        // 2) fallback prefers DOM-derived cid (root-bound), because root is what will patch
         let cid = null;
     
         if (urlCid !== "unknown" && domCid !== "unknown" && urlCid === domCid) {
@@ -3179,7 +3325,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         const sigNow = chapterSignature(root, cid);
         if (!sigNow) { stableHits = 0; return; }
     
-        // Ensure we don't stabilize on "old chapter" before swap.
+        // Ensure don't stabilize on "old chapter" before swap.
         if (!sawNewContent) {
           if (sigNow !== preNavSig || cid !== preNavCid) {
             sawNewContent = true;
@@ -3222,7 +3368,9 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
 
       let _onNavLastAt = 0;
       let _onNavLastWhy = "";
-   
+
+      // CONTRACT (onNav)
+    // @NAV Unified navigation handler (Next / TOC / tracker / URL)
         const onNav = (why) => {
           const now = Date.now();
           if (now - _onNavLastAt < 250) return; // throttle bursts
@@ -3310,10 +3458,17 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
 
         // ==========================================================
         // Route watcher: hide pill immediately when leaving chapter pages (SPA-safe)
-        // - Calls syncPillVisibility() right away on ANY route change
-        // - Does NOT call run() or onNav() (so it's cheap / safe)
         // ==========================================================
-        function installRouteWatcher({ ui, rootManager, stopNavSweep }) {
+      // CONTRACT (installRouteWatcher)
+      // @GATE Hide pill + resolve root on route changes  
+      function installRouteWatcher({ ui, rootManager, stopNavSweep }) {
+        /* CONTRACT (installRouteWatcher)
+           - Sync pill visibility ASAP on any route change (SPA-safe).
+           - Must NOT trigger run() directly; should be cheap.
+           - Stops nav sweep when leaving chapter pages.
+           - Intentionally does not restore history.* wrappers (script lifetime ownership).
+         */
+          
           let lastHref = location.href;
           let syncBurstTimer = null;
         
@@ -3331,7 +3486,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
             } catch {}
           };
         
-          // Run a small burst of syncs so we catch "URL changed but DOM not swapped yet"
+          // Run a small burst of syncs to catch "URL changed but DOM not swapped yet"
           const syncBurst = (why) => {
             if (syncBurstTimer) clearTimeout(syncBurstTimer);
         
@@ -3376,24 +3531,23 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         return {
           disconnect() {
             try { clearInterval(hrefPollTimer); } catch {}
-            // (We don’t unpatch history.* here—keeping it simple + safe.)
+            // (Don’t unpatch history.* here—keeping it simple + safe.)
           }
         };
         }
 
-        // Keep your nav-nudge:
+        // Keep nav-nudge:
         setTimeout(() => startNavSweep("nav-nudge"), 900);
       
       /* =========================
-         F) Mode-aware wiring (upgrade #4)
-         Replace your hook install section with this.
-         (Keeps your hooks but avoids redundant observers per mode.)
+         F) Mode-aware wiring
+         (Keeps hooks but avoids redundant observers per mode.)
          ========================= */
 
     let _hooksWired = false;
     let _hookMode = null; // "infinite" or "single"
     
-    // Keep track of disconnectors so we can cleanly switch modes
+    // Keep track of disconnectors to cleanly switch modes
     const _hookDisposers = new Set();
     function _trackDisposer(d) {
       if (!d) return;
@@ -3411,11 +3565,23 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       return !!document.querySelector(".chapter-infinite-reader");
     }
 
+      // ===== DO NOT SIMPLIFY =====
+      // Contract @NAV (wireHooksModeAware):
+      // - Always-on hooks are installed once.
+      // - Mode-specific observers are disposable and must be re-armed on mode flip.
+      // ==========================
+   
     function wireHooksModeAware() {
       const infinite = isInfiniteModeNow();
       const mode = infinite ? "infinite" : "single";
+
+          /* CONTRACT (wireHooksModeAware)
+       - Always-on hooks are installed once (click/history/tracker/toc).
+       - Mode-specific observers are disposable and MUST be swapped on mode flip.
+       - Must never double-install interval/observer hooks (leaks + duplicate nav events).
+       */
     
-    // If we already installed hooks, DO NOT install again.
+    // If already installed hooks, DO NOT install again.
     // But if mode changed, dispose mode-specific observers and re-arm the right set.
     if (_hooksWired) {
       if (_hookMode !== mode) {
@@ -3429,7 +3595,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         ui.syncPillVisibility?.();
 
         // Re-arm mode-specific observers for the new mode
-        // (We intentionally do NOT re-install the always-on click/history/tracker hooks.)
+        // (Intentionally do NOT re-install the always-on click/history/tracker hooks.)
         if (mode === "single") {
           // URL watcher mainly for single-chapter
           _trackDisposer(installUrlChangeWatcher((why) => onNav(why), ui.isEnabled));
@@ -3507,7 +3673,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         _trackDisposer(infObs);
       }
     }
-
+    // CONTRACT (installModeFlipWatcher)
+    // @GATE Detect single ↔ infinite reader flips
     function installModeFlipWatcher() {
       let last = isInfiniteModeNow() ? "infinite" : "single";
       let t = null;
