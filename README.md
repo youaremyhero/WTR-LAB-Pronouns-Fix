@@ -27,27 +27,16 @@ A Tampermonkey userscript that reduces mixed-up pronouns (he/she/him/her/his/her
 4. Copy the **RAW** URL for `glossary.json` and set it in the script:
    ```js
    const GLOSSARY_URL = "https://raw.githubusercontent.com/<user>/<repo>/main/glossary.json";
-Open a WTR-LAB chapter and refresh
-
-IMPORTANT: Do NOT use token URLs
-Do not use URLs like:
-...glossary.json?token=GHSAT...
-Those are temporary and not meant for automation.
-
-5. Open the chapter in Firefox and refresh.
-
-6. Configure your glossary
-Use glossary.template.json to create your own glossary.json.
-
-7. Optional per-novel settings
-json
-Copy code
-
-- carryParagraphs: how many following paragraphs can inherit the gender from the last paragraph that mentioned the character if the next paragraph starts with a pronoun.
-- mode:
-- paragraph (recommended): best for dialogue-heavy chapters
-- chapter: best for single-POV chapters (combine with forceGender or primaryCharacter)
-- forceGender: "female" or "male" (use only if the entire novel/chapter is consistent)
+   ```
+   > **IMPORTANT:** Do **not** use token URLs like `...glossary.json?token=GHSAT...`; those are temporary and will fail in automation.
+5. Open a WTR-LAB chapter in Firefox and refresh.
+6. Configure your glossary using `glossary.template.json` as a starting point.
+7. Optional per-novel settings:
+   - **carryParagraphs**: how many following paragraphs can inherit the gender from the last paragraph that mentioned the character if the next paragraph starts with a pronoun.
+   - **mode**:
+     - **paragraph** (recommended): best for dialogue-heavy chapters
+     - **chapter**: best for single-POV chapters (combine with `forceGender` or `primaryCharacter`)
+   - **forceGender**: `"female"` or `"male"` (use only if the entire novel/chapter is consistent)
 ---
 
 ## Safety & expectations

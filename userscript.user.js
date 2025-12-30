@@ -84,42 +84,42 @@
   }
 
   function wordBoundaryRegex(phrase) {
-  // Unicode-ish boundaries: not a letter/number/_ on either side
-  const p = escapeRegExp(String(phrase || "").trim());
-  if (!p) return null;
-  return new RegExp(String.raw`(^|[^\p{L}\p{N}_])(${p})(?=[^\p{L}\p{N}_]|$)`, "giu");
+    // Unicode-ish boundaries: not a letter/number/_ on either side
+    const p = escapeRegExp(String(phrase || "").trim());
+    if (!p) return null;
+    return new RegExp(String.raw`(^|[^\p{L}\p{N}_])(${p})(?=[^\p{L}\p{N}_]|$)`, "giu");
   }
 
   /* =========================
      Word-boundary regex cache (perf)
      ========================= */
-    const _wtrpfWordRxCache = new Map();
-  
-    function wordBoundaryRegexCached(phrase) {
-      const key = normalizeWeirdSpaces(String(phrase || "")).trim();
-      if (!key) return null;
-      if (_wtrpfWordRxCache.has(key)) return _wtrpfWordRxCache.get(key);
-      const rx = wordBoundaryRegex(key);
-      _wtrpfWordRxCache.set(key, rx);
-      return rx;
+  const _wtrpfWordRxCache = new Map();
+
+  function wordBoundaryRegexCached(phrase) {
+    const key = normalizeWeirdSpaces(String(phrase || "")).trim();
+    if (!key) return null;
+    if (_wtrpfWordRxCache.has(key)) return _wtrpfWordRxCache.get(key);
+    const rx = wordBoundaryRegex(key);
+    _wtrpfWordRxCache.set(key, rx);
+    return rx;
+  }
+
+  function findAllMatches(rx, text, max = 20) {
+    rx.lastIndex = 0;
+    const out = [];
+    let m;
+
+    while ((m = rx.exec(text)) && out.length < max) {
+      // Your wordBoundaryRegex structure is:
+      //  (1) left boundary group, (2) the actual phrase
+      const left = m[1] || "";
+      const phrase = m[2] || m[0] || "";
+      const phraseIndex = (m.index || 0) + left.length; // <-- centers on actual name
+      out.push({ index: phraseIndex, match: phrase });
     }
 
-    function findAllMatches(rx, text, max = 20) {
-      rx.lastIndex = 0;
-      const out = [];
-      let m;
-    
-      while ((m = rx.exec(text)) && out.length < max) {
-        // Your wordBoundaryRegex structure is:
-        //  (1) left boundary group, (2) the actual phrase
-        const left = m[1] || "";
-        const phrase = m[2] || m[0] || "";
-        const phraseIndex = (m.index || 0) + left.length; // <-- centers on actual name
-        out.push({ index: phraseIndex, match: phrase });
-      }
-    
-      return out;
-    }
+    return out;
+  }
   
   function scoreGenderInText(text, entries) {
     const s = normalizeWeirdSpaces(String(text || ""));
