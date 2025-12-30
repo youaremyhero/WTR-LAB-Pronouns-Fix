@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.13
+// @version      1.3.14
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -808,17 +808,18 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       // 2) Infinite mode fallback: newest chapter-body that isn't patched yet
       const inf = document.querySelector(".chapter-infinite-reader");
       if (inf) {
-        const bodies = Array.from(inf.querySelectorAll(".chapter-body"));
-        const newestUnpatched = bodies.reverse().find(el => {
-          const ok = (el.innerText || "").trim().length > 200;
-          const already = el.dataset?.wtrpfPatchedChapter; // your root marker
-          return ok && !already;
-        });
-        if (newestUnpatched) return newestUnpatched;
+      const bodies = Array.from(inf.querySelectorAll(".chapter-body"));
+      const rev = bodies.slice().reverse();
       
-        // fallback to last good if all patched
-        const lastGood = bodies.reverse().find(el => (el.innerText || "").trim().length > 200);
-        if (lastGood) return lastGood;
+      const newestUnpatched = rev.find(el => {
+        const ok = (el.innerText || "").trim().length > 200;
+        const already = el.dataset?.wtrpfPatchedChapter;
+        return ok && !already;
+      });
+      if (newestUnpatched) return newestUnpatched;
+      
+      const lastGood = rev.find(el => (el.innerText || "").trim().length > 200);
+      if (lastGood) return lastGood;
       }
     
       // 3) Single chapter fallback (original behavior)
@@ -2118,44 +2119,6 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     }, true);
   }
 
-
-  function installChapterBodyObserver(onNav) {
-    let lastCb = null;
-    let debounce = null;
-    let mo = null;
-
-    function attach(cb) {
-      if (!cb || cb === lastCb) return;
-
-      // Disconnect previous observer to avoid buildup
-      if (mo) {
-        try { mo.disconnect(); } catch {}
-        mo = null;
-      }
-
-      lastCb = cb;
-
-      mo = new MutationObserver(() => {
-        if (debounce) return;
-        debounce = setTimeout(() => {
-          debounce = null;
-          onNav("chapter-body-mutation");
-        }, CHAPTER_OBS_DEBOUNCE_MS);
-      });
-
-      mo.observe(cb, { childList: true, subtree: true });
-    }
-
-    const t = setInterval(() => {
-      const cb = document.querySelector(".chapter-body");
-      if (cb && cb !== lastCb) attach(cb);
-    }, 800);
-
-    setTimeout(() => {
-      clearInterval(t);
-    }, 15000);
-  }
-
   function installUrlChangeWatcher(onNav, isEnabled) {
     let lastHref = location.href;
     let lastFireAt = 0;
@@ -2393,26 +2356,6 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       const carryParagraphs = Number.isFinite(+cfg.carryParagraphs)
         ? Math.max(0, Math.min(5, +cfg.carryParagraphs))
         : DEFAULT_CARRY_PARAGRAPHS;
-
-    function installChapterBodyReplaceWatcher(onNav) {
-      const mo = new MutationObserver((muts) => {
-        for (const m of muts) {
-          if (!m.addedNodes || !m.addedNodes.length) continue;
-          for (const n of m.addedNodes) {
-            if (!(n instanceof Element)) continue;
-    
-            // If the new subtree contains chapter-body, trigger a sweep.
-            if (n.matches?.(".chapter-body") || n.querySelector?.(".chapter-body")) {
-              onNav("chapter-body-replaced");
-              return;
-            }
-          }
-        }
-      });
-    
-      // Observe only direct structural changes; NOT characterData.
-      mo.observe(document.body, { childList: true, subtree: true });
-    }
 
     function loadChapterState() {
       try { return JSON.parse(sessionStorage.getItem(chapterStateKey) || "{}"); }
@@ -2921,10 +2864,17 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       // If a run is in-flight, requeue once with a tiny delay instead of dropping the request
       if (running) {
         _pendingRun = r;
-        requestRun("rearm-while-running", { forceFull: r.forceFull, forcedRoot: r.forcedRoot, forcedChapterId: r.forcedChapterId, allowOffChapter: r.allowOffChapter });
+        setTimeout(() => {
+          if (_pendingRun && !_runTimer) requestRun("rearm-while-running", {
+            forceFull: r.forceFull,
+            forcedRoot: r.forcedRoot,
+            forcedChapterId: r.forcedChapterId,
+            allowOffChapter: r.allowOffChapter
+          });
+        }, 60);
         return;
       }
-  
+      
       console.log("[WTRPF] requestRun→run:", r.reason, "forceFull=", r.forceFull);
       run({
         forceFull: r.forceFull,
@@ -3335,7 +3285,8 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     
         rootManager.resolve();
         onNav("mode-changed");
-    
+        ui.syncPillVisibility?.();
+
         // Re-arm mode-specific observers for the new mode
         // (We intentionally do NOT re-install the always-on click/history/tracker hooks.)
         if (mode === "single") {
@@ -3414,13 +3365,35 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
         _trackDisposer(infObs);
       }
     }
+
+    function installModeFlipWatcher() {
+      let last = isInfiniteModeNow() ? "infinite" : "single";
+      let t = null;
+    
+      const mo = new MutationObserver(() => {
+        if (t) return;
+        t = setTimeout(() => {
+          t = null;
+          const cur = isInfiniteModeNow() ? "infinite" : "single";
+          if (cur === last) return;
+          last = cur;
+          wireHooksModeAware();
+        }, 120);
+      });
+    
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+      return { disconnect: () => { try { mo.disconnect(); } catch {} } };
+    }
  
       // Call once at startup:
       wireHooksModeAware();
 
-    // Install route watcher once (SPA: hide pill immediately when leaving chapter pages)
+      // Install route watcher once (SPA: hide pill immediately when leaving chapter pages)
       _trackDisposer(installRouteWatcher({ ui, rootManager, stopNavSweep }));
-      
+
+      // NEW: watch for infinite reader mount/unmount and rewire observers
+      _trackDisposer(installModeFlipWatcher());
+   
       // And re-evaluate once shortly after load (reader can mount late):
       setTimeout(() => wireHooksModeAware(), 1600);
 
@@ -3428,10 +3401,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       requestRun("initial", { forceFull: true });
       
       // Start watchdog
-      if (!document.querySelector(".chapter-infinite-reader")) {
       startChapterMonitor();
-    }
-
     
   })();
 })();
