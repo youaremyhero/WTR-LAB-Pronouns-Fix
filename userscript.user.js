@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WTR-LAB PF Test
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.14
+// @version      1.3.15
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
@@ -2306,7 +2306,25 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
     
       return { disconnect: () => { if (mo) { try { mo.disconnect(); } catch {} } } };
     }
+
+    function installTocClickHook(onNav) {
+    document.addEventListener("click", (e) => {
+      const a = e.target?.closest?.("a[href]") || null;
+      if (!a) return;
   
+      const href = a.getAttribute("href") || "";
+      // must look like a chapter jump
+      if (!/\/chapter-\d+/i.test(href)) return;
+  
+      // Optional: tighten if you know TOC container selectors
+      // const inToc = !!a.closest(".toc, .chapter-list, .modal, [role='dialog']");
+      // if (!inToc) return;
+  
+      // Fire immediately so preNavSig/preNavCid reflect the *old* chapter
+      onNav("toc-click");
+    }, true);
+  }
+
     // ==========================================================
     // Main
     // ==========================================================
@@ -3194,6 +3212,39 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
           navEpoch++;
         
           rootManager.resolve();
+          
+          // If infinite reader is present, nav sweep won't run.
+          // Force a sweep + force-run the currently active body.
+          if (document.querySelector(".chapter-infinite-reader")) {
+            setTimeout(() => {
+              try { sweepInfiniteBodies(); } catch {}
+          
+              // Try to force-run the ACTIVE chapter body (TOC often focuses existing body, no append)
+              const activeTracker = document.querySelector(".chapter-tracker.active[data-chapter-no]");
+              const no = activeTracker?.getAttribute?.("data-chapter-no");
+          
+              if (no && /^\d+$/.test(no)) {
+                // Find the body corresponding to the active chapter
+                const body =
+                  document.querySelector(`#chapter-${no} .chapter-body`) ||
+                  document.querySelector(`#tracker-${no} .chapter-body`) ||
+                  activeTracker.closest?.(".chapter, article, section, main")?.querySelector?.(".chapter-body") ||
+                  null;
+          
+                if (body && contentReady(body)) {
+                  const cid = `chapter-${no}`;
+                  requestRun("toc/infinite-active", {
+                    forceFull: true,
+                    forcedRoot: body,
+                    forcedChapterId: cid
+                  });
+                }
+              }
+            }, 120);
+    
+            return; // IMPORTANT: don't startNavSweep in infinite mode
+          }
+          
           startNavSweep(String(why || "nav"), navEpoch); // startNavSweep will requestRun when safe
         };
 
@@ -3364,6 +3415,7 @@ function carryGuardAllows(text, assumedGender, entries, limit = 220) {
       installNextButtonHook((why) => onNav(why));
       installHistoryHooksLite((why) => onNav(why));
       installChapterTrackerObserver((why) => onNav(why), ui.isEnabled);
+      installTocClickHook((why) => onNav(why));
     
       // Mode-specific observers must be disposable (for mode flips)
       if (!infinite) {
