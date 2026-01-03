@@ -11,6 +11,7 @@ It works by applying user-defined gender rules from a small JSON glossary and re
   - Infinite reader mode (more prone to errors)
   - Switching reader modes automatically triggers re-processing
 - ✅ Uses a public `glossary.json` (GitHub Raw or public Gist Raw) hosted by user
+- ✅️ Works for ***multiple** WTR Lab novels (`glossary.json` can contain multiple novels)
 - ✅ Movable floating UI, minimise to a pill, ON/OFF toggle
 - ✅ Paragraph-level matching (reduces collateral changes)
 - ✅ Context carry-over across short paragraphs (fixes “name in previous paragraph → pronoun in next paragraph”)
@@ -76,9 +77,9 @@ Example:
 ```
 7. **Replace it with your own raw glossary URL**
 8. **Save** the script
-> ⚠️ **Important**
-> Do not use URLs containing ?token=GHSAT...
-> Token URLs are temporary and will fail
+>⚠️ **Important**
+-  Do not use URLs containing `?token=GHSAT...`
+-  Token URLs are temporary and will fail
 
 **This is the only edit you need to make.**
 You will still receive script updates automatically from Greasy Fork.
@@ -106,6 +107,8 @@ The floating panel shows:
 2. Choose Male or Female
 3. A JSON snippet appears in the Draft box
 4. Copy it into your glossary.json if you want to keep it
+
+You can also choose to amend your `glossary.json` directly on Github, ensuring that the format is preserved.
 
 ---
 
