@@ -34,7 +34,7 @@ It works by applying user-defined gender rules from a small JSON glossary and re
   
   > ❌️ iOS browsers are not supported (userscripts are not allowed).
 
-2. Install the Script from **Greasy Fork** (Recommended)
+2. Install the Script from [**Greasy Fork** (Recommended)](https://greasyfork.org/en/scripts/559092-wtr-lab-pronouns-fix)
 3. Open the script’s Greasy Fork page
 4. Click Install this script
 5. Tampermonkey will install it automatically
