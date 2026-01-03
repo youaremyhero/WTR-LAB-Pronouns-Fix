@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         WTR-LAB PF Test
+// @name         WTR-LAB Pronouns Fix
 // @namespace    https://github.com/youaremyhero/WTR-LAB-Pronouns-Fix
-// @version      1.3.17
+// @version     1.0.0
 // @description  Uses a custom JSON glossary on Github to detect gender and changes pronouns on WTR-Lab for a better reading experience.
 // @match        *://wtr-lab.com/en/novel/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wtr-lab.com
